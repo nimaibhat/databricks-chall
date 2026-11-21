@@ -1,0 +1,28 @@
+name: bench
+on:
+  push:
+    branches: [bench]
+  workflow_dispatch:
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: machine
+        run: |
+          lscpu | head -20; nproc; free -g
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+          df -hT . /tmp; uname -a; docker version --format '{{.Server.Version}}'
+      - name: generator
+        run: |
+          mkdir -p ~/gen && cd ~/gen
+          curl -sSfL -o generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          unzip -q generator.zip
+          d=$(dirname $(find . -name Cargo.toml | head -1)); cd $d && cargo build --release -q
+          time ./target/release/generate --seed 7 --events ${EVENTS:-20000000} --clicks ${CLICKS:-5000000} --output ~/data
+          du -sh ~/data
+      - name: bench
+        run: bash bench/gha_bench.sh
