@@ -135,8 +135,10 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
     let shard_bits: u32 = p2_bits();
     let shards: usize = 1 << shard_bits;
     let shift = 64 - shard_bits;
-    let pairs = PerThread::new(threads, Vec::<(Key, Key)>::new);
-    let skeys = PerThread::new(threads, || vec![Vec::<Key>::new(); shards]);
+    // sized up front (a link line is about 20 bytes) so the lists do not regrow
+    let lines = m.maps.iter().map(|x| x.len()).sum::<usize>() / 18;
+    let pairs = PerThread::new(threads, || Vec::<(Key, Key)>::with_capacity(lines / threads * 3 / 2 + 1024));
+    let skeys = PerThread::new(threads, || (0..shards).map(|_| Vec::<Key>::with_capacity(2 * lines / shards / threads * 3 / 2 + 64)).collect::<Vec<_>>());
     par_for(chunks.len(), threads, |t, i| {
         let c = chunks[i];
         let d: &[u8] = &m.maps[c.file as usize];
@@ -156,6 +158,7 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
             sk[(hk(b) >> shift) as usize].push(b);
         });
     });
+    let t_parse = t0.elapsed();
     let pairs = pairs.into_inner();
     let skeys = skeys.into_inner();
     let npairs: usize = pairs.iter().map(|p| p.len()).sum();
@@ -180,6 +183,7 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
         unsafe { *maps.get(s) = mp };
     });
     drop(skeys);
+    let t_intern = t0.elapsed();
     let maps = maps.into_inner();
     let shard_keys = shard_keys.into_inner();
     let mut offs = vec![0u32; shards + 1];
@@ -201,7 +205,14 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
         }
     });
     let ipairs = ipairs.into_inner();
+    let t_xlate = t0.elapsed();
     let t_uf = Instant::now();
+    let mut all_keys: Vec<Key> = Vec::with_capacity(nids);
+    for s in 0..shards {
+        all_keys.extend_from_slice(&shard_keys[s]);
+    }
+    // Union-find with path halving. The root of a set is always its
+    // byte-wise smallest ID (the person's name), so no naming pass is needed.
     let mut parent: Vec<u32> = (0..nids as u32).collect();
     #[inline(always)]
     fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -214,12 +225,14 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
         }
         x
     }
+    let mut nmoved = 0usize; // IDs that are not a root = unions made
     for v in &ipairs {
         for &(a, b) in v {
             let ra = find(&mut parent, a);
             let rb = find(&mut parent, b);
             if ra != rb {
-                if ra < rb {
+                nmoved += 1;
+                if key_cmp(all_keys[ra as usize], all_keys[rb as usize]) == std::cmp::Ordering::Less {
                     parent[rb as usize] = ra;
                 } else {
                     parent[ra as usize] = rb;
@@ -227,36 +240,31 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
             }
         }
     }
-    let mut all_keys: Vec<Key> = Vec::with_capacity(nids);
-    for s in 0..shards {
-        all_keys.extend_from_slice(&shard_keys[s]);
-    }
-    let mut name: Vec<Key> = vec![EMPTY; nids];
-    for i in 0..nids {
-        let r = find(&mut parent, i as u32) as usize;
-        parent[i] = r as u32;
-        let k = all_keys[i];
-        if name[r] == EMPTY || key_cmp(k, name[r]) == std::cmp::Ordering::Less {
-            name[r] = k;
-        }
-    }
     let uf_time = t_uf.elapsed();
-    // the table holds only IDs that are not their own person's name
-    let mut nmoved = 0usize;
-    for i in 0..nids {
-        nmoved += (name[parent[i] as usize] != all_keys[i]) as usize;
-    }
+    let t_union = t0.elapsed();
+    let t_name = t0.elapsed();
     let tab = LinkTab::new(nmoved);
+    // the table holds only IDs that are not their own person's name
     par_for(shards, threads, |_t, s| {
         let off = offs[s] as usize;
         for (j, &k) in shard_keys[s].iter().enumerate() {
-            let nm = name[parent[off + j] as usize];
-            if nm != k {
-                tab.insert(k, nm);
+            let mut r = off + j;
+            loop {
+                let up = parent[r] as usize;
+                if up == r {
+                    break;
+                }
+                r = up;
+            }
+            if r != off + j {
+                tab.insert(k, all_keys[r]);
             }
         }
     });
-    eprintln!("links: {} pairs, {} ids, {} mapped, uf {:?}, total {:?}", npairs, nids, nmoved, uf_time, t0.elapsed());
+    eprintln!(
+        "links: {} pairs, {} ids, {} mapped, uf {:?}, total {:?} (parse {:?} intern {:?} xlate {:?} union {:?} name {:?})",
+        npairs, nids, nmoved, uf_time, t0.elapsed(), t_parse, t_intern, t_xlate, t_union, t_name
+    );
     tab
 }
 
@@ -312,27 +320,18 @@ fn transpose<T>(v: Vec<Vec<T>>, parts: usize) -> Vec<Vec<T>> {
     out
 }
 
-fn main() {
-    let t_start = Instant::now();
-    let data = PathBuf::from(env("DATA_DIR", "/data"));
-    let outdir = PathBuf::from(env("OUTPUT_DIR", "/output"));
-    let threads: usize = env("NCPU", "0").parse().unwrap_or(0);
-    let threads = if threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
-    } else {
-        threads
-    };
+struct Catalogs {
+    products: Catalog,
+    cat_set: Vec<Vec<u8>>,
+    cat_unknown: u16,
+    campaigns: Catalog,
+    camp_names: Vec<Vec<u8>>,
+    camp_channels: Vec<Vec<u8>>,
+}
 
-    // ---- phase 0
-    P1_BITS_V.store(env("P1BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
-    P2_BITS_V.store(env("P2BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
-    let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
-    let ws = manifest_ts(&manifest, "window_start");
-    let we = manifest_ts(&manifest, "window_end");
-    assert!(we - ws + WEEK_MS < (1i64 << 32), "window too long for u32 offsets");
-    let day0 = ws.div_euclid(DAY_MS);
-    let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1).max(1) as usize;
-
+/// products.csv and campaigns.csv; runs beside the link build.
+fn load_catalogs(data: &Path) -> Catalogs {
+    let t_cat = Instant::now();
     let prod_rows = read_small_csv(&data.join("products.csv"));
     let mut cat_set: Vec<Vec<u8>> = prod_rows.iter().map(|r| r[1].clone()).collect();
     cat_set.push(b"unknown".to_vec());
@@ -356,9 +355,37 @@ fn main() {
             camp_channels.push(r[1].clone());
         }
     }
-
     products.finish();
     campaigns.finish();
+    eprintln!("catalogs {:?}", t_cat.elapsed());
+    Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels }
+}
+
+fn epoch() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+fn main() {
+    let t_start = Instant::now();
+    eprintln!("epoch_start {:.6}", epoch());
+    let data = PathBuf::from(env("DATA_DIR", "/data"));
+    let outdir = PathBuf::from(env("OUTPUT_DIR", "/output"));
+    let threads: usize = env("NCPU", "0").parse().unwrap_or(0);
+    let threads = if threads == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+    } else {
+        threads
+    };
+
+    // ---- phase 0
+    P1_BITS_V.store(env("P1BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
+    P2_BITS_V.store(env("P2BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
+    let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
+    let ws = manifest_ts(&manifest, "window_start");
+    let we = manifest_ts(&manifest, "window_end");
+    assert!(we - ws + WEEK_MS < (1i64 << 32), "window too long for u32 offsets");
+    let day0 = ws.div_euclid(DAY_MS);
+    let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1).max(1) as usize;
 
     // map the inputs early so the arena can be sized
     let ev_m = Mapped::open(&list_csv(&data.join("events")));
@@ -375,9 +402,15 @@ fn main() {
     let arena = Arena::new(2 * (ev_bytes + cl_bytes) + partial + (64 << 20), est * 3 / 2);
     assert!(arena.cap() / 16 < u32::MAX as usize - 1, "input too large for 32-bit record indices");
     let abase = arena.base();
+    eprintln!("mapped + arena at {:?}", t_start.elapsed());
 
-    // ---- phase 1
-    let links = build_links(&data, threads);
+    // ---- phase 1 (the catalogs load on a side thread meanwhile)
+    let (links, cats) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| load_catalogs(&data));
+        let links = build_links(&data, threads);
+        (links, h.join().expect("catalogs"))
+    });
+    let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels } = cats;
     eprintln!("phase1 done {:?} {}", t_start.elapsed(), cpu());
 
     let ctx = Ctx {
@@ -480,6 +513,7 @@ fn main() {
     // ---- phase 5: output
     out::write_all(&outdir, &ctx, accs);
     eprintln!("done {:?} {}", t_start.elapsed(), cpu());
+    eprintln!("epoch_done {:.6}", epoch());
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();
         libc::getrusage(libc::RUSAGE_SELF, &mut ru);
