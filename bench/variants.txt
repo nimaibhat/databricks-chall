@@ -1,5 +1,3 @@
 # label|ref|build-args|env
-base|main||
-flat16|main||FLAT16=1
-tsbl|main||TSBL=1
-both|main||FLAT16=1 TSBL=1
+head86e|86e23cb||
+fix5b17560|origin/gate-5b17560||
