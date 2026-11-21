@@ -20,6 +20,8 @@ Moved to runner-up in iteration 36 (was rank 5): finishing the output shrink wit
 
 Runners-up, in order: one-multiply hash ([1.7](#17-one-multiply-hash)); rank sort for small groups ([19.2](#192-branch-free-rank-sort-for-small-groups)); 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)).
 
+Iteration 38 (measured per-stage instruction counts): scanner stages A and B are done by the optimizer (experiments 26, 27); row 2 is now stage C alone, priced at 20 to 35 instructions per event line, followed by the time-of-day check (15.1, about 20), the per-field room checks (28.4, about 24) and the type dispatch (2.2, about 9). See [38](#iteration-38-2026-11-21-0345-measured-instructions-per-line-by-stage-ours-against-the-two-fastest-builds).
+
 Runners-up, added in iteration 31: the link filter only if the four-keys table loses its A/B (31.5); the small parse items of iteration 28. Lowered: rank sort for small groups (19.2), after three teams measured nothing from re-ordering clicks without a sort (31.3).
 
 Closed: everything for a cold page cache (1.9, 3.1); a smaller runtime image (25.2).
@@ -1516,6 +1518,41 @@ Run [44882607432](https://github.com/nimaibhat/databricks-chall/actions/runs/448
 - **What this ranks.** The scanner stages of 34 (about 315 to 160 per line) would close roughly 155 of the 220 instructions per line that separate us from both builds, so they are worth more than the -3 to -4% estimated there if the count carries to time as it has so far (ratio of instructions and of in-process time agree). The remaining 65 per line are spread over `keys.rs` and the emit path: 28.2 (one-multiply hash), 28.3 (one ring path) and 28.4 (one room check per line) are the logged candidates.
 - **Mispredictions**: ours 4.80 M, of which `process_partition` in `main.rs` has 0.90 M and `parse_events` about 0.87 M across files; Vibhor7-7 has 19% fewer overall with a quarter fewer branches. Not a lever of the size of the instruction count.
 - Reusable: `bench/cg.sh` on `bench-ext` takes any ref or public repo; the per-function table (`CGF` lines) is in the run log.
+
+## Iteration 38 (2026-11-21, ~03:45): measured instructions per line by stage, ours against the two fastest builds
+
+Source: line-level cachegrind tables from run [44884763238](https://github.com/nimaibhat/databricks-chall/actions/runs/44884763238) (`bench/cg.sh` on `bench-ext`; 1,072,116 event and 255,280 click lines, one thread, x86-64-v3). Ours is `b2fa94d` code (scanner stages A and B, one-multiply hash, `pext` packing already in). Whole run now: **ours 1,422 M instructions** (1,599 M in iteration 37), cherylaurelia 1,175 M, Vibhor7-7 1,284 M: the gap to cherylaurelia fell from 36% to 21%, to Vibhor7-7 from 25% to 11%.
+
+**What the table can and cannot say.** Only source lines with at least 1 M instructions are listed, and code inlined from the core library (intrinsics, pointer reads, slice helpers) is not attributed to lines at all. The listed lines cover 785 M of ours (55%), 658 M of cherylaurelia's (56%) and 697 M of Vibhor7-7's (54%), so coverage is equal and the columns are comparable, but about 45% of every build is outside the table. Stage assignment is by function line ranges, checked against the source text; clicks and events share code, so the unit is instructions per input line (1,327,396 lines).
+
+| Stage (listed lines only, per input line) | ours | cherylaurelia | Vibhor7-7 |
+|---|---|---|---|
+| delimiter masks | 35 | 31 | 88 |
+| line split, quotes, field offsets | 130 | 116 | 27 |
+| timestamps (`ts` + `ingest_ts` + digit helpers) | 109 | 95 | 78 |
+| ID packing (event, user, click IDs) | 40 | 51 | 25 |
+| hash | 33 | 24 | 23 |
+| link lookup | 12 | 12 | 19 |
+| event type, price, catalog | 20 | 2 | 7 |
+| empties and window checks | 12 | 17 | 27 |
+| ring, record build, push | 42 | 45 | 71 |
+| click-only lines | 2 | 2 | 7 |
+| lines with no line number (file known) | 89 | 45 | 79 |
+| dedup phase | 12 | 10 | 15 |
+| sessions phase (incl. its tables) | 43 | 37 | 59 |
+| **parse functions in full, from the function table (incl. library code)** | **at least 634** | **538** | **about 550** |
+
+The parse gap to cherylaurelia is now about 96 instructions per line (220 in iteration 37). Where the listed lines put it:
+
+1. **Field slices (stage C of 34), about 20 to 30 per line.** `parse.rs:720` `fields[i] = std::slice::from_raw_parts(lp.add((at >> (8 * i)) as u8 as usize), (ln >> (8 * i)) as u8 as usize)` is 40.7 M: 38 per event line to build eight pointer-and-length pairs. cherylaurelia keeps the two packed words and extracts on use ([`Fields::at`/`len`, `src/main.rs` 1341 to 1349](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L1341-L1349)): 21.4 M. Vibhor7-7 stores two 8-lane arrays from one vector op (`reader.rs:77-82`, 3.2 M) after its 27-per-line split. This confirms stage C as the next scanner step and prices it at 20 to 35 per event line in listed code alone; the rest of the scanner is now at parity with cherylaurelia (masks 35 against 31; split and validity 92 against 95 once line 720 is set aside). 34's budget of 315 to 160 is not directly checkable (library intrinsics are unlisted), but the listed scanner lines stand at 165 per line after A and B and would be about 135 after C.
+2. **Time of day, about 20 per line.** `tod_checked` runs twice per event line (`ts` and `ingest_ts`): `parse.rs:1124` `if (w & SEP) != 0x0000_3A00_003A_0000 || !digits8(w2)` 25.9 M, `digits8` at `parse.rs:1024` 30.9 M (shared with other callers), `1131` and `1134` 19.3 M: about 70 M. Vibhor7-7 does the same job in about 45 M ([`ts.rs` 277 to 286](https://github.com/Vibhor7-7/shopping-sessions/blob/bee0cbf/src/ts.rs#L277-L286)): one XOR with the `"00:00:00"` pattern, one test `(time | time + 0x7676_7f76_767f_7676) & TOP_BITS` that rejects a wrong digit or separator together, then `HOURS[digits & 255] + MINUTES[(digits >> 8) & 255] + ...` table lookups and one `seconds < 86_400` compare instead of three range checks. cherylaurelia (`main.rs:1092-1102`) is the same shape with a multiply. This is entry 15.1, still open in the code, now with a measured size: one combined check per word instead of the mask compare plus `digits8`, and a single range test. Exactness: the XOR-and-add test must reject every byte that is not a digit in digit positions and not `:` in separator positions; 15.1's argument and the existing `ts_fuzz` cover it.
+3. **Event type and price dispatch, about 9 per event line.** `main.rs:655-656` (`let price = match f[4] { b"view" | b"cart" => 0, ...`) costs 16.6 M as slice-pattern compares. cherylaurelia loads the field's first four bytes once and compares words ([`main.rs:2119-2120`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L2119-L2120): `4 if w as u32 == u32::from_le_bytes(*b"view") || ...`), 6.3 M. This is entry 2.2 with a measured size; it depends on stage C handing the body a pointer and a length.
+4. **Hash evaluations, about 10 per line.** `hk` (`keys.rs:196-197`) is 43.8 M at about five instructions a call: eight or nine evaluations per event across parse, dedup and sessions (`main.rs:606`, `793`, `799`, `813` and the `KMap` probes). The other two spend 23 to 24 per line. Passing the already-computed hash (or the slot) from pass to pass in `dedup_partition` instead of calling `slot(r.eid)` twice per record is the visible duplicate. Small, and only worth doing where the value is already in a register.
+5. **Unattributed, 44 per line more than cherylaurelia.** Lines cachegrind could not give a number are 118 M for us (`parse.rs` 64 M, `keys.rs` 30 M, `main.rs` 23 M) against 59 M. These are compiler-generated sequences inside our files (moves of the 8-slice array and of ring records, bounds and niche checks are the likely content, but that is a guess). Stage C removes the largest candidate; a re-run of `bench/cg.sh` after it will show whether the row shrinks.
+
+**Not levers**: ID packing (40 against 51 and 25; Vibhor7-7's is cheaper but ours beats cherylaurelia's), link lookup (12, parity), ring and push (42, the lowest of the three), dedup and sessions (parity or better). Vibhor7-7's index build costs 88 per line where line-start masks cost 31 to 35, so stage B was the right shape.
+
+**Cross-checks.** 37's "all of the gap is parse" still holds (dedup and sessions are level). 28.2 (one-multiply hash) is done and visible: `hk` is now two lines. 28.4 (one room check per line) is visible as `keys.rs:134` 16.1 M and `parse.rs:1214`/`1164` 16.3 M of `(p as usize) + n <= ceil as usize` guards: about 24 per event line across five call sites, so it is larger than 28.4's "about 1%" and ranks with item 2. Expected gain if 1 to 3 and 28.4 are all done: about 70 to 90 instructions per line of 634, which by the instruction-to-time ratio seen so far is 4 to 6% of in-process time.
 
 ## Next iteration
 
