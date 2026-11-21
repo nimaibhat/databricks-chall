@@ -25,7 +25,8 @@ jobs:
           d=$(dirname $(find . -name Cargo.toml | head -1)); cd $d && cargo build --release -q
           [ "${R20:-0}" -gt 0 ] && ./target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output ~/d20
           [ "${R60:-0}" -gt 0 ] && ./target/release/generate --seed 11 --events 60000000 --clicks 15000000 --output ~/d60
-          du -sh ~/d20 ~/d60 2>/dev/null || true
+          ./target/release/generate --seed 3 --events 2000 --clicks 500 --output ~/d0
+          du -sh ~/d0 ~/d20 ~/d60 2>/dev/null || true
       - name: tests
         run: |
           git fetch -q origin "refs/heads/gate-*:refs/remotes/origin/gate-*" || true

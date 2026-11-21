@@ -44,7 +44,7 @@ runone() { # ds label envs keep
 first_label=$(echo "${V[0]}" | cut -d'|' -f1)
 for i in 1 2 3 4 5 6 7; do
   t0=$(date +%s.%N)
-  docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus $N --memory 14g --memory-swap 14g --user 1000:1000 -e DATA_DIR=/nonexistent "sut:$first_label" >/dev/null 2>&1
+  docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus $N --memory 14g --memory-swap 14g --user 1000:1000 -v $HOME/d0:/data:ro --tmpfs /output:rw,size=64m,mode=1777 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=$N "sut:$first_label" >/dev/null 2>&1
   t1=$(date +%s.%N); echo "EMPTY $(echo "$t1 - $t0" | bc)"
 done
 for ds in d20 d60; do

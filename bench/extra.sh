@@ -22,11 +22,13 @@ if [ -n "${CG_REF:-}" ]; then
   G=$(dirname $(find ~/gen -name Cargo.toml | head -1))
   $G/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output ~/dev >/dev/null 2>&1
   echo "CG lines: $(cat ~/dev/events/*.csv | wc -l) events $(cat ~/dev/clicks/*.csv | wc -l) clicks"
-  rm -rf /tmp/t2 && git -C $GITHUB_WORKSPACE worktree prune && git -C $GITHUB_WORKSPACE worktree add -f /tmp/t2 "$CG_REF" -q && cd /tmp/t2
-  RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -q --features diag 2>&1 | tail -2
+  cd "$GITHUB_WORKSPACE"; rm -rf /tmp/t2; git worktree prune; git worktree add -f /tmp/t2 "$CG_REF" 2>&1 | tail -2; cd /tmp/t2 || echo "CG cd failed"
+  pwd; ls | head -5
+  RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --features diag 2>&1 | tail -3
+  which valgrind cg_annotate || sudo apt-get install -y valgrind 2>&1 | tail -2
   for st in ${CG_STAGES:-0}; do
     rm -rf /tmp/o; mkdir /tmp/o
-    STAGE=$st NCPU=1 DATA_DIR=$HOME/dev OUTPUT_DIR=/tmp/o valgrind --tool=cachegrind --branch-sim=yes --cache-sim=no --cachegrind-out-file=/tmp/cg.out ./target/release/sessions 2>&1 | grep -E "I +refs|Branches|Mispred" | sed "s/^/CG$st /"
+    STAGE=$st NCPU=1 DATA_DIR=$HOME/dev OUTPUT_DIR=/tmp/o valgrind --tool=cachegrind --branch-sim=yes --cache-sim=no --cachegrind-out-file=/tmp/cg.out ./target/release/sessions 2>&1 | grep -E "I +refs|Branches|Mispred|rror|valgrind:" | sed "s/^/CG$st /"
     cg_annotate /tmp/cg.out --sort=Ir --show=Ir,Bcm --annotate=yes 2>/dev/null > /tmp/ann.txt
     python3 - $st <<'PY'
 import re,sys
