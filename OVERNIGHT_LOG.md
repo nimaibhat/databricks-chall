@@ -1,6 +1,8 @@
 # OVERNIGHT_LOG.md
 
-**SUBMIT THIS: `0a06317`** (adds the sessions-phase rework). x86 runner, full `docker run` wall, median of 7, one run on an Intel Xeon 8573C (4 vCPU, a slow runner): 20M 2.257 s, 60M 6.342 s, against 2.306 / 6.479 s for its parent `62abf9c` and 2.401 / 6.775 s for the pick before that; ranges do not overlap with the parent at 20M. Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); unit and fuzz tests and fixtures pass on the x86 runner; outputs equal there on both datasets. The fastest public build takes 1.430 / 4.022 s in the same run.
+**SUBMIT THIS: `fe79ca9`** (adds the links-phase trim and the dedup prefilter). x86 runner, full `docker run` wall, median of 7 (20M) and 5 (60M), EPYC 9V74 4 vCPU: 20M 1.736 s, 60M 4.860 s; in the previous run on the same CPU model the earlier picks measured 1.753 / 4.925 s (`0a06317`) and 1.799 / 5.045 s (`62abf9c`). Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); 14 unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets. Vibhor7-7's current build takes 1.372 / 3.741 s in the same run and cherylaurelia's 1.118 / 3.083 s in the run before.
+
+**Open finding:** after our process prints its last line, `docker run` takes another 0.40 s at 20M and 1.10 s at 60M to return (an empty container is 0.155 s in total). Pread instead of mmap and releasing the arena do not change it. The run in flight tests output size and output-on-tmpfs as the cause.
 
 How to read the numbers: "x86" is a GitHub Actions `ubuntu-latest` runner (4 vCPU, 16 GB; CPU model varies per run, so only same-run comparisons count), timed around the whole `docker run` with the scorer's flags, variants interleaved, warm page cache. "M4" is this Mac (arm64, 10 cores), process wall. The x86 number decides.
 
@@ -37,6 +39,10 @@ Before/after pairs come from one x86 run each; absolute times differ between run
 | 5b | `e75b17b` | whole series #2-#5 against `e7a116f` on Intel | 2.243 / 1.920 (Xeon 6973P-C) | 6.339 / 5.418 | | -14.4% / -14.5% (Zen runs showed -6%) |
 | 9 | `0a06317` | Sessions phase: 8-byte event keys, 16-byte clicks inside a group, interval-counted assists, largest partition first, reserved user rows | 2.306 / 2.257 (Xeon 8573C; ranges 2.299-2.336 / 2.237-2.293) | 6.479 / 6.342 (6.388-6.562 / 6.247-6.503) | sessions 0.434 / 0.376 at one thread | kept (-2.1%, -2.1%) |
 | 10 | n/a | Teammate branch `origin/saran/work` (`6ff3e77`) measured in the same run for reference | 2.459 | 7.067 | | slower than main (2.257 / 6.342); nothing to take |
+| 11 | `493f36e` | Links: union-find root = smallest ID (no naming pass), pre-sized lists, catalogs on a side thread | 1.753 / 1.737 (9V74; ranges 1.747-1.800 / 1.730-1.745) | 4.925 / 4.875 | links 0.051 / 0.035 | kept (-0.9%, -1.0%) |
+| 12 | same image | `RA=0` (no background read-ahead), `P1BITS=10`, `P1BITS=11 P2BITS=10` | 1.737 / 1.744 / 1.738 / 1.745 | 4.875 / 4.881 / 4.884 / 4.875 | | no difference; defaults stay (matches Vibhor7-7's sweep) |
+| 13 | `fe79ca9` | Dedup bitmap prefilter | 1.746 / 1.736 (dedup phase 0.078 / 0.069) | 4.886 / 4.860 (dedup 0.245 / 0.202) | dedup 0.028 / 0.021 | kept on the phase time; wall gain is inside the range |
+| 14 | same image | `AREL=1`, `IOMODE=4 CHUNKKB=1024`, both: effect on the time after exit | post-exit 0.406 / 0.405 / 0.401 / 0.399 | 1.100 / 1.099 / 1.087 / 1.080 | | neither changes it; pread wall -1.1% / -1.2% again |
 
 ## Current phase profile (`e75b17b`)
 
@@ -67,9 +73,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Find the 0.3 to 0.4 s that `docker run` takes beyond our in-process time plus the empty-container baseline (0.19 s with a tiny dataset): wall-clock stamps at process start and end are in the build being measured now.
-2. Links phase (union-find root = smallest ID, no naming pass, catalogs on a side thread): built, passes the gate, x86 A/B running together with partition-count variants.
-3. Instruction diet for the per-line path from a cachegrind line profile (1.67 G instructions for the 1M set now, 2.15 G at the start of the night), then a duplicate prefilter for dedup.
+1. The post-exit time (0.40 s at 20M, 1.10 s at 60M under Docker on the runner): INT32 count columns are built (output 93 -> 76 MB); the run in flight compares output on disk, output on tmpfs and a smaller output. If output bytes are the cause, dictionary and delta encodings for `user_daily` come next (the fastest public build writes 7.6 MB where we write 93 MB).
+2. Port the remaining measured wins from Vibhor7-7's log (user request): `pread` without any mapping (their mmap was +7.5%), huge pages for the large non-arena allocations (-3.7%), half-hour bins instead of the per-person sort (-2.7%), `select_unpredictable` for the timestamp form and link lookup (-2%), 4 keys + 4 people per link-table line (-1.5%).
+3. Instruction diet for the per-line path from the cachegrind line profile.
 
 ## Setup notes
 
