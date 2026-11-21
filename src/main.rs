@@ -528,11 +528,19 @@ fn main() {
     let ncat = ctx.cat_names.len();
     // about 0.1 user-day rows per event; threads take uneven shares
     let nev: usize = sparts.iter().map(|ls| ls.iter().map(|l| l.len).sum::<usize>()).sum();
-    let acc = PerThread::new(threads, || {
-        let mut a = out::Acc::new(ncamp + 1, ndays);
-        a.users.reserve(nev / 4 / threads + 1024);
-        a
-    });
+    let (ud, cd) = out::prepare(&outdir);
+    let hint = out::start_hints();
+    let group_rows = out::group_rows();
+    let _ = nev;
+    let acc = PerThread::from_vec(
+        (0..threads)
+            .map(|t| {
+                let mut a = out::Acc::new(ncamp + 1, ndays, ud.join(format!("part-{t}.parquet")), hint.clone());
+                a.users.reserve(if group_rows == usize::MAX { nev / 4 / threads + 1024 } else { 2 * group_rows });
+                a
+            })
+            .collect(),
+    );
     let pscr = PerThread::new(threads, Scratch::default);
     let ptimes = std::sync::Mutex::new(Vec::new());
     // largest partitions first, so a whale's partition is never the last one running alone
@@ -544,6 +552,9 @@ fn main() {
         let sc = unsafe { pscr.get(t) };
         let t0 = Instant::now();
         process_partition(&ctx, &sparts[p], &cparts[p], a, sc, ncat);
+        if a.users.len() >= group_rows {
+            a.flush_group(&ctx.cat_names);
+        }
         let n: usize = sparts[p].iter().map(|l| l.len).sum();
         ptimes.lock().unwrap().push((t0.elapsed().as_micros(), n, p));
     });
@@ -557,7 +568,7 @@ fn main() {
     eprintln!("phase4 sessions {:?} {} arena used {} MB of {} MB", t_start.elapsed(), cpu(), arena.used() >> 20, arena.cap() >> 20);
 
     // ---- phase 5: output
-    out::write_all(&outdir, &ctx, accs);
+    out::write_all(&cd, &ctx, accs);
     if env("AREL", "0") == "1" {
         arena.release_parallel(threads);
     }
