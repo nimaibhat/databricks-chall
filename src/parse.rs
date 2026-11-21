@@ -646,50 +646,51 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
         }
         let nw = win!(nm);
         if nw == 0 {
-            // a line of 128 bytes or more
+            // a line of 128 bytes or more (rare): the scalar splitter, then
+            // the same single call site as the fast path so `f` is inlined once
             let rest = unsafe { std::slice::from_raw_parts(base.add(ls), len - ls) };
             let l = memchr::memchr(b'\n', rest).unwrap_or(rest.len());
-            if split(&rest[..l], &mut fields) {
-                f(&fields);
-            }
             ls += l + 1;
-            continue;
-        }
-        let ll = nw.trailing_zeros(); // line length, 0..=127
-        let below = (1u128 << ll) - 1;
-        let c = win!(cm) & below;
-        let q = win!(qm) & below;
-        let lp = unsafe { base.add(ls) };
-        ls += ll as usize + 1;
-        // Quotes: with `d` = delimiters (commas and the line end), a field
-        // starts after each delimiter and ends before one. Every quote must
-        // be the first or last byte of a field (1), a one-byte field cannot
-        // be a quote (2), and a field opens with a quote iff it closes with
-        // one: subtracting the opening bits from the closing bits (moved onto
-        // the delimiter that follows) leaves a delimiter bit set exactly when
-        // some field has one without the other (3).
-        let d = c | (1u128 << ll);
-        let st = (d << 1) | 1;
-        let en = d >> 1;
-        let x = q & st;
-        let y = (q << 1) & d;
-        let bad = (q & !(st | en)) | (x & en) | (y.wrapping_sub(x) & d);
-        if c.count_ones() as usize != N - 1 || bad != 0 {
-            continue; // wrong field count (or an empty line), or a misplaced quote
-        }
-        let mut m = c;
-        let mut fs = 0u32;
-        for i in 0..N {
-            let fe = if i == N - 1 {
-                ll
-            } else {
-                let p = m.trailing_zeros();
-                m &= m.wrapping_sub(1);
-                p
-            };
-            let qa = ((q >> fs) as u32) & 1; // quoted: drop the first and last byte
-            fields[i] = unsafe { std::slice::from_raw_parts(lp.add((fs + qa) as usize), (fe - fs - 2 * qa) as usize) };
-            fs = fe + 1;
+            if !split(&rest[..l], &mut fields) {
+                continue;
+            }
+        } else {
+            let ll = nw.trailing_zeros(); // line length, 0..=127
+            let below = (1u128 << ll) - 1;
+            let c = win!(cm) & below;
+            let q = win!(qm) & below;
+            let lp = unsafe { base.add(ls) };
+            ls += ll as usize + 1;
+            // Quotes: with `d` = delimiters (commas and the line end), a field
+            // starts after each delimiter and ends before one. Every quote must
+            // be the first or last byte of a field (1), a one-byte field cannot
+            // be a quote (2), and a field opens with a quote iff it closes with
+            // one: subtracting the opening bits from the closing bits (moved onto
+            // the delimiter that follows) leaves a delimiter bit set exactly when
+            // some field has one without the other (3).
+            let d = c | (1u128 << ll);
+            let st = (d << 1) | 1;
+            let en = d >> 1;
+            let x = q & st;
+            let y = (q << 1) & d;
+            let bad = (q & !(st | en)) | (x & en) | (y.wrapping_sub(x) & d);
+            if c.count_ones() as usize != N - 1 || bad != 0 {
+                continue; // wrong field count (or an empty line), or a misplaced quote
+            }
+            let mut m = c;
+            let mut fs = 0u32;
+            for i in 0..N {
+                let fe = if i == N - 1 {
+                    ll
+                } else {
+                    let p = m.trailing_zeros();
+                    m &= m.wrapping_sub(1);
+                    p
+                };
+                let qa = ((q >> fs) as u32) & 1; // quoted: drop the first and last byte
+                fields[i] = unsafe { std::slice::from_raw_parts(lp.add((fs + qa) as usize), (fe - fs - 2 * qa) as usize) };
+                fs = fe + 1;
+            }
         }
         f(&fields);
     }
