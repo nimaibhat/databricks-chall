@@ -806,7 +806,7 @@ fn dedup_partition(lists: &mut [BList<DRec>], sc: &mut DedupScratch, bs: &mut Bl
         });
     }
     let mp = sc.map.get_or_insert_with(|| KMap::<u64>::with_capacity(16));
-    mp.reset(n / 8 + 16);
+    mp.reset(n / 16 + 16);
     for l in lists.iter() {
         l.for_each_slice(|sl| {
             for r in sl {
@@ -950,7 +950,9 @@ fn process_partition(
         return;
     }
     let gmap = sc.gmap.get_or_insert_with(|| KMap::<u32>::with_capacity(16));
-    gmap.reset(n / 4 + 16);
+    // about 30 events per person: start small so the table stays in cache
+    // (it doubles itself when a partition has more people than that)
+    gmap.reset(n / 32 + 64);
     // group events by person (counting sort); copies that lost dedup are skipped
     let gkeys = &mut sc.gkeys;
     let counts = &mut sc.counts;

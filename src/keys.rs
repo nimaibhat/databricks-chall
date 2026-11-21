@@ -457,6 +457,39 @@ mod tests {
             }
         }
     }
+    /// KMap against HashMap, started far too small so that it has to grow,
+    /// reused across rounds with `reset`.
+    #[test]
+    fn kmap_grows_and_matches_hashmap() {
+        let mut x: u64 = 0xDEAD_BEEF_1234_5678;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut km = KMap::<u32>::with_capacity(4);
+        for round in 0..40 {
+            let n = [0usize, 1, 5, 100, 5000, 60_000][round % 6];
+            km.reset(if round % 2 == 0 { 1 } else { n / 32 + 3 });
+            let mut hm: HashMap<u64, u32> = HashMap::new();
+            for i in 0..n {
+                let k = if rnd() % 3 == 0 { rnd() % 500 } else { rnd() >> 1 };
+                let (slot, ins) = km.entry(k, i as u32);
+                assert_eq!(ins, !hm.contains_key(&k));
+                let v = *hm.entry(k).or_insert(i as u32);
+                assert_eq!(*km.val_mut(slot), v);
+            }
+            assert_eq!(km.len, hm.len());
+            for (&k, &v) in &hm {
+                assert_eq!(km.get(k), Some(v));
+            }
+            for _ in 0..2000 {
+                let k = rnd() % 1000;
+                assert_eq!(km.get(k), hm.get(&k).copied());
+            }
+        }
+    }
     #[test]
     fn linktab_matches_hashmap() {
         let mut x: u64 = 0x2545_F491_4F6C_DD1D;
