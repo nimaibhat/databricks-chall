@@ -24,15 +24,15 @@ Re-ranked in iteration 9 from the measurements in `OVERNIGHT_LOG.md` (experiment
 
 **Still wanted from the log:** nothing blocking. The four-run ladder of 8.3 would size rows 3 and 4 before any work on them.
 
-## Requests to the coding agent (so the next ranking rests on data, not estimates)
+## Requests to the coding agent
 
-Please put these in `OVERNIGHT_LOG.md` once, for the 20M set on the Intel VM:
+Requests 1 to 5 of the first iterations are answered in `OVERNIGHT_LOG.md` ("Facts for the research session"); thank you. Open now, cheapest first:
 
-1. The VM: CPU model (`/proc/cpuinfo` model name), kernel, `cat /sys/kernel/mm/transparent_hugepage/enabled`, the filesystem `/data` and `/output` are on, and the `docker run` flags used.
-2. The `XL_TIMING=1` line (`[v2b] ms: ...`) and the `[v2b] rows:` line.
-3. One run of a `--features tl` build: the `[tl]` lap lines (serial ms and idle thread-ms per job), "worker start/ready", and the write-syscall line.
-4. One run of a `--features pmu` build: the `[pmu] parse:` line (instructions, cycles, faults, `task_ms`, `stime_ms`). Instructions per line and system time during parse decide between ideas 2, 3 and 4.
-5. Output size in MB, and the time from the last stderr line to `docker run` returning.
+1. Row 1: `XL_REL=0 XL_RGREL=0 XL_ENDREL=2` against the default, on tmpfs, wall as the parent sees it. Also `XL_ENDREL=1` alone.
+2. Row 2: `XL_CKIX=1` and `XL_CKIX=2` against the default; `parse`, `ev3a` and wall; stderr checked for the fallback line on three seeds.
+3. 11.1: `NCPU=4 XL_PIN=0 taskset -c 0-3` (one thread per core), `parse` lap, against the 8-thread default.
+4. Row 3: a build with `XL_BB=14` (and 13), full gate, `parse` and `ev3a` laps.
+5. Optional, sizes rows 4 and 5: the four-run ladder of 8.3 (`--features knobs` build).
 
 ## Scorer facts carried over (all from other teams' probes, quoted in the old notes 11.1, 39.2, 50.1, 51.2; none verified here)
 
