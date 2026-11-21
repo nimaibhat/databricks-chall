@@ -15,25 +15,38 @@ unsafe impl Sync for Arena {}
 unsafe impl Send for Arena {}
 
 impl Arena {
-    pub fn new(cap: usize) -> Arena {
-        let cap = (cap + BLK - 1) / BLK * BLK;
-        #[cfg(unix)]
-        unsafe {
-            let p = libc::mmap(
-                std::ptr::null_mut(),
-                cap,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | map_noreserve(),
-                -1,
-                0,
-            );
-            if p != libc::MAP_FAILED {
-                #[cfg(target_os = "linux")]
-                libc::madvise(p, cap, libc::MADV_HUGEPAGE);
-                return Arena { base: p as *mut u8, cap, off: AtomicUsize::new(0) };
+    /// Reserves `cap` bytes of address space (untouched pages cost nothing).
+    /// Every block comes from this one region, so a record is addressable by
+    /// a 32-bit index from `base`. Falls back to smaller reservations if the
+    /// kernel refuses the large one.
+    pub fn new(cap: usize, min_cap: usize) -> Arena {
+        let mut cap = (cap + BLK - 1) / BLK * BLK;
+        loop {
+            unsafe {
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    cap,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | map_noreserve(),
+                    -1,
+                    0,
+                );
+                if p != libc::MAP_FAILED {
+                    #[cfg(target_os = "linux")]
+                    libc::madvise(p, cap, libc::MADV_HUGEPAGE);
+                    return Arena { base: p as *mut u8, cap, off: AtomicUsize::new(0) };
+                }
             }
+            assert!(cap > min_cap, "arena reservation failed");
+            cap = (cap / 2).max(min_cap).div_ceil(BLK) * BLK;
         }
-        Arena { base: std::ptr::null_mut(), cap: 0, off: AtomicUsize::new(0) }
+    }
+    #[inline(always)]
+    pub fn base(&self) -> usize {
+        self.base as usize
+    }
+    pub fn cap(&self) -> usize {
+        self.cap
     }
 
     /// Frees the used part of the arena with `threads` parallel madvise calls.
@@ -65,13 +78,8 @@ impl Arena {
     #[inline]
     pub fn block(&self) -> *mut u8 {
         let o = self.off.fetch_add(BLK, Ordering::Relaxed);
-        if o + BLK <= self.cap {
-            unsafe { self.base.add(o) }
-        } else {
-            // arena exhausted: fall back to the heap (leaked, like the arena)
-            let layout = std::alloc::Layout::from_size_align(BLK, 64).unwrap();
-            unsafe { std::alloc::alloc(layout) }
-        }
+        assert!(o + BLK <= self.cap, "arena exhausted");
+        unsafe { self.base.add(o) }
     }
 }
 
@@ -139,6 +147,24 @@ impl<T: Copy> BList<T> {
         self.left -= 1;
         self.len += 1;
     }
+    /// Appends and returns where the record now lives (stable until release).
+    #[inline(always)]
+    pub fn push_at(&mut self, x: T, src: &mut Blocks) -> *mut T {
+        if self.left == 0 {
+            let b = src.get() as *mut T;
+            self.blocks.push(b);
+            self.cur = b;
+            self.left = Self::PER;
+        }
+        let at = self.cur;
+        unsafe {
+            at.write(x);
+            self.cur = at.add(1);
+        }
+        self.left -= 1;
+        self.len += 1;
+        at
+    }
     /// The filled parts of each block.
     #[inline]
     pub fn for_each_slice(&self, mut f: impl FnMut(&[T])) {
@@ -146,51 +172,6 @@ impl<T: Copy> BList<T> {
         for (i, &b) in self.blocks.iter().enumerate() {
             let l = if i + 1 == n { Self::PER - self.left } else { Self::PER };
             f(unsafe { std::slice::from_raw_parts(b, l) });
-        }
-    }
-    /// In-place filter-map: `f` may modify each element; elements for which it
-    /// returns false are removed (order kept). Emptied blocks go to `free`.
-    pub fn compact(&mut self, free: &mut Vec<*mut u8>, mut f: impl FnMut(&mut T) -> bool) {
-        let per = Self::PER;
-        let n = self.len;
-        let mut w = 0usize;
-        let mut wb = 0usize; // write block
-        let mut wp: *mut T = if self.blocks.is_empty() { std::ptr::null_mut() } else { self.blocks[0] };
-        let mut wleft = per;
-        let nblk = self.blocks.len();
-        for bi in 0..nblk {
-            let b = self.blocks[bi];
-            let l = if bi + 1 == nblk { n - bi * per } else { per };
-            for j in 0..l {
-                unsafe {
-                    let p = b.add(j);
-                    if f(&mut *p) {
-                        if wleft == 0 {
-                            wb += 1;
-                            wp = *self.blocks.get_unchecked(wb);
-                            wleft = per;
-                        }
-                        *wp = *p;
-                        wp = wp.add(1);
-                        wleft -= 1;
-                        w += 1;
-                    }
-                }
-            }
-        }
-        let nb = w.div_ceil(per);
-        for &b in &self.blocks[nb..] {
-            free.push(b as *mut u8);
-        }
-        self.blocks.truncate(nb);
-        self.len = w;
-        if nb == 0 {
-            self.cur = std::ptr::null_mut();
-            self.left = 0;
-        } else {
-            let used = w - (nb - 1) * per;
-            self.left = per - used;
-            self.cur = unsafe { self.blocks[nb - 1].add(used) };
         }
     }
     /// Gives the blocks back for reuse (contents become garbage).

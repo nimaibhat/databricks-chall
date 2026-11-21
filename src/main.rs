@@ -2,10 +2,13 @@
 //!
 //! Phases
 //!   0. manifest, products, campaigns (tiny)
-//!   1. links  -> sharded ID interning -> union-find -> ID -> person-name map
-//!   2. events + clicks parsed in parallel chunks of mmapped files;
-//!      events radix-partitioned by event_id, clicks by person
-//!   3. event dedup per event_id partition; survivors re-partitioned by person
+//!   1. links  -> sharded ID interning -> union-find -> global ID -> person table
+//!   2. events + clicks parsed in parallel chunks of mmapped files; the person
+//!      is resolved at parse time (prefetched table lookup), so each valid
+//!      event is written once, into its person partition; every event copy
+//!      also leaves a 16-byte (event_id, ingest, record index) key in its
+//!      event_id partition
+//!   3. dedup per event_id partition: the losing copies are marked dead in place
 //!   4. per person partition: group, sessionize, credit, assist, aggregate
 //!   5. Parquet output
 use mimalloc::MiMalloc;
@@ -75,20 +78,20 @@ fn par_for(n: usize, threads: usize, f: impl Fn(usize, usize) + Sync) {
 // ---------------------------------------------------------------------------
 // Records
 // ---------------------------------------------------------------------------
-/// One parsed event copy. `pc` = price << 8 | category, or INVALID.
+/// Dedup key of one parsed event copy. `loc` = 1 + index of its SRec in the
+/// arena (in 16-byte units), or 0 if the copy is invalid and has no SRec.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-struct ERec {
+struct DRec {
     eid: Key,
-    person: Key,
-    ts: u32,     // ms since window start (valid copies only)
     ingest: i32, // seconds since window start, saturated
-    pc: u32,
-    _pad: u32,
+    loc: u32,
 }
-const INVALID: u32 = u32::MAX;
+/// `SRec.pc` of an event copy that lost dedup.
+const DEAD: u32 = u32::MAX;
 
-/// A surviving event. Purchase <=> price > 0.
+/// A valid event copy, in its person partition. Purchase <=> price > 0.
+/// `pc` = price << 8 | category (0 for non-purchases), or DEAD.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct SRec {
@@ -117,30 +120,13 @@ pub struct Ctx {
     pub campaigns: Catalog,
     pub camp_names: Vec<Vec<u8>>,
     pub camp_channels: Vec<Vec<u8>>,
-    pub links: Vec<KMap<Key>>, // sharded by top bits of hk
-    pub link_shift: u32,
-}
-
-impl Ctx {
-    #[inline(always)]
-    fn prefetch_person(&self, h: u64) {
-        if !self.links.is_empty() {
-            prefetch(self.links[(h >> self.link_shift) as usize].slot_ptr(h));
-        }
-    }
-    #[inline(always)]
-    fn person_h(&self, uid: Key, h: u64) -> Key {
-        if self.links.is_empty() {
-            return uid;
-        }
-        self.links[(h >> self.link_shift) as usize].get_h(uid, h).unwrap_or(uid)
-    }
+    pub links: LinkTab,
 }
 
 // ---------------------------------------------------------------------------
 // Phase 1: links
 // ---------------------------------------------------------------------------
-fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
+fn build_links(data: &Path, threads: usize) -> LinkTab {
     let t0 = Instant::now();
     let paths = list_csv(&data.join("links"));
     let m = Mapped::open(&paths);
@@ -174,7 +160,7 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
     let skeys = skeys.into_inner();
     let npairs: usize = pairs.iter().map(|p| p.len()).sum();
     if npairs == 0 {
-        return (Vec::new(), shift);
+        return LinkTab::new(0);
     }
     // shard maps: key -> local index (temporarily stored as the value)
     let maps = PerThread::new(shards, || KMap::<Key>::with_capacity(16));
@@ -255,20 +241,23 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
         }
     }
     let uf_time = t_uf.elapsed();
-    let maps_pt = PerThread::from_vec(maps);
+    // the table holds only IDs that are not their own person's name
+    let mut nmoved = 0usize;
+    for i in 0..nids {
+        nmoved += (name[parent[i] as usize] != all_keys[i]) as usize;
+    }
+    let tab = LinkTab::new(nmoved);
     par_for(shards, threads, |_t, s| {
-        let mp: &mut KMap<Key> = unsafe { maps_pt.get(s) };
         let off = offs[s] as usize;
-        for slot in mp.slots.iter_mut() {
-            if slot.0 != EMPTY {
-                let g = off + slot.1 as usize;
-                slot.1 = name[parent[g] as usize];
+        for (j, &k) in shard_keys[s].iter().enumerate() {
+            let nm = name[parent[off + j] as usize];
+            if nm != k {
+                tab.insert(k, nm);
             }
         }
     });
-    let maps = maps_pt.into_inner();
-    eprintln!("links: {} pairs, {} ids, uf {:?}, total {:?}", npairs, nids, uf_time, t0.elapsed());
-    (maps, shift)
+    eprintln!("links: {} pairs, {} ids, {} mapped, uf {:?}, total {:?}", npairs, nids, nmoved, uf_time, t0.elapsed());
+    tab
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +300,6 @@ fn p1_bits() -> u32 {
 fn p2_bits() -> u32 {
     P2_BITS_V.load(Ordering::Relaxed)
 }
-const LAG: usize = 16;
 
 /// [thread][partition] -> [partition][thread]
 fn transpose<T>(v: Vec<Vec<T>>, parts: usize) -> Vec<Vec<T>> {
@@ -378,12 +366,18 @@ fn main() {
     background_readahead(&[&ev_m, &cl_m]);
     let ev_bytes: usize = ev_m.maps.iter().map(|m| m.len()).sum();
     let cl_bytes: usize = cl_m.maps.iter().map(|m| m.len()).sum();
-    // ERec 32 B per ~78 B line, CRec 32 B per ~45 B line, plus partial blocks
-    let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * BLK * 2 + (256 << 20);
-    let arena = Arena::new(est * 3 / 2);
+    // Records are never larger than twice the input (a valid event line of
+    // >= 35 bytes makes 32 bytes, an invalid one of >= 8 bytes makes 16, a
+    // valid click line of >= 20 bytes makes 32), plus one partial block per
+    // list. The reservation is address space only.
+    let partial = ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * BLK;
+    let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + partial * 2 + (256 << 20);
+    let arena = Arena::new(2 * (ev_bytes + cl_bytes) + partial + (64 << 20), est * 3 / 2);
+    assert!(arena.cap() / 16 < u32::MAX as usize - 1, "input too large for 32-bit record indices");
+    let abase = arena.base();
 
     // ---- phase 1
-    let (links, link_shift) = build_links(&data, threads);
+    let links = build_links(&data, threads);
     eprintln!("phase1 done {:?} {}", t_start.elapsed(), cpu());
 
     let ctx = Ctx {
@@ -398,20 +392,16 @@ fn main() {
         camp_names,
         camp_channels,
         links,
-        link_shift,
     };
 
-    if env("BENCH", "0") == "2" {
-        microbench(&ctx, &ev_m, &cl_m, &arena);
-        return;
-    }
     // ---- phase 2: parse events + clicks
     let t_parse = Instant::now();
     let mut chunks = Vec::new();
     chunks_of(0, &ev_m, 4 << 20, &mut chunks);
     chunks_of(1, &cl_m, 4 << 20, &mut chunks);
     let blocks = PerThread::new(threads, || Blocks::new(&arena));
-    let ebl = PerThread::new(threads, || (0..(1usize << p1_bits())).map(|_| BList::<ERec>::new()).collect::<Vec<_>>());
+    let ebl = PerThread::new(threads, || (0..(1usize << p1_bits())).map(|_| BList::<DRec>::new()).collect::<Vec<_>>());
+    let sbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
     let cbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
     let iobufs = PerThread::new(threads, Vec::<u8>::new);
     par_for(chunks.len(), threads, |t, i| {
@@ -420,7 +410,7 @@ fn main() {
         let bs = unsafe { blocks.get(t) };
         if c.kind == 0 {
             let (d, s, e) = chunk_data(&ev_m, c.file as usize, c.start, c.end, buf);
-            parse_events(&ctx, d, s, e, unsafe { ebl.get(t) }, bs);
+            parse_events(&ctx, d, s, e, unsafe { ebl.get(t) }, unsafe { sbl.get(t) }, bs, abase);
             chunk_done(&ev_m, c.file as usize, c.start, c.end);
         } else {
             let (d, s, e) = chunk_data(&cl_m, c.file as usize, c.start, c.end, buf);
@@ -433,40 +423,17 @@ fn main() {
     let cparts = transpose(cbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
 
-    // ---- phase 3: dedup per eid partition, survivors partitioned by person
-    let sbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
-    let dscr = PerThread::new(threads, || (KMap::<u64>::with_capacity(16), Vec::<u64>::new()));
+    let sparts = transpose(sbl.into_inner(), 1usize << p2_bits());
+
+    // ---- phase 3: dedup per eid partition; losers are marked dead in place
+    let dscr = PerThread::new(threads, || KMap::<u64>::with_capacity(16));
     par_for(1usize << p1_bits(), threads, |t, p| {
         let lists = unsafe { eparts.get(p) };
-        let (mp, dead) = unsafe { dscr.get(t) };
+        let mp = unsafe { dscr.get(t) };
         let bs = unsafe { blocks.get(t) };
-        let sb = unsafe { sbl.get(t) };
-        dedup_partition(lists, mp, dead, sb, bs);
+        dedup_partition(lists, mp, bs, abase);
     });
-    let sparts = transpose(sbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
-
-    // ---- phase 3b: user -> person, per user-hash partition
-    let sparts = PerThread::from_vec(sparts);
-    let cparts = PerThread::from_vec(cparts);
-    let smv = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
-    let cmv = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
-    if !ctx.links.is_empty() {
-        par_for(1usize << p2_bits(), threads, |t, p| {
-            let bs = unsafe { blocks.get(t) };
-            let map = Some(&ctx.links[p]);
-            resolve_partition(p, map, unsafe { sparts.get(p) }, |r: &mut SRec| &mut r.person, unsafe { smv.get(t) }, bs);
-            resolve_partition(p, map, unsafe { cparts.get(p) }, |r: &mut CRec| &mut r.person, unsafe { cmv.get(t) }, bs);
-        });
-    }
-    let mut sparts = sparts.into_inner();
-    let mut cparts = cparts.into_inner();
-    for (p, v) in transpose(smv.into_inner(), 1usize << p2_bits()).into_iter().enumerate() {
-        sparts[p].extend(v.into_iter().filter(|l| l.len > 0));
-    }
-    for (p, v) in transpose(cmv.into_inner(), 1usize << p2_bits()).into_iter().enumerate() {
-        cparts[p].extend(v.into_iter().filter(|l| l.len > 0));
-    }
     eprintln!("phase3b resolve {:?} {}", t_start.elapsed(), cpu());
 
     // ---- phase 4: per person partition
@@ -490,7 +457,7 @@ fn main() {
         eprintln!("phase4 partitions: total {} us, top: {:?}", tot, &v[v.len().saturating_sub(5)..]);
     }
     let accs = acc.into_inner();
-    eprintln!("phase4 sessions {:?} {} arena used {} MB of {} MB", t_start.elapsed(), cpu(), arena.used() >> 20, (est * 3 / 2) >> 20);
+    eprintln!("phase4 sessions {:?} {} arena used {} MB of {} MB", t_start.elapsed(), cpu(), arena.used() >> 20, arena.cap() >> 20);
 
     // ---- phase 5: output
     out::write_all(&outdir, &ctx, accs);
@@ -511,89 +478,42 @@ fn main() {
     std::process::exit(0);
 }
 
-fn microbench(ctx: &Ctx, ev_m: &Mapped, cl_m: &Mapped, arena: &Arena) {
-    let mut ch = Vec::new();
-    chunks_of(0, ev_m, 4 << 20, &mut ch);
-    let ch = &ch[..ch.len().min(40)];
-    for c in ch {
-        let m = &ev_m.maps[c.file as usize];
-        let mut x = 0u64;
-        for i in (c.start..c.end).step_by(4096) {
-            x = x.wrapping_add(m[i] as u64);
-        }
-        std::hint::black_box(x);
-    }
-    let mut lines = 0u64;
-    let mut acc = 0u64;
-    let run = |name: &str, lines: u64, f: &mut dyn FnMut(&[&[u8]; 7])| {
-        let t = Instant::now();
-        for c in ch {
-            scan_lines::<7>(&ev_m.maps[c.file as usize], c.start, c.end, |x| f(x));
-        }
-        eprintln!("  {name:10} {:.1} ns/line", t.elapsed().as_nanos() as f64 / lines.max(1) as f64);
+/// A parsed valid event waiting for its link-table line to arrive in cache.
+#[derive(Clone, Copy, Default)]
+struct PendE {
+    user: Key,
+    h: u64,
+    eid: Key,
+    ts: u32,
+    pc: u32,
+    ingest: i32,
+}
+#[derive(Clone, Copy, Default)]
+struct PendC {
+    user: Key,
+    h: u64,
+    cid: Key,
+    ts: i64,
+    camp: u32,
+}
+/// Lines between the prefetch of a link-table bucket and its lookup.
+const RING: usize = 16;
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn emit_event(tab: &LinkTab, p: &PendE, eb: &mut [BList<DRec>], sb: &mut [BList<SRec>], bs: &mut Blocks, sh1: u32, sh2: u32, abase: usize) {
+    let (person, hp) = match tab.get(p.user, p.h) {
+        Some(v) => (v, hk(v)),
+        None => (p.user, p.h),
     };
-    for c in ch {
-        scan_lines::<7>(&ev_m.maps[c.file as usize], c.start, c.end, |_| lines += 1);
-    }
-    run("scan", lines, &mut |f| acc = acc.wrapping_add(f[6].len() as u64));
-    run("pack eid", lines, &mut |f| acc = acc.wrapping_add(pack(f[0])));
-    run("pack uid", lines, &mut |f| acc = acc.wrapping_add(pack(f[1])));
-    run("ts", lines, &mut |f| acc = acc.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64));
-    run("ingest", lines, &mut |f| acc = acc.wrapping_add(parse_ts(f[3]).unwrap_or(0) as u64));
-    let (fl, ce) = (ev_m.maps[0].as_ptr(), unsafe { ev_m.maps[0].as_ptr().add(ev_m.maps[0].len()) });
-    run("ts fast", lines, &mut |f| acc = acc.wrapping_add(parse_ts_fast(f[2], fl, ce).unwrap_or(0) as u64));
-    run("ts bl", lines, &mut |f| acc = acc.wrapping_add(parse_ts_bl(f[2], fl, ce).unwrap_or(0) as u64));
-    run("type", lines, &mut |f| acc = acc.wrapping_add(match f[4] { b"view" => 1, b"cart" => 2, b"purchase" => 3, _ => 0 }));
-    run("price", lines, &mut |f| acc = acc.wrapping_add(parse_price(f[6]).unwrap_or(0) as u64));
-    let floor = ev_m.maps[0].as_ptr();
-    run("raw7 prod", lines, &mut |f| acc = acc.wrapping_add(raw7(f[5], floor).unwrap_or(0)));
-    run("prod get", lines, &mut |f| acc = acc.wrapping_add(ctx.products.get(f[5], floor).unwrap_or(0) as u64));
-    run("person", lines, &mut |f| { let u = pack(f[1]); acc = acc.wrapping_add(ctx.person_h(u, hk(u))) });
-    let (mut inl, mut remap, mut tot) = (0u64, 0u64, 0u64);
-    for c in ch {
-        scan_lines::<7>(&ev_m.maps[c.file as usize], c.start, c.end, |f| {
-            let u = pack(f[1]);
-            let h = hk(u);
-            tot += 1;
-            if !ctx.links.is_empty() {
-                if let Some(v) = ctx.links[(h >> ctx.link_shift) as usize].get_h(u, h) {
-                    inl += 1;
-                    if v != u { remap += 1; }
-                }
-            }
-        });
-    }
-    let nslots: usize = ctx.links.iter().map(|m| m.slots.len()).sum();
-    eprintln!("  stats: events {tot}, uid in links {inl}, remapped {remap}, link slots {nslots}");
-    let mut bs = Blocks::new(arena);
-    let mut eb: Vec<BList<ERec>> = (0..(1usize << p1_bits())).map(|_| BList::new()).collect();
-    let t = Instant::now();
-    for c in ch {
-        parse_events(ctx, &ev_m.maps[c.file as usize], c.start, c.end, &mut eb, &mut bs);
-    }
-    eprintln!("  full       {:.1} ns/line ({} lines, {})", t.elapsed().as_nanos() as f64 / lines as f64, lines, acc);
-    let mut cch = Vec::new();
-    chunks_of(1, cl_m, 4 << 20, &mut cch);
-    let cch = &cch[..cch.len().min(40)];
-    let mut cl_lines = 0u64;
-    for c in cch {
-        scan_lines::<4>(&cl_m.maps[c.file as usize], c.start, c.end, |_| cl_lines += 1);
-    }
-    let t = Instant::now();
-    for c in cch {
-        scan_lines::<4>(&cl_m.maps[c.file as usize], c.start, c.end, |f| acc = acc.wrapping_add(f[3].len() as u64));
-    }
-    eprintln!("  cl scan    {:.1} ns/line", t.elapsed().as_nanos() as f64 / cl_lines as f64);
-    let mut cb: Vec<BList<CRec>> = (0..(1usize << p2_bits())).map(|_| BList::new()).collect();
-    let t = Instant::now();
-    for c in cch {
-        parse_clicks(ctx, &cl_m.maps[c.file as usize], c.start, c.end, &mut cb, &mut bs);
-    }
-    eprintln!("  cl full    {:.1} ns/line ({} lines)", t.elapsed().as_nanos() as f64 / cl_lines as f64, cl_lines);
+    let at = unsafe { sb.get_unchecked_mut((hp >> sh2) as usize) }.push_at(SRec { person, ts: p.ts, pc: p.pc }, bs);
+    let loc = ((at as usize - abase) / 16) as u32 + 1;
+    unsafe { eb.get_unchecked_mut((hk(p.eid) >> sh1) as usize) }.push(DRec { eid: p.eid, ingest: p.ingest, loc }, bs);
 }
 
 #[inline(never)]
-fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<ERec>], bs: &mut Blocks) {
+#[allow(clippy::too_many_arguments)]
+fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<DRec>], sb: &mut [BList<SRec>], bs: &mut Blocks, abase: usize) {
     let ws = ctx.ws;
     let we = ctx.we;
     let ws_s = ws.div_euclid(1000);
@@ -602,6 +522,10 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
     let unknown = ctx.cat_unknown as u32;
     let tsbl = ts_bl();
     let sh1 = 64 - p1_bits();
+    let sh2 = 64 - p2_bits();
+    let tab = &ctx.links;
+    let mut ring = [PendE::default(); RING];
+    let mut rn = 0usize;
     scan_lines::<7>(d, start, end, |f| {
         if f[0].is_empty() {
             return;
@@ -611,7 +535,6 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             Some(v) => (v - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
         };
-        let mut r = ERec { eid, ingest, pc: INVALID, ..Default::default() };
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
@@ -628,13 +551,35 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
                 },
                 _ => break 'v,
             };
-            r.ts = (ts - ws) as u32;
-            r.person = pack_fast(f[1], ceil);
             // the category is read only for purchases (price > 0)
-            r.pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
+            let pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
+            let user = pack_fast(f[1], ceil);
+            let h = hk(user);
+            tab.prefetch(h);
+            let slot = rn & (RING - 1);
+            if rn >= RING {
+                let old = ring[slot];
+                emit_event(tab, &old, eb, sb, bs, sh1, sh2, abase);
+            }
+            ring[slot] = PendE { user, h, eid, ts: (ts - ws) as u32, pc, ingest };
+            rn += 1;
+            return;
         }
-        unsafe { eb.get_unchecked_mut((hk(eid) >> sh1) as usize) }.push(r, bs);
+        // an invalid copy still takes part in dedup
+        unsafe { eb.get_unchecked_mut((hk(eid) >> sh1) as usize) }.push(DRec { eid, ingest, loc: 0 }, bs);
     });
+    for p in &ring[..rn.min(RING)] {
+        emit_event(tab, p, eb, sb, bs, sh1, sh2, abase);
+    }
+}
+
+#[inline(always)]
+fn emit_click(tab: &LinkTab, p: &PendC, cb: &mut [BList<CRec>], bs: &mut Blocks, sh2: u32) {
+    let (person, hp) = match tab.get(p.user, p.h) {
+        Some(v) => (v, hk(v)),
+        None => (p.user, p.h),
+    };
+    unsafe { cb.get_unchecked_mut((hp >> sh2) as usize) }.push(CRec { person, cid: p.cid, ts: p.ts, camp: p.camp }, bs);
 }
 
 #[inline(never)]
@@ -645,6 +590,9 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
     let floor = d.as_ptr();
     let ceil = unsafe { floor.add(d.len()) };
     let sh2 = 64 - p2_bits();
+    let tab = &ctx.links;
+    let mut ring = [PendC::default(); RING];
+    let mut rn = 0usize;
     scan_lines::<4>(d, start, end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -654,91 +602,52 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
             return;
         }
         let Some(camp) = ctx.campaigns.get(f[2], floor) else { return };
-        let u = pack_fast(f[1], ceil);
-        let r = CRec { person: u, cid: pack_fast(f[0], ceil), ts, camp };
-        unsafe { cb.get_unchecked_mut((hk(u) >> sh2) as usize) }.push(r, bs);
+        let user = pack_fast(f[1], ceil);
+        let h = hk(user);
+        tab.prefetch(h);
+        let slot = rn & (RING - 1);
+        if rn >= RING {
+            let old = ring[slot];
+            emit_click(tab, &old, cb, bs, sh2);
+        }
+        ring[slot] = PendC { user, h, cid: pack_fast(f[0], ceil), ts, camp };
+        rn += 1;
     });
-}
-
-/// Rewrites user ids to person ids inside one user-hash partition (the links
-/// shard for it is small and cache-resident). Records whose person belongs to
-/// another partition are moved out to `mv`.
-#[inline(never)]
-fn resolve_partition<T: Copy>(
-    p: usize,
-    map: Option<&KMap<Key>>,
-    lists: &mut [BList<T>],
-    person: impl Fn(&mut T) -> &mut Key,
-    mv: &mut [BList<T>],
-    bs: &mut Blocks,
-) {
-    let Some(map) = map else { return };
-    for l in lists.iter_mut() {
-        let mut free = std::mem::take(&mut bs.free);
-        l.compact(&mut free, |r| {
-            let k = person(r);
-            let u = *k;
-            if let Some(v) = map.get(u) {
-                *k = v;
-                let q = (hk(v) >> (64 - p2_bits())) as usize;
-                if q != p {
-                    unsafe { mv.get_unchecked_mut(q) }.push(*r, bs);
-                    return false;
-                }
-            }
-            true
-        });
-        bs.free.append(&mut free);
+    for p in &ring[..rn.min(RING)] {
+        emit_click(tab, p, cb, bs, sh2);
     }
 }
 
-/// Keeps, per event_id, the copy with the smallest ingest_ts; emits it if valid.
+/// Keeps, per event_id, the copy with the smallest ingest_ts: every other
+/// copy that has an event record gets that record marked DEAD. An invalid
+/// copy has no record (loc 0) but still wins or loses like any other, so a
+/// later valid copy never rescues an event whose earliest copy is invalid.
 #[inline(never)]
-fn dedup_partition(
-    lists: &mut [BList<ERec>],
-    mp: &mut KMap<u64>,
-    dead: &mut Vec<u64>,
-    sb: &mut [BList<SRec>],
-    bs: &mut Blocks,
-) {
+fn dedup_partition(lists: &mut [BList<DRec>], mp: &mut KMap<u64>, bs: &mut Blocks, abase: usize) {
     let n: usize = lists.iter().map(|l| l.len).sum();
     if n == 0 {
         return;
     }
     mp.reset(n);
-    dead.clear();
-    dead.resize(n / 64 + 1, 0);
-    // pass 1: value = (ingest as u32) << 32 | index
-    let mut i = 0u32;
     for l in lists.iter() {
         l.for_each_slice(|sl| {
             for r in sl {
-                let v = ((r.ingest as u32 as u64) << 32) | i as u64;
+                // value = (ingest as u32) << 32 | loc
+                let v = ((r.ingest as u32 as u64) << 32) | r.loc as u64;
                 let (s, ins) = mp.entry(r.eid, v);
                 if !ins {
                     let cur = *mp.val_mut(s);
-                    if r.ingest < (cur >> 32) as u32 as i32 {
-                        let ci = cur as u32;
-                        dead[(ci / 64) as usize] |= 1 << (ci % 64);
+                    let loser = if r.ingest < (cur >> 32) as u32 as i32 {
                         *mp.val_mut(s) = v;
+                        cur as u32
                     } else {
-                        dead[(i / 64) as usize] |= 1 << (i % 64);
+                        r.loc
+                    };
+                    if loser != 0 {
+                        // SRec.pc of the losing copy; no other thread touches this record
+                        unsafe { *((abase + (loser as usize - 1) * 16 + 12) as *mut u32) = DEAD };
                     }
                 }
-                i += 1;
-            }
-        });
-    }
-    // pass 2: survivors, sequentially
-    let mut i = 0u32;
-    for l in lists.iter() {
-        l.for_each_slice(|sl| {
-            for r in sl {
-                if r.pc != INVALID && dead[(i / 64) as usize] & (1 << (i % 64)) == 0 {
-                    unsafe { sb.get_unchecked_mut((hk(r.person) >> (64 - p2_bits())) as usize) }
-                        .push(SRec { person: r.person, ts: r.ts, pc: r.pc }, bs);
-                }
-                i += 1;
             }
         });
     }
@@ -792,6 +701,9 @@ fn process_partition(
     for l in slists {
         l.for_each_slice(|sl| {
             for r in sl {
+                if r.pc == DEAD {
+                    continue;
+                }
                 let (s, ins) = gmap.entry(r.person, gkeys.len() as u32);
                 if ins {
                     gkeys.push(r.person);
@@ -823,6 +735,9 @@ fn process_partition(
         for l in slists {
             l.for_each_slice(|sl| {
                 for r in sl {
+                    if r.pc == DEAD {
+                        continue;
+                    }
                     let g = gid[i] as usize;
                     unsafe { *ev.get_unchecked_mut(pos[g] as usize) = *r };
                     pos[g] += 1;
