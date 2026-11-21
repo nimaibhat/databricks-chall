@@ -1,7 +1,7 @@
 # label|ref|build-args|env
-s9|origin/gate-s9-61cb613||
 s10|origin/gate-s10-8db173d||
-s10io4|origin/gate-s10io4-8db173d||IOMODE=4 CHUNKKB=1024
-s10arel|origin/gate-s10arel-8db173d||AREL=1
-s10both|origin/gate-s10both-8db173d||IOMODE=4 CHUNKKB=1024 AREL=1
-vibhor|ext:Vibhor7-7/shopping-sessions||
+s11|origin/gate-s11-41635a8||
+s11tmpfs|origin/gate-s11tmpfs-41635a8||@tmpfs
+s11arel|origin/gate-s11arel-41635a8||AREL=1
+s11io4|origin/gate-s11io4-41635a8||IOMODE=4 CHUNKKB=1024
+s11thp|origin/gate-s11thp-41635a8||MIMALLOC_ALLOW_LARGE_OS_PAGES=1
