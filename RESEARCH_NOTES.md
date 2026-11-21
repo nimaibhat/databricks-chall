@@ -241,6 +241,20 @@ Read: `parse.rs:440-500` (record packing), `pqw.rs:76-124`, `:1056-1100` (`Out`,
 - The test VM runs the process in 198.6 ms on a CPU whose cores run well above 4 GHz. The scorer is reported at 2.8 GHz. Scaling by clock alone gives roughly 280 to 310 ms in-process there, which with the reported 0.1 s outside the process would be 0.38 to 0.41 s, above the 0.35 s on the board. So either the scorer's cores run faster than 2.8 GHz under turbo, or the outside part is nearer 0.05 s. Both readings say the same thing: **in-process time is about 0.25 to 0.30 s of the score, and a 1% code gain is about 3 ms on a clock whose single draws differ by tens of ms.**
 - Consequence for picking the final commit: decide on the VM's interleaved A/B (±1 ms), never on one board draw. A change that is exact and not slower on the VM is safe to submit; whether it "helped on the board" is not knowable from one or two draws.
 
+## Iteration 6 (2026-11-21): can a hidden-set seed push the fast path into the slow one?
+
+A run that trips `sys::fallback` re-executes itself with `--generic` (`sys.rs:122`). The output stays exact, but the time is several times worse, which on a hidden set is a worse outcome than any gain in the table is good. There are 99 `fallback("...")` sites. I checked the three whose trigger depends on the data's proportions rather than on a malformed file, against the generator source (`generator/src/plan.rs`, `user.rs`) and its README. No change is proposed; this is so nobody "tightens" these to save memory.
+
+| Capacity | Formula (`setup.rs`) | What the generator guarantees (quoted from its source) | Margin (my arithmetic) |
+|---|---|---|---|
+| Event slots `ecap` | `ev_bytes / 64` (`:963`) | Event indices are consecutive per user (`user.rs:153-157`); 2 to 4% of events are written twice (`plan.rs:129`) | Needs at least 64 input bytes per distinct event. Shortest well-formed event line is about 70 bytes (two 10-byte IDs, a 4-byte type, two 13-digit epoch timestamps, a product, separators) and the average is about 90, so about 1.4x |
+| User slots `ucap` | `ecap / 16` (`:964`) | `user_count = events / 30` (`plan.rs:147`, `EVENTS_PER_USER = 30`), at any scale | `ucap` is about 0.09 per event against 0.033 needed: about 2.7x |
+| Output rows per thread `row_cap` | `ev_bytes / 40 / nt * 2 + 65536` (`:845`) | At most 14 days per user (`WINDOW_DAYS`), so at most `events / 30 * 14` rows in total | At 20M: 11M rows of room per thread against 9.3M rows in the whole output: above 8x |
+
+- **Odd events** (`links.rs:1954`, fallback above 2% of event rows): the rates that produce non-conforming IDs are fixed constants or narrow ranges in `plan.rs:128-141` (empty user 0.2%, malformed 0.05%, upper-cased 0.0005%); none is drawn from a range that reaches 2%.
+- **Scale.** A comment in `plan.rs:133` speaks of "the full 75M rows". If the hidden set is larger than the reported 20M events, all three capacities scale with input bytes, so the margins above do not shrink. I did not check the other fixed limits (`names over 4 GB`, `edge store over 4G records`, `input too large`) against a 60M-event set; the first two are far away at 20M.
+- **What would be worth one run:** generate two more 20M seeds and one 40M set and confirm stderr never shows the fallback message (the fast path's output is compared anyway, but an exact output via the slow path passes the comparison and hides the problem; check the time or `XL_TIMING` line, not only the diff).
+
 ## Next passes (in this order)
 
 1. `events.rs` `stage3a` and `core.rs`: the 35 ms stage, pass by pass.
