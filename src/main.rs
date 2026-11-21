@@ -396,8 +396,6 @@ fn main() {
     };
 
     // ---- phase 0
-    P1_BITS_V.store(env("P1BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
-    P2_BITS_V.store(env("P2BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
@@ -420,6 +418,19 @@ fn main() {
     }
     let ev_bytes: usize = if io5 { ev_in.bytes() } else { ev_m.maps.iter().map(|m| m.len()).sum::<usize>() };
     let cl_bytes: usize = if io5 { cl_in.bytes() } else { cl_m.maps.iter().map(|m| m.len()).sum::<usize>() };
+    // Partition counts follow the input size, so that a partition's working
+    // set stays about the same: 512 for both streams up to 2.5 GB of events
+    // (the 20M sets), 1024 up to 10 GB (the 60M sets), 2048 beyond. Measured:
+    // at 60M, 1024/1024 is about 2% faster than 512/512; at 20M it is not.
+    let auto_bits = if ev_bytes < (5usize << 29) {
+        "9"
+    } else if ev_bytes < (10usize << 30) {
+        "10"
+    } else {
+        "11"
+    };
+    P1_BITS_V.store(env("P1BITS", auto_bits).parse().unwrap_or(9), Ordering::Relaxed);
+    P2_BITS_V.store(env("P2BITS", auto_bits).parse().unwrap_or(9), Ordering::Relaxed);
     // An event line makes at most twice its size in records (a valid line of
     // >= 35 bytes makes 32 bytes, an invalid one of >= 8 bytes makes 16); a
     // valid click line makes 32 bytes and is at least 20 bytes for any window
