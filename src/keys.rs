@@ -326,6 +326,9 @@ pub struct Catalog {
     ids: Vec<Vec<u8>>,
     prefix: Vec<u8>,
     dense: Vec<u32>, // value + 1, 0 = absent
+    pl: usize,  // prefix length; usize::MAX when there is no dense table
+    pval: u64,  // prefix bytes as a little-endian word
+    pmask: u64, // mask of the prefix bytes
 }
 
 /// (prefix length, number) if `s` is non-digits followed by 1..=8 digits
@@ -347,6 +350,9 @@ impl Catalog {
             ids: Vec::new(),
             prefix: Vec::new(),
             dense: Vec::new(),
+            pl: usize::MAX,
+            pval: 0,
+            pmask: 0,
         }
     }
     /// Inserts if absent; returns true if inserted.
@@ -394,27 +400,36 @@ impl Catalog {
                 }
             }
         }
+        if prefix.len() <= 7 {
+            let mut b = [0u8; 8];
+            b[..prefix.len()].copy_from_slice(&prefix);
+            self.pl = prefix.len();
+            self.pval = u64::from_le_bytes(b);
+            self.pmask = (1u64 << (8 * prefix.len())) - 1;
+            self.dense = dense;
+        }
         self.prefix = prefix;
-        self.dense = dense;
     }
     /// The value for `s`; bytes from `floor` up to `s` are readable.
     #[inline(always)]
     pub fn get(&self, s: &[u8], floor: *const u8) -> Option<u32> {
-        let pl = self.prefix.len();
+        let pl = self.pl;
         let n = s.len();
-        if !self.dense.is_empty() && n > pl && n - pl <= 8 && s[..pl] == self.prefix[..] {
-            let k = n - pl;
-            let e = unsafe { s.as_ptr().add(n) };
-            if e as usize >= floor as usize + 8 {
-                let x = crate::parse::ld8(unsafe { e.sub(8) });
-                let keep = 8 - k;
-                let x = if keep == 0 { x } else { (x & (!0u64 << (8 * keep))) | (0x3030_3030_3030_3030 >> (8 * k)) };
-                if crate::parse::digits8(x) && (s[pl] != b'0' || k == 1) {
-                    let v = crate::parse::val8(x) as usize;
-                    if v < self.dense.len() {
-                        let d = unsafe { *self.dense.get_unchecked(v) };
-                        return d.checked_sub(1);
-                    }
+        let e = unsafe { s.as_ptr().add(n) };
+        // dense path: prefix + 1..=8 digits, at most 8 bytes in all, compared
+        // and converted from the single word that ends at the field end
+        if n > pl && n <= 8 && e as usize >= floor as usize + 8 {
+            let x = crate::parse::ld8(unsafe { e.sub(8) });
+            let k = n - pl; // 1..=8 digits
+            let pre = (x >> (8 * (8 - n))) & self.pmask;
+            let first = (x >> (8 * (8 - k))) as u8;
+            let keep = 8 - k;
+            let dg = if keep == 0 { x } else { (x & (!0u64 << (8 * keep))) | (0x3030_3030_3030_3030 >> (8 * k)) };
+            if pre == self.pval && crate::parse::digits8(dg) && (first != b'0' || k == 1) {
+                let v = crate::parse::val8(dg) as usize;
+                if v < self.dense.len() {
+                    let d = unsafe { *self.dense.get_unchecked(v) };
+                    return d.checked_sub(1);
                 }
             }
         }
