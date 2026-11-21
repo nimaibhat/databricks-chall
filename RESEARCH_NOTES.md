@@ -1183,6 +1183,72 @@ Read from the run's printed summary; post-exit seconds, median of 5:
 - **The size of the effect is the runner's disk.** This 7763 runner shows nothing at 20M (0.08 s either way), as in my run; the 9V74 runner showed 0.31 s at 20M and 1.0 s at 60M (29.1). The scorer's disk is unknown, so the expected board gain from a fifth of the bytes is between nothing and 0.3 s at 20M.
 - **Order of work this implies** (sizes from 20.3): `DELTA_BINARY_PACKED` on `day`, `sessions`, `events`, `revenue_cents` first (78 to 42 MB, one encoder), then `DELTA_BYTE_ARRAY` on `user_id` and a dictionary for `top_category` (to about 18 MB).
 
+## Iteration 30 (2026-11-21, ~02:20): an implementation-ready spec for smaller Parquet output, with test vectors
+
+Follows 29.4 (output bytes cost time after exit). Extends 20.4 with dictionary pages, the rules checked against the format spec, golden byte vectors, and what the one scorer-accepted small writer does. Nothing in `src/` was built or run; the vectors come from the Python reference writer in the scratchpad (`pqsize/refwriter.py` and the new `pqsize/ref2.py`).
+
+### 30.1 What cherylaurelia's writer uses (accepted by the scorer)
+
+- **Encodings only, no compression, no statistics, v1 data pages** ([`src/main.rs` line 3222](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L3222): codec `UNCOMPRESSED`).
+- Column by column ([lines 3073 to 3081](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L3073)): `user_id` `RLE_DICTIONARY` with **one dictionary entry per run of equal IDs** and RLE runs as indices ([lines 3378 to 3412](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L3378)), so no hash table is needed; `day`, `sessions`, `events` (INT32) and `revenue_cents` (INT64) `DELTA_BINARY_PACKED` ([`put_delta`, lines 3304 to 3357](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L3304)); `top_category` PLAIN with bit-packed definition levels. `campaign_daily` stays PLAIN with INT64 counts.
+- Pages of 16,384 rows ([line 3094](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L3094)); a zero-row file falls back to PLAIN for `user_id` ([line 3145](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L3145)).
+- **Size check.** The same layout through the reference writer on the first golden 20M file gives 10.7 B/row, about 24 MB for all of `user_daily` at 20M. That matches the 24.7 MB in cherylaurelia's own commit message for `88ed99d`, not the 7.6 MB quoted in `OVERNIGHT_LOG.md`; treat the 7.6 MB as unverified.
+
+| Layout (first golden 20M file, 218,405 rows; all read equal by polars and duckdb) | Bytes | B/row |
+|---|---|---|
+| now (PLAIN, INT64 counts) | 9,376,877 | 42.9 |
+| run dictionary `user_id`, delta integers, PLAIN `top_category` (cherylaurelia's) | 2,330,723 | 10.7 |
+| the same plus a dictionary for `top_category` | 1,949,683 | 8.9 |
+| `DELTA_BYTE_ARRAY` `user_id`, delta integers, dictionary `top_category` | 1,712,210 | 7.8 |
+
+**Recommendation:** cherylaurelia's layout first: it is a quarter of today's bytes, needs two encoders, and is known to pass the scorer. The `top_category` dictionary is a further 17% for one more page type. `DELTA_BYTE_ARRAY` saves 12% more but no scored entry is known to use it.
+
+### 30.2 The rules, checked against [Encodings.md](https://github.com/apache/parquet-format/blob/master/Encodings.md)
+
+**`DELTA_BINARY_PACKED` (encoding 5), INT32 and INT64.**
+- Header: `uleb(128)` (block size, a multiple of 128), `uleb(4)` (miniblocks, so 32 values each, a multiple of 32), `uleb(total values)`, `zigzag(first value)`. The total counts the first value.
+- Per block of up to 128 deltas: `zigzag(min delta)`, 4 width bytes, then each used miniblock as 32 residuals (`delta - min`) packed LSB first at its width. Width 0 has no body.
+- Last block: "the bytes storing the bit widths of the unneeded miniblocks are still present, their value should be zero", and they have no body. The last used miniblock is padded to 32 values; padding should be zero.
+- Arithmetic: deltas and residuals wrap in two's complement at the column's width. "INT32 data must not use more than 32 bits": compute INT32 deltas with `i32::wrapping_sub`, or in `i64` only for values known to be non-negative (counts and dates), where the residual always fits 32 bits. cherylaurelia does the latter.
+- Zero values: the header alone, with first value 0 (accepted by all three readers).
+
+**Dictionary (`RLE_DICTIONARY` = 8).**
+- Dictionary page first: page type 2, body is the entries PLAIN (4-byte length, bytes). Its header carries `dictionary_page_header` (field 7) with `num_values` = entries and `encoding` = 0 (PLAIN).
+- Data page body: for an optional column the definition levels first, unchanged (4-byte length prefix in v1); then **one byte holding the index bit width**; then RLE/bit-packed runs of indices of the non-null values **with no length prefix**.
+- A run is `uleb(count << 1)` then the value in `ceil(width / 8)` bytes; a bit-packed run is `uleb((groups << 1) | 1)` then `groups * 8` values LSB first, zero padded. Width at least 1 was used here even for one entry.
+- Duplicate dictionary entries are legal, which is what makes the run dictionary work without a table.
+- An all-null column (empty dictionary, no indices after the width byte) and a zero-row file both read back correctly in all three readers.
+
+**`DELTA_BYTE_ARRAY` (7)**: prefix lengths as a delta-packed INT32 stream, then suffix lengths as a delta-packed INT32 stream, then the suffix bytes.
+
+### 30.3 Where each change lands in `pq.rs` (as on `origin/gate-s11-41635a8`)
+
+- **Values**: the `Data::Date | Data::I32` and `Data::I64` arms of the `match` in `write` call one `delta_pack(&mut page, values, bits)`; the `Data::Str` arm with `def: None` writes the dictionary page then width byte and runs; `out.rs` already holds a person's rows adjacent, so the run dictionary is one comparison of consecutive `ends` slices (or of the person number before names are materialised).
+- **Page header**: `h.i32(2, 0); // PLAIN` inside `h.begin(5)` becomes 5 or 8. Definition and repetition level encodings stay 3.
+- **Dictionary page header**: `h.i32(1, 2); h.i32(2, len); h.i32(3, len); h.begin(7); h.i32(1, entries); h.i32(2, 0); h.end();` then the terminating 0.
+- **Column metadata**: the encodings list (`t.list(2, CT_I32, 2); t.zz(0); t.zz(3)`) becomes `[3, 5]`, or `[0, 3, 8]` with a dictionary. `Meta.offset` is used for two fields that now differ: `file_offset` (field 2 of the chunk) and `dictionary_page_offset` (new field 11, written after field 9) point at the dictionary page; `data_page_offset` (field 9) points at the data page header. `total_compressed_size` and `total_uncompressed_size` cover both pages.
+- **Capacity estimate** at the top of `write` can stay: every encoding here is smaller than PLAIN except pathological INT64 data, where a block costs at most 5 + 10 bytes more than 128 plain values.
+- **Cost**: about 3 to 5 ns per value for a scalar delta pack (subtract, min, OR-reduce, shift into a 128-bit accumulator), so roughly 10 M values at 20M: about 40 ms of CPU across the writer threads, against the 60 MB of memory copies and page-cache writes it removes. cherylaurelia measured the per-thread write falling from 25 to 20 ms with it (`88ed99d`).
+
+### 30.4 Golden vectors (each written as a one-column file and read back equal by pyarrow 26.0.1, polars 2.1.0, duckdb 2.0.1)
+
+| Encoder | Input | Bytes | Encoded page body (hex) |
+|---|---|---|---|
+| delta INT32 | `[7,5,3,1,2,3,4,5]` | 18 | `800104080e0302000000c03f000000000000` |
+| delta INT32 | `[5]` | 5 | `800104010a` |
+| delta INT32 | `[3,3,3,3,3]` | 10 | `80010405060000000000` |
+| delta INT32 | `[1,-2147483648,2147483647,0]` | 142 | starts `8001040402fdffffff0f20000000feffffff`; SHA-256 prefix `a2ff4598558795f7` |
+| delta INT64 | `[0,i64::MIN,i64::MAX,-1]` | 271 | starts `8001040400ffffffffffffffffff013f000000`; SHA-256 prefix `cf22a41ddc5b8dc5` |
+| delta INT32 | `20000 + (i*i mod 7)`, i in 0..300 (crosses two block boundaries) | 143 | starts `800104ac02c0b8020503030303`; SHA-256 prefix `68e6d5cc9fe9fd70` |
+| delta INT64 | `(i*1000003 mod 65521) - 30000`, i in 0..130 | 278 | starts `8001048201dfd40399f30510101010`; SHA-256 prefix `a4368f7caaa2f711` |
+| run dictionary | `u_1a, u_1a, u_1b, u_20, "", u_20x` | dict 37, data 11 | dictionary `04000000755f316104000000755f316204000000755f32300000000005000000755f323078`; data `0304000201020202030204` |
+| dictionary, optional | `null, toys, null, null, books, toys, null, "", null, toys, garden` | levels 7, dict 31, data 4 | levels `0300000005b206`; dictionary `04000000746f797305000000626f6f6b73000000000600000067617264656e`; data `0203840c` |
+| `DELTA_BYTE_ARRAY` | the six strings above | 60 | `800104060003030000004e20000000000000000000008001040608070400000050250900000000000000000000000000755f3161623230755f323078` |
+
+The first row decodes by hand: 128, 4, 8 values, first 7; min delta -2 (`03`); widths 2,0,0,0; residuals 0,0,0,3,3,3,3 at 2 bits give `c0 3f` and six zero bytes of padding. Whole-file checks also passed for 1 to 70,000 rows with both dictionary modes, `i64::MIN` and `i64::MAX` in `revenue_cents`, an all-null `top_category`, and a zero-row file.
+
+- **Risk to exactness.** Values are unchanged if the reader decodes these pages; three readers do, and cherylaurelia's entry shows the scorer accepts delta and run-dictionary pages with INT32 counts in `user_daily`. The remaining risk is a writer bug, which the vectors and the existing duckdb equality check in the bench catch.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
