@@ -154,6 +154,80 @@ pub fn prefetch<T>(p: *const T) {
     }
 }
 
+/// Global user -> person table. Holds only IDs whose person differs from
+/// themselves, so a miss means "this ID is its own person". Buckets of four
+/// 16-byte slots (one cache line), key 0 = empty (no ID packs to 0 except the
+/// empty string, which is never looked up). Inserts are lock-free so the table
+/// is filled in parallel; lookups happen only after the build.
+pub struct LinkTab {
+    base: *mut [u64; 2],
+    nb_mask: usize,
+    shift: u32,
+}
+unsafe impl Sync for LinkTab {}
+unsafe impl Send for LinkTab {}
+
+impl LinkTab {
+    pub fn new(n: usize) -> LinkTab {
+        let slots = (n * 2).next_power_of_two().max(64);
+        let bytes = slots * 16;
+        let base = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "link table mmap");
+            #[cfg(target_os = "linux")]
+            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+            p as *mut [u64; 2]
+        };
+        let nb = slots / 4;
+        LinkTab { base, nb_mask: nb - 1, shift: 64 - nb.trailing_zeros() }
+    }
+    #[inline(always)]
+    pub fn prefetch(&self, h: u64) {
+        prefetch(unsafe { self.base.add(((h >> self.shift) as usize) * 4) });
+    }
+    /// Concurrent insert of a key that is not in the table yet.
+    pub fn insert(&self, k: Key, v: Key) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        assert!(k != 0);
+        let mut b = (hk(k) >> self.shift) as usize;
+        loop {
+            for i in 0..4 {
+                let slot = unsafe { self.base.add(b * 4 + i) };
+                let key = unsafe { &*(slot as *const AtomicU64) };
+                if key.load(Ordering::Relaxed) == 0 && key.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    unsafe { (*(slot as *const [AtomicU64; 2]))[1].store(v, Ordering::Relaxed) };
+                    return;
+                }
+            }
+            b = (b + 1) & self.nb_mask;
+        }
+    }
+    /// The person of `k` if it differs from `k`. `h` = hk(k).
+    #[inline(always)]
+    pub fn get(&self, k: Key, h: u64) -> Option<Key> {
+        let mut b = (h >> self.shift) as usize;
+        loop {
+            for i in 0..4 {
+                let s = unsafe { *self.base.add(b * 4 + i) };
+                if s[0] == k {
+                    return Some(s[1]);
+                }
+                if s[0] == 0 {
+                    return None;
+                }
+            }
+            b = (b + 1) & self.nb_mask;
+        }
+    }
+}
+
 /// Open addressing, linear probing, EMPTY marks a free slot. The backing
 /// storage can be larger than the active capacity so one map is reused.
 pub struct KMap<V: Copy> {
@@ -268,6 +342,44 @@ impl<V: Copy + Default> KMap<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn linktab_matches_hashmap() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for &n in &[0usize, 1, 3, 31, 32, 33, 1000, 50_000] {
+            let mut m: HashMap<u64, u64> = HashMap::new();
+            while m.len() < n {
+                // clustered keys too, to force bucket overflow
+                let k = if rnd() % 4 == 0 { 1 + rnd() % 64 } else { rnd() | 1 };
+                let v = rnd();
+                m.entry(k).or_insert(v);
+            }
+            let t = LinkTab::new(n);
+            let items: Vec<(u64, u64)> = m.iter().map(|(a, b)| (*a, *b)).collect();
+            std::thread::scope(|s| {
+                for part in items.chunks(items.len() / 4 + 1) {
+                    let t = &t;
+                    s.spawn(move || {
+                        for &(k, v) in part {
+                            t.insert(k, v);
+                        }
+                    });
+                }
+            });
+            for (&k, &v) in &m {
+                assert_eq!(t.get(k, hk(k)), Some(v));
+            }
+            for _ in 0..20_000 {
+                let k = if rnd() % 2 == 0 { 1 + rnd() % 200 } else { rnd() | 1 };
+                assert_eq!(t.get(k, hk(k)), m.get(&k).copied(), "n {n} k {k}");
+            }
+        }
+    }
     #[test]
     fn order() {
         let words: Vec<&[u8]> = vec![
