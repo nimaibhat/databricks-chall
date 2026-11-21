@@ -211,7 +211,13 @@ impl<T: Copy> Scatter<T> {
                     let dst = (next as *mut u8).sub(STG);
                     let mut i = 0;
                     while i < STG {
+                        #[cfg(target_feature = "avx")]
                         _mm256_stream_si256(dst.add(i) as *mut __m256i, _mm256_load_si256(st.add(i) as *const __m256i));
+                        #[cfg(not(target_feature = "avx"))]
+                        {
+                            _mm_stream_si128(dst.add(i) as *mut __m128i, _mm_load_si128(st.add(i) as *const __m128i));
+                            _mm_stream_si128(dst.add(i + 16) as *mut __m128i, _mm_load_si128(st.add(i + 16) as *const __m128i));
+                        }
                         i += 32;
                     }
                 }
