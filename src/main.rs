@@ -61,7 +61,7 @@ pub const fn env_u32(s: Option<&str>, d: u32) -> u32 {
         }
     }
 }
-pub const BB: u32 = env_u32(option_env!("XL_BB"), 14);
+pub const BB: u32 = env_u32(option_env!("XL_BB"), 15);
 pub const SPIN_US_DEFAULT: u64 = env_u32(option_env!("XL_SPIN_DEF"), 400) as u64;
 pub const BSIZE: usize = 1 << BB;
 pub const UB: u32 = env_u32(option_env!("XL_UB"), 12);
@@ -132,7 +132,7 @@ pub struct EdgeInfo {
 }
 
 pub struct TState {
-    pub ev: parse::Part,
+    pub ev: parse::EvPart,
     pub us: parse::Part,
     pub raws: Vec<(u64, u32)>,
     pub rawbuf: Vec<u8>,
@@ -148,7 +148,7 @@ pub struct TState {
     pub cx_raw: Vec<Rec>,
     pub cx_ev: Vec<Vec<Rec>>,
     pub cx_ck: Vec<Vec<[u64; 3]>>,
-    pub ck: Vec<[u64; 2]>,
+    pub ck: Vec<u64>,
     pub runbuf: Vec<Rec>,
     pub pend: Vec<(u32, u16)>,
     pub cnt: Vec<u32>,
@@ -250,12 +250,12 @@ impl G {
         }
     }
     #[inline(always)]
-    pub fn csr_range(&self, u: u32) -> &[[u64; 2]] {
+    pub fn csr_range(&self, u: u32) -> &[u64] {
         unsafe {
             let i = u as usize + (u as usize >> UB);
             let a = *self.csr_off.add(i) as usize;
             let b = *self.csr_off.add(i + 1) as usize;
-            std::slice::from_raw_parts(self.csr.add(a), b - a)
+            std::slice::from_raw_parts((self.csr as *const u64).add(a), b - a)
         }
     }
 }
@@ -297,6 +297,7 @@ fn main() {
     }
     let (data, outdir) = dirs(&args, 0);
     sys::exec_init(&args, &data, &outdir, ncpu_env());
+    sys::fault_fallback_init();
     sys::fd_reserve();
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[v2b] panic: {info}");
@@ -316,8 +317,13 @@ fn main() {
         sys::tl::T0_NS = sys::tl::realtime_ns() - t0.elapsed().as_nanos() as u64;
         sys::tl::LAPT.reserve(64);
     }
+    #[cfg(feature = "tl")]
+    sys::mp::ON.store(std::env::var("XL_MEMPROF").is_ok(), std::sync::atomic::Ordering::Relaxed);
     if std::env::var("XL_ALLOC").map_or(true, |v| v == "1") {
         sys::alloc_enable();
+    }
+    if let Some(v) = std::env::var("XL_DONATE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        sys::DONATE_DIV.store(v, std::sync::atomic::Ordering::Relaxed);
     }
     if std::env::var("XL_FIRST4K").is_ok_and(|v| v == "1") {
         sys::FIRST_SMALL.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -465,7 +471,7 @@ fn main() {
                 v(c.rev.as_ptr() as *const u8, c.rev.len() * 4),
                 v(c.cat.as_ptr(), c.cat.len()),
                 v(t.edge.as_ptr() as *const u8, t.edge.len() * 16),
-                if g.csr.is_null() { (0, 0) } else { v((g.csr as *const u8).wrapping_add(g.ncsr * 16 * tid / nt), g.ncsr * 16 * (tid + 1) / nt - g.ncsr * 16 * tid / nt) },
+                if g.csr.is_null() { (0, 0) } else { v((g.csr as *const u8).wrapping_add(g.ncsr * 8 * tid / nt), g.ncsr * 8 * (tid + 1) / nt - g.ncsr * 8 * tid / nt) },
                 if endrel.as_deref() == Some("2") { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
                 (0, 0),
             ];
