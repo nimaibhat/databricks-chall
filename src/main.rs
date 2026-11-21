@@ -528,7 +528,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<
     let floor = d.as_ptr();
     let ceil = unsafe { floor.add(d.len()) };
     let unknown = ctx.cat_unknown as u32;
-    let tsbl = ts_bl();
+    let mut memo = DateMemo::new();
     let sh1 = 64 - p1_bits();
     let sh2 = 64 - p2_bits();
     let tab = &ctx.links;
@@ -545,7 +545,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<
             return;
         }
         let eid = pack_fast(f[0], ceil);
-        let ingest = match parse_ingest_s(f[3], ceil) {
+        let ingest = match parse_ingest_s(f[3], ceil, &mut memo) {
             Some(v) => (v - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
         };
@@ -557,7 +557,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let Some(ts) = (if tsbl { parse_ts_bl(f[2], floor, ceil) } else { parse_ts_fast(f[2], floor, ceil) }) else { break 'v };
+            let Some(ts) = parse_ts_fast(f[2], floor, ceil, &mut memo) else { break 'v };
             if cfg!(feature = "diag") && stage == 3 {
                 sink = sink.wrapping_add(eid).wrapping_add(ingest as u64).wrapping_add(ts as u64);
                 return;
@@ -638,7 +638,7 @@ fn emit_click(tab: &LinkTab, p: &PendC, cb: &mut Scatter<CRec>, bs: &mut Blocks,
 fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut Scatter<CRec>, bs: &mut Blocks) {
     let cws = ctx.ws - WEEK_MS;
     let we = ctx.we;
-    let tsbl = ts_bl();
+    let mut memo = DateMemo::new();
     let floor = d.as_ptr();
     let ceil = unsafe { floor.add(d.len()) };
     let sh2 = 64 - p2_bits();
@@ -649,7 +649,7 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut Scatter<
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let Some(ts) = (if tsbl { parse_ts_bl(f[3], floor, ceil) } else { parse_ts_fast(f[3], floor, ceil) }) else { return };
+        let Some(ts) = parse_ts_fast(f[3], floor, ceil, &mut memo) else { return };
         if ts < cws || ts >= we {
             return;
         }
