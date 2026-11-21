@@ -65,7 +65,8 @@ pub enum Idx {
     /// (index, repeat count) runs; written as RLE runs in one page
     Runs(Vec<(u32, u32)>),
     /// one index per value; written bit-packed, in pages of PAGE_ROWS values
-    /// so that a few large indices do not widen every value
+    /// (each with its own bit width) so that a few large indices do not
+    /// widen every value
     Each(Vec<u32>),
 }
 
@@ -89,7 +90,7 @@ pub struct Column {
     pub enc: Enc,
 }
 
-const PAGE_ROWS: usize = 16384;
+const PAGE_ROWS: usize = 2048;
 
 // ---- thrift compact protocol
 struct T {
