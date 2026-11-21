@@ -1797,7 +1797,7 @@ pub fn pin_mode() -> u32 {
 const RD_DEFAULT: usize = env_u32(option_env!("XL_RD_DEF"), 0) as usize;
 const PIN_DEFAULT: usize = env_u32(option_env!("XL_PIN_DEF"), 2) as usize;
 const QORD_DEFAULT: usize = env_u32(option_env!("XL_QORD_DEF"), 2) as usize;
-const CH_DEFAULT: usize = env_u32(option_env!("XL_CH_DEF"), 8192) as usize;
+const CH_DEFAULT: usize = env_u32(option_env!("XL_CH_DEF"), 65536) as usize;
 
 pub static RD_AUTO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const RD_AUTO_BYTES: usize = 128 << 10;

@@ -1680,7 +1680,7 @@ unsafe fn cl_fast<S: ClickSink, const TAIL: bool>(cx: &Cx<CkBatch, S>, p: *const
 }
 
 const PIPE: u8 = 0;
-const PFD: usize = 1024;
+const PFD: usize = 512;
 const CHAIN: u8 = 1;
 
 #[inline(always)]
