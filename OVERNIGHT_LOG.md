@@ -76,6 +76,8 @@ ups                        wall min 307.2 med 310.2 max 310.9 | setup=0.0 parse=
 v21p                       wall min 299.0 med 302.1 max 303.8 | setup=0.0 parse=230.5 ev3a=50.4 write=10.1 total=297.1
 ```
 
+Experiment 17: on 9363748 (`v21p`), seed 20. (a) The other eleven variants in upstream's probe set (`v/18, b13, c2, dt, e2, fr, k, m1, m2, mn, o2`), built as they are, 7 rounds: all slower than `v21p` (199.4 / 200.0): 18 204.4, b13 201.0, c2 206.6, dt 212.5, e2 205.8, fr 205.5, k 211.0, m1 209.8, m2 215.4, mn 215.8, o2 209.0. They are older states of the same pipeline. (b) Runtime knobs, 6 rounds each, control 196.0 / 200.3: `XL_RECYCLE=0` 205.1 (ev3a +8); `XL_QORD=0/1` 222 / 219 (parse +23); `XL_RELK`, `XL_IOADV`, `XL_R3`, `XL_DONATE`, `XL_POPW=1`, `XL_FA=1`, `XL_PSETUP=0`, `XL_FREE=0`, `XL_FRLAG=0/4`, `XL_CH=32768/131072`, `XL_PF=0/1` all 195.3 to 200.5 at the minimum and 199.3 to 202.2 at the median, i.e. no different from the control. Rejected, nothing changed.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
