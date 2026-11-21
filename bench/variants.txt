@@ -1,8 +1,4 @@
 # label|ref|build-args|env
-main|origin/gate-main-09b1677||
-s33|origin/gate-s33-6b40cf2||
-s34|origin/gate-s34-28cc4bf||
-s34g8k|origin/gate-s34g8k-28cc4bf||STREAM=8192
-s34nohint|origin/gate-s34nohint-28cc4bf||OUTSYNC=0
-s34one|origin/gate-s34one-28cc4bf||STREAM=0
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+main|origin/gate-main-b959c3e||
+blk8|origin/gate-blk8-fc5e767||
+blk16|origin/gate-blk16-ed6ce49||
