@@ -1730,6 +1730,31 @@ Pulled: Vibhor7-7 `765c6e2..b4025c3` (experiments 30 to 32), Th3r0n `4451e22..e1
 - **Expected gain.** -0.2 to -0.4% of wall. Small, but it is in a serial stretch, so it is all wall, and it keeps the pre-fault window.
 - **Risk to exactness.** None: prefetches and selects only; the roots do not depend on the order.
 
+## Iteration 47 (2026-11-21, 07:25): the board against the runners, after the user's redirect
+
+The user asked whether a jump to the board's top is findable (board at 06:54: 0.31, 0.54, 0.55, 0.56, 0.58, 0.61, 0.61, 0.63, 0.64 ... 14th 0.69 s; ours 0.82 s) and pointed this loop at structural causes instead of 1% items.
+
+### 47.1 More public entries found and measured
+
+- Entries must be public repositories, so a GitHub search by push date found 41 more (`repos3/` in the scratchpad). [Js-Hwang1/buildathon_databricks](https://github.com/Js-Hwang1/buildathon_databricks) keeps unchanged copies of other teams' entries for comparison and links [mliao0128/fraun-shopping-sessions](https://github.com/mliao0128/fraun-shopping-sessions) (team Fraun, 0.64 s on the board, public code from Friday 18:41), [yihao-qiao/p-4a81fb27](https://github.com/yihao-qiao/p-4a81fb27) and [Louise-Ruza/shopping-sessions](https://github.com/Louise-Ruza/shopping-sessions). The board leader's repository is public too but carries a notice asking other teams' tools not to read or use it during the event; it was not read, and the user was told.
+- Run [44901707257](https://github.com/nimaibhat/databricks-chall/actions/runs/44901707257) on `bench-ext`, EPYC 9V45 (Zen 5), 4 vCPU, full `docker run` wall, interleaved, median of 5 (20M) and 3 (60M), every output equal to ours:
+
+| Entry | 20M | 60M |
+|---|---|---|
+| ours `73f8661` | **0.822** | **2.232** |
+| Js-Hwang1 `73a09cc` (C++) | 0.849 | 2.246 |
+| Vibhor7-7 `e6ccab2` | 1.042 | 2.932 |
+| Louise-Ruza `75171b8` | 1.061 | 2.947 |
+| yihao-qiao `95120cb` | 1.074 | 3.187 |
+| Fraun `83629fd` | 1.891 | 5.885 |
+
+### 47.2 What that says: the gap is the scorer's machine, not the design
+
+- On this runner ours is the fastest of everything public that may be read, and 21% ahead of Vibhor7-7. On the board Vibhor7-7's older commit scored 0.76 s and ours 0.82 s. The two orders disagree by about 30%, far more than the board's stated noise for one team, and in the direction the optimizer's log already shows in small: level with or ahead of the public builds on Zen 4 and Zen 5, 4 to 7% behind on Ice Lake (experiment 49).
+- The scorer differs from every machine this build was tuned on: Cascade Lake at 2.8 GHz (no fast short `rep movsb`, 1 MB L2 shared by two hyperthreads, slower page zeroing and copying), **8 hyperthreads on 4 cores** where the runners give 4 on 2, and `/data` on tmpfs. Nothing in `OVERNIGHT_LOG.md` was measured at 8 threads on 4 Intel cores. Candidates for a large scorer-only loss, none measured: the `pread` copy of the whole input (kernel copy is 14% of CPU on Intel by Vibhor7-7's `time`, and a tmpfs mapping needs no copy); non-temporal scatter with 8 threads sharing 4 cores' fill buffers; partition counts and arena sizes chosen at 4 threads; thread count itself (8 against 4 on the scorer was never A/B'd).
+- **The step that would settle it** is a run on the scorer's machine type: a Google Cloud `n2-standard-8` (Cascade Lake, 8 vCPU) with `/data` on tmpfs, `docker run --cpus 8`, ours against Js-Hwang1 and Vibhor7-7, plus our switches (`IOMODE`, thread count, partition bits, pre-fault). It costs well under a dollar an hour and is the only measurement that can find a 20 to 30% effect; the GitHub runners cannot. This needs the user's cloud account.
+- Until that exists, the board itself is the only Cascade Lake measurement, at 2 submissions an hour and about 20% noise between machines: too coarse to tune with.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
