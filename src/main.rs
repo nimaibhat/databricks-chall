@@ -77,14 +77,13 @@ fn par_for(n: usize, threads: usize, f: impl Fn(usize, usize) + Sync) {
 // ---------------------------------------------------------------------------
 /// One parsed event copy. `pc` = price << 8 | category, or INVALID.
 #[derive(Clone, Copy, Default)]
-#[repr(C)]
+#[repr(C, packed(4))]
 struct ERec {
     eid: Key,
     person: Key,
     ts: u32,     // ms since window start (valid copies only)
     ingest: i32, // seconds since window start, saturated
     pc: u32,
-    _pad: u32,
 }
 const INVALID: u32 = u32::MAX;
 
