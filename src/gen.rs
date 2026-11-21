@@ -75,6 +75,50 @@ pub fn dec36(s: &[u8]) -> Option<u64> {
     Some(v)
 }
 
+/// `dec36` for a field whose last byte is at `end - 1`, with at least 8
+/// readable bytes before `end` (they may belong to earlier fields): the
+/// whole field in one word, no loop. Same result as `dec36` for every input.
+///
+/// # Safety
+/// `end - 8 .. end` must be readable.
+#[inline(always)]
+pub unsafe fn dec36_word(end: *const u8, n: usize) -> Option<u64> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    if n == 0 || n > 8 {
+        return None;
+    }
+    // the field's bytes at the top of the word (last character in the top
+    // byte), '0' in the bytes before it
+    let keep = !0u64 << (8 * (8 - n as u32));
+    let raw = std::ptr::read_unaligned(end.sub(8) as *const u64);
+    let w = (raw & keep) | (0x3030_3030_3030_3030 & !keep);
+    // per byte (all must be ASCII): digit '0'..='9' or letter 'a'..='z'
+    let ge = |k: u64| w.wrapping_add((0x80 - k) * ONES) & HI;
+    let digit = ge(0x30) & !ge(0x3A);
+    let letter = ge(0x61) & !ge(0x7B);
+    if (w & HI) != 0 || (digit | letter) != HI {
+        return None;
+    }
+    let first = (raw >> (8 * (8 - n as u32))) as u8;
+    if first == b'0' && n > 1 {
+        return None;
+    }
+    // value: low nibble for a digit; nibble + 9 for a..o; nibble + 25 for p..z
+    let l = letter >> 7;
+    let val = (w & (0x0F * ONES)) + l * 9 + (((w >> 4) & l) << 4);
+    // the first character is the lowest byte and the most significant digit
+    const M8: u64 = 0x00FF_00FF_00FF_00FF;
+    const M16: u64 = 0x0000_FFFF_0000_FFFF;
+    let p = (val & M8) * 36 + ((val >> 8) & M8);
+    let q = (p & M16) * 1296 + ((p >> 16) & M16);
+    let v = (q & 0xFFFF_FFFF) * 1_679_616 + (q >> 32);
+    if v > M40 {
+        return None;
+    }
+    Some(v)
+}
+
 /// Digit value of a base-36 character, 0xFF for any other byte.
 static D36: [u8; 256] = {
     let mut t = [0xFFu8; 256];
@@ -116,6 +160,18 @@ pub fn id_value(field: &[u8], prefix: u8) -> Option<u64> {
         return None;
     }
     dec36(&field[1..])
+}
+
+/// `id_value`, by the word decoder when the field has room before it.
+#[inline(always)]
+pub fn id_value_fast(field: &[u8], prefix: u8, roomy: bool) -> Option<u64> {
+    if !roomy {
+        return id_value(field, prefix);
+    }
+    if field.len() < 2 || field[0] != prefix {
+        return None;
+    }
+    unsafe { dec36_word(field.as_ptr().add(field.len()), field.len() - 1) }
 }
 
 #[cfg(test)]
@@ -164,6 +220,20 @@ mod tests {
             let mut z = b"0".to_vec();
             z.extend_from_slice(&s);
             assert_eq!(dec36(&z), None, "leading zero");
+        }
+        // the word decoder agrees with the loop on every kind of input
+        let mut buf = vec![b','; 64];
+        let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyzAZ_-. \"\xff{`/:@[";
+        for i in 0..3_000_000u64 {
+            let n = (r() % 10) as usize;
+            for k in 0..n {
+                buf[40 - n + k] = if i % 3 == 0 { alphabet[(r() % 36) as usize] } else { alphabet[(r() % alphabet.len() as u64) as usize] };
+            }
+            for k in 0..8 {
+                buf[40 - n - 1 - k] = alphabet[(r() % alphabet.len() as u64) as usize];
+            }
+            let f = &buf[40 - n..40];
+            assert_eq!(unsafe { dec36_word(f.as_ptr().add(n), n) }, dec36(f), "{:?}", String::from_utf8_lossy(f));
         }
         assert_eq!(dec36(b""), None);
         assert_eq!(dec36(b"zzzzzzzzz"), None);
