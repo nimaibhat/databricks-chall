@@ -12,9 +12,11 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 |---|---|---|---|---|---|---|
 | 1 | **Risk item, not a speed-up:** find which of experiment 9's three parts makes 40M events slower (+11 ms), and ship only the parts that do not | `main.rs:64` (`BB`), `parse.rs:1800` (`CH_DEFAULT`), `k_free.rs:1683` (`PFD`) | Removes a 2.7% loss if the hidden set is larger than reported, at a cost of at most about 1 ms at 20M | Log, experiment 9: 422.7 against 411.5 at 40M, parse +16.5, ev3a -5.7. **My reading:** it is the bucket size. Bucket count grows with the input (`nb = ecap >> BB`), so at 40M each parse thread scatters into about 3,100 staging lines (197 KiB) instead of 1,540; experiment 7 already showed `BB=14` costing parse 2.1 ms at 20M and `BB=13` 11 ms | None | 14.1 |
 | 2 | Frequency-licence probe at three points (worker start, end of parse, end of ev3a) | `parse.rs:2181`, `events.rs:2096` | Probe: none. If parse is held at L1 by its 256-bit multiplies: **my estimate** up to 5 ms | Log: memory traffic accounts for about 70 of parse's 158 ms, "the rest is computation". So about 88 ms scales with the core clock. Quoted: Lemire 2018, Downs 2020 (1.2) | Probe: none | 1.2, 3.3, 14.2 |
-| 3 | One thread per core run (`NCPU=4 XL_PIN=0 taskset -c 0-3`) | none | Diagnostic only; says how much the second hyperthread adds, which bounds row 2 | 11.1 | None | 11.1 |
-| 4 | Setup: spawn workers flat from main and offload thread 0's chain | `sys.rs:279-292`, `setup.rs:835-932` | Under 1 ms | 13.1 | None | 13.1 |
-| 5 | (empty: I have no fifth idea that I can support with a number or a mechanism) | | | | | |
+| 3 | Clear arena blocks during setup, on workers spawned flat from main (the two changes only work together) | `sys.rs:279-292` (`pool_start`, `worker`), `setup.rs:826-833`, `parse.rs:180` (`new_chunk`) | **My estimate** 1 to 2 ms | Log: page zeroing is 11.1% of samples; the VM writes 30 GB/s on 8 threads and parse uses that bandwidth for zeroing and records at once, while setup's 2.5 ms uses almost none. Log: workers only exist from 0.9 to 1.45 ms (13.1) | None: same bytes in the same places | 15.1 |
+| 4 | `ev3b`: find out whether its 2.6 ms of wall is one item, and if so split it | `events.rs:2126-2222` (`stage3b`), `:2312` (the sort by size) | Up to 1.5 ms | Log: `ev3b wall 2.56, busy 16.2, idle 4.34 (21%)`, 599 joined runs. 16 thread-ms on 8 threads should take 2.0 ms; the rest is a tail | Low if only the scheduling changes; any change to how one user's segments are fed is row-sensitive | 15.2 |
+| 5 | Put the scanner's lookup tables on one huge page | `k_free.rs:604-624` (`static T`) | **My estimate** 0 to 2 ms of parse, could be 0; costs about 0.3 ms at start | Mechanism only: the tables are about 1 MB of `.rodata` on 4 KiB pages, read about 12 times per line. The VM has no counters, so the dTLB miss rate is unknown | None to output; start-up remapping is delicate (15.3) | 15.3 |
+
+Diagnostics that cost no code and would direct the next round (15.4): `perf annotate` of the three hottest functions; a profile of the write stage alone; the one-thread-per-core run (11.1).
 
 **Closed by measurement since iteration 9 (do not re-propose):**
 - Row 1 of iteration 9 (release input once at the end): experiment 5. Parse does drop to 151.0, but the parallel release then takes 8.6 ms, so the wall is the same. The log's conclusion is the durable fact: **unmapping 1.8 GB of 4 KiB input pages costs about 8 ms of wall on 8 threads wherever it is done.** My estimate of 3 to 6 ms for the parallel release was too low.
@@ -25,6 +27,7 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 
 ## Requests to the coding agent
 
+0. New in iteration 15: row 3 (15.1), the `ev3b` item timing (15.2), and the three measurements of 15.4.
 1. Row 1: at 40M (seed 5), three builds on top of `801982c`, each with one part reverted: `XL_BB=15`; `XL_CH_DEF=8192`; `PFD=1024`. Also one size in between (30M) for the shipped build against `941879e`, to see where the crossover is.
 2. Row 2: the probe of 1.2 with 3.3's third measuring point.
 3. Row 3: the one-thread-per-core run of 11.1.
@@ -472,6 +475,48 @@ Every fallback prints `[v2b] FALLBACK: <reason>` before it re-executes (`sys.rs:
 - Rows 3 and 4 (bucket size, prefetch distance) were each under 1 ms alone, as the lower ends of my ranges said, and I had the prefetch direction open; 512 B was the better one.
 - Net: of five ranked ideas, the two I ranked highest were null or negative, and the kept gain came from the three lowest combined.
 
+## Iteration 15 (2026-11-21): next batch
+
+Where the time is now, from the log (tmpfs, before experiment 9): parse 158 ms, of which the log's bandwidth test puts about 70 ms in memory traffic; kernel time is 21% of parse thread time; in the profile `run_events` 31.4%, page zeroing 11.1%, `ev_batch` 10.5%, `stage3` 9.1%, `links::job` 5.0%, `cl_loop` 4.8%. Everything below is aimed at one of those.
+
+### 15.1 Row 3: do the page clearing when the memory bus is idle
+
+- **The argument, with the log's numbers.** Zeroing is about 170 thread-ms for about 0.56 GB, 3.3 GB/s per thread. Eight threads at that rate are 26 GB/s, which is the VM's measured write ceiling (30 GB/s on 8 threads). So during parse the kernel's zeroing, the record stores and the input reads share a saturated bus. During setup (0 to 2.5 ms) the bus is nearly idle and one thread alone writes 7.4 GB/s.
+- **Why `XL_PREFAULT` being null (experiment 2) does not close this.** That knob faults each worker's 4 MiB heap chunk, 8 pages in all, and with the tree spawn the workers only exist from 0.9 to 1.45 ms (13.1). It never touched the record arenas.
+- **Change, two parts that only pay together.**
+  1. `pool_start` (`sys.rs:279`): spawn all `nt - 1` workers from main in a loop, and drop the two child spawns at the top of `worker` (`sys.rs:289-293`). Main's first heap page is already faulted, so the workers exist after seven thread creations (**my estimate** 0.2 to 0.3 ms) and not after three sequential 2 MiB clears.
+  2. In `setup_par`'s worker branch (`setup.rs:828-832`), replace the spin `while !(...) { spin_loop() }` by: take the next 2 MiB block of a pre-reserved range and `madvise(MADV_POPULATE_WRITE)` it, until `keys.done` is set. The arenas are created after the job today (`setup.rs:968-969`); their sizes need only `ev_bytes`, `ck_bytes`, `lk_bytes`, which thread 0 has after the listing (`setup.rs:844`), so creating them there and publishing them through a `Slot` (as `rowcap` and `nbs` already are) is the enabling step. `Arena::alloc` hands out blocks in address order (`sys.rs:175`), so "the first N blocks of the event arena" is well defined and parse will use exactly those first.
+- **Size (my estimate).** About 1.5 ms of window on 7 threads; at 7 GB/s single-thread and a 30 GB/s ceiling that is at most 40 MB, about 20 blocks, 7% of the zeroing. Taken out of a bandwidth-bound parse that is 1 to 2 ms. It cannot lengthen setup: the loop ends on `keys.done`, and a block in progress is 0.3 ms at worst.
+- **What to watch:** `ev_bytes / 28 * 16` (`setup.rs:968`) over-reserves the arena; populate only blocks below the expected use (say the first 32) so no cleared memory is wasted. With `PARTS_READY` the `Part`s are built in setup (`setup.rs:975-983`); they take their first block lazily in `new_chunk`, so nothing else changes.
+- **Risk to output:** none. The same records go to the same addresses.
+
+### 15.2 Row 4: `ev3b`'s tail
+
+- `stage3b` (`events.rs:2126`) processes the users whose events cross a bucket boundary ("joined" runs: 599 at 20M with 2^15 buckets, about twice that now), largest first (`events.rs:2312`), one user per `fetch_add`.
+- The log shows 16.2 thread-ms of work finishing in 2.56 ms of wall with 21% idle. On 8 threads the work alone would be 2.0 ms, so about half a millisecond, and possibly more, is waiting on the largest items. The five whale users hold 1 to 2% of all events each (rules), 200,000 to 400,000 events; if a whale's edge segments are fed raw rather than as digests (they are digested only when the segment has at least 4,096 events, `DIG_MIN`, `events.rs:368`), one whale is on one thread for most of the stage.
+- **First, measure:** time each item in `stage3b` in the `tl` build (there is already `tl::TASK` for the write stage, `out.rs:527-533`) and log the largest three. If the largest is under 0.5 ms, close this.
+- **If one item dominates,** the safe change is in scheduling only: each thread releases its part of the event arena before its first item (`release_part`, `events.rs:2134-2136`, a `madvise` over about 40 MB); moving that release to after the loop for the thread that takes item 0 would start the longest item earlier. Splitting one user's feed across threads is not proposed: session state carries from one segment to the next (`feed_slice`, `feed_digest`), and that is row-sensitive.
+- Note that `BB=14` doubled the number of bucket boundaries, so `ev3b` may have grown since the log's 2.56 ms; the lap line of the shipped build will show it.
+
+### 15.3 Row 5: the scanner's tables on a huge page (speculative)
+
+- `static T: Tables` (`k_free.rs:604-624`) holds the per-shape rows the scanner indexes for every line: `jid` (64 x 64 rows), `tj` (128 rows of 512 bytes), `tail`, `kind2`, `prod`, and the click tables; about 1 MB in `.rodata`, which is file-backed and so on 4 KiB pages. Each event line reads about 12 rows (2.2). The first-level data TLB of this CPU has 64 entries for 4 KiB pages; the input stream, the batch and the tables compete for them. A miss that hits the second-level TLB costs about 7 cycles.
+- **Unknown:** how many distinct table pages are hot. If line shapes repeat (IDs have fixed lengths, so they largely do), the hot set is a few dozen pages and this gains nothing. Without counters on the VM I cannot tell, which is why this is rank 5.
+- **How, without touching the scanner:** at the very start of `main`, before any thread exists, copy the 2 MiB-aligned range that contains `T` into an anonymous 2 MiB region advised `MADV_HUGEPAGE`, give it the original protection, and `mremap(MREMAP_MAYMOVE | MREMAP_FIXED)` it over the original address. Addresses do not change, so no code that uses `T` changes. This is the known "remap the binary onto huge pages" technique. It needs the link to align segments at 2 MiB (`-C link-arg=-Wl,-z,common-page-size=2097152,-z,max-page-size=2097152`) so that a whole 2 MiB range belongs to the binary, and it costs one 2 MiB clear and copy at start, about 0.3 ms.
+- **A cheaper test of whether it can matter at all:** a measurement build in which `run_events` is called on the same 64 MiB buffer twice in a row from one thread, timed, with and without the remap. If the second pass does not get faster with the remap, drop the idea.
+- **Risk to output:** none in principle; the bytes are identical. The risk is to start-up (a wrong range or protection is a crash, which on the scorer is a zero), so it needs the gate and a fallback to "do nothing" if any call fails.
+
+### 15.4 Three measurements that would direct the next round (no code)
+
+1. `perf annotate` (the same cpu-clock profile as before, on the tmpfs run) for `k_free::run_events`, `parse::Ctx::ev_batch` and `links::job`: the ten source lines or instructions with the most samples in each. With timer sampling a stalled load shows up on the instruction after it, so this separates "waiting on the input" from "waiting on a table" from "waiting on a store", which is the question behind rows 2 and 5 and behind any further prefetch work.
+2. `perf report --sort symbol` restricted to the write stage (`--time` with the stage's start and end from the `tl` line, or simply all symbols in `pqw::` and `out::` and `complex::` with their percentages). The stage is 4.8% of the run's CPU and no single function has yet appeared above 1.1%; I need the list to see whether it is the encoders, the row split, or the complex persons.
+3. The one-thread-per-core run of 11.1 (`NCPU=4 XL_PIN=0 taskset -c 0-3`), `parse` lap.
+
+### 15.5 A caution on row 2 (the licence probe), so it is not oversold
+
+The authors wrote all vector code that runs during parse through 256-bit wrappers with explicit barriers against 512-bit code generation (`sys::z`, `yb`/`kb`, `sys.rs:1139-1158`), including the link jobs that run inside parse, and kept 512-bit code to stage 3. People who do that have usually measured frequency effects on their own machine. That makes it less likely that a second, cheaper licence step was left on the table, though they may not have had a Cascade Lake to test on (the build targets it, `target-cpu=cascadelake`). The probe is still 20 lines and settles it either way.
+
 ## Next passes
 
-Nothing in the queue that I can support. I will re-read `OVERNIGHT_LOG.md` when it changes and re-rank.
+1. `core.rs` `feed_slice` / `feed_digest` and `events.rs` `digest_put`, for 15.2.
+2. `complex.rs` and `core.rs` `person`: 202,264 complex events go through a comparison sort per shard (`complex.rs:95`); small, but it is on the write stage's critical path.
