@@ -156,7 +156,7 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
         let d: &[u8] = &m.maps[c.file as usize];
         let p = unsafe { pairs.get(t) };
         let sk = unsafe { skeys.get(t) };
-        scan_lines::<2>(d, c.start, c.end, |f| {
+        scan_lines_fast::<2>(d, c.start, c.end, |f| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
@@ -382,11 +382,15 @@ fn main() {
     let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * BLK * 2 + (256 << 20);
     let arena = Arena::new(est * 3 / 2);
 
-    // ---- phase 1
-    let (links, link_shift) = build_links(&data, threads);
-    eprintln!("phase1 done {:?} {}", t_start.elapsed(), cpu());
+    // ---- phase 1, concurrent with phase 2: parsing never reads the link maps
+    let link_threads: usize = env("LINKT", "0").parse().unwrap_or(0);
+    let link_threads = if link_threads == 0 { (threads / 2).max(1) } else { link_threads };
+    let links_job = {
+        let data = data.clone();
+        std::thread::spawn(move || build_links(&data, link_threads))
+    };
 
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         ws,
         we,
         day0,
@@ -397,11 +401,14 @@ fn main() {
         campaigns,
         camp_names,
         camp_channels,
-        links,
-        link_shift,
+        links: Vec::new(),
+        link_shift: 64,
     };
 
     if env("BENCH", "0") == "2" {
+        let (links, link_shift) = links_job.join().expect("links");
+        ctx.links = links;
+        ctx.link_shift = link_shift;
         microbench(&ctx, &ev_m, &cl_m, &arena);
         return;
     }
@@ -432,6 +439,10 @@ fn main() {
     let eparts = PerThread::from_vec(transpose(ebl.into_inner(), 1usize << p1_bits()));
     let cparts = transpose(cbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
+    let (links, link_shift) = links_job.join().expect("links");
+    ctx.links = links;
+    ctx.link_shift = link_shift;
+    eprintln!("phase1 joined {:?}", t_start.elapsed());
 
     // ---- phase 3: dedup per eid partition, survivors partitioned by person
     let sbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
@@ -528,7 +539,7 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, cl_m: &Mapped, arena: &Arena) {
     let run = |name: &str, lines: u64, f: &mut dyn FnMut(&[&[u8]; 7])| {
         let t = Instant::now();
         for c in ch {
-            scan_lines::<7>(&ev_m.maps[c.file as usize], c.start, c.end, |x| f(x));
+            scan_lines_fast::<7>(&ev_m.maps[c.file as usize], c.start, c.end, |x| f(x));
         }
         eprintln!("  {name:10} {:.1} ns/line", t.elapsed().as_nanos() as f64 / lines.max(1) as f64);
     };
@@ -581,7 +592,7 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, cl_m: &Mapped, arena: &Arena) {
     }
     let t = Instant::now();
     for c in cch {
-        scan_lines::<4>(&cl_m.maps[c.file as usize], c.start, c.end, |f| acc = acc.wrapping_add(f[3].len() as u64));
+        scan_lines_fast::<4>(&cl_m.maps[c.file as usize], c.start, c.end, |f| acc = acc.wrapping_add(f[3].len() as u64));
     }
     eprintln!("  cl scan    {:.1} ns/line", t.elapsed().as_nanos() as f64 / cl_lines as f64);
     let mut cb: Vec<BList<CRec>> = (0..(1usize << p2_bits())).map(|_| BList::new()).collect();
@@ -601,7 +612,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
     let ceil = unsafe { floor.add(d.len()) };
     let unknown = ctx.cat_unknown as u32;
     let tsbl = ts_bl();
-    scan_lines::<7>(d, start, end, |f| {
+    scan_lines_fast::<7>(d, start, end, |f| {
         if f[0].is_empty() {
             return;
         }
@@ -629,7 +640,8 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             };
             r.ts = (ts - ws) as u32;
             r.person = pack_fast(f[1], ceil);
-            r.pc = (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown);
+            // the category is only ever read for purchases
+            r.pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
         }
         unsafe { eb.get_unchecked_mut((hk(eid) >> (64 - p1_bits())) as usize) }.push(r, bs);
     });
@@ -642,7 +654,7 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
     let tsbl = ts_bl();
     let floor = d.as_ptr();
     let ceil = unsafe { floor.add(d.len()) };
-    scan_lines::<4>(d, start, end, |f| {
+    scan_lines_fast::<4>(d, start, end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
