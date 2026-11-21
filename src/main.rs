@@ -368,6 +368,7 @@ fn main() {
     // map the inputs early so the arena can be sized
     let ev_m = Mapped::open(&list_csv(&data.join("events")));
     let cl_m = Mapped::open(&list_csv(&data.join("clicks")));
+    background_readahead(&[&ev_m, &cl_m]);
     let ev_bytes: usize = ev_m.maps.iter().map(|m| m.len()).sum();
     let cl_bytes: usize = cl_m.maps.iter().map(|m| m.len()).sum();
     // ERec 32 B per ~78 B line, CRec 32 B per ~45 B line, plus partial blocks
@@ -394,7 +395,7 @@ fn main() {
     };
 
     if env("BENCH", "0") == "2" {
-        microbench(&ctx, &ev_m, &arena);
+        microbench(&ctx, &ev_m, &cl_m, &arena);
         return;
     }
     // ---- phase 2: parse events + clicks
@@ -503,7 +504,7 @@ fn main() {
     std::process::exit(0);
 }
 
-fn microbench(ctx: &Ctx, ev_m: &Mapped, arena: &Arena) {
+fn microbench(ctx: &Ctx, ev_m: &Mapped, cl_m: &Mapped, arena: &Arena) {
     let mut ch = Vec::new();
     chunks_of(0, ev_m, 4 << 20, &mut ch);
     let ch = &ch[..ch.len().min(40)];
@@ -564,6 +565,24 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, arena: &Arena) {
         parse_events(ctx, &ev_m.maps[c.file as usize], c.start, c.end, &mut eb, &mut bs);
     }
     eprintln!("  full       {:.1} ns/line ({} lines, {})", t.elapsed().as_nanos() as f64 / lines as f64, lines, acc);
+    let mut cch = Vec::new();
+    chunks_of(1, cl_m, 4 << 20, &mut cch);
+    let cch = &cch[..cch.len().min(40)];
+    let mut cl_lines = 0u64;
+    for c in cch {
+        scan_lines::<4>(&cl_m.maps[c.file as usize], c.start, c.end, |_| cl_lines += 1);
+    }
+    let t = Instant::now();
+    for c in cch {
+        scan_lines::<4>(&cl_m.maps[c.file as usize], c.start, c.end, |f| acc = acc.wrapping_add(f[3].len() as u64));
+    }
+    eprintln!("  cl scan    {:.1} ns/line", t.elapsed().as_nanos() as f64 / cl_lines as f64);
+    let mut cb: Vec<BList<CRec>> = (0..P2).map(|_| BList::new()).collect();
+    let t = Instant::now();
+    for c in cch {
+        parse_clicks(ctx, &cl_m.maps[c.file as usize], c.start, c.end, &mut cb, &mut bs);
+    }
+    eprintln!("  cl full    {:.1} ns/line ({} lines)", t.elapsed().as_nanos() as f64 / cl_lines as f64, cl_lines);
 }
 
 #[inline(never)]

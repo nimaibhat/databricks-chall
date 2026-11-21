@@ -311,6 +311,34 @@ impl Mapped {
     }
 }
 
+/// Starts a detached thread that asks the kernel to read every mapped file
+/// ahead, in 32 MiB steps and in parse order, so a cold page cache is filled
+/// at full device queue depth while earlier phases run. Cheap when warm.
+pub fn background_readahead(ms: &[&Mapped]) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if std::env::var("RA").map(|v| v == "0").unwrap_or(false) {
+            return;
+        }
+        let files: Vec<(i32, i64)> =
+            ms.iter().flat_map(|m| m.files.iter().zip(m.maps.iter()).map(|(f, mm)| (f.as_raw_fd(), mm.len() as i64))).collect();
+        std::thread::spawn(move || {
+            const STEP: i64 = 32 << 20;
+            for (fd, len) in files {
+                let mut off = 0;
+                while off < len {
+                    unsafe {
+                        libc::posix_fadvise(fd, off, STEP.min(len - off), libc::POSIX_FADV_WILLNEED);
+                    }
+                    off += STEP;
+                }
+            }
+        });
+    }
+    let _ = ms;
+}
+
 #[derive(Clone, Copy)]
 pub struct Chunk {
     pub kind: u8,
