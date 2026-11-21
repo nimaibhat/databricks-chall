@@ -8,13 +8,15 @@ Research-only notes for the optimizing session. Nothing here has been built or b
 
 | # | Idea | Where | Expected gain | Risk to exactness | Entry |
 |---|---|---|---|---|---|
-| 1 | Look up the product category only for purchase rows (3% of events) | `parse_events`, `main.rs:632` | Removes one dense-table load + digit conversion from 97% of valid event lines; audit put this lookup at 37 to 40 ns of a 163 ns line before `1c4fa8e` | None: the category byte is read only when `price != 0` | [1.1](#11-product-lookup-only-for-purchases) |
-| 2 | Software write-combining with non-temporal stores for the 512-way scatters | `BList::push` in `mem.rs:128`, callers in `parse_events`, `parse_clicks`, `dedup_partition` | Competitor measured -12% total, -16% parse on an Ice Lake Xeon (the scorer's class); -6% on Zen 4 | Low: a flush bug loses or duplicates records, which the 20M cross-check catches | [1.2](#12-write-combining-buffers-with-non-temporal-stores) |
-| 3 | Dedup without a key table: two-bit counters find the few repeated ids, only those are sorted (step 1, drop-in); then route valid events straight to their user partition and mark losers in place (step 2) | `dedup_partition`, `main.rs:694`; step 2 also `parse_events`, `resolve_partition` | Step 1 shrinks the per-partition table from 2 to 4 MB to about 170 KB; step 2 removes the second 512-way scatter. Competitors report 19 to 36 ms dedup phases at 20M | Step 1 low (same winner rule, same pass 2); step 2 medium | [9.1](#91-two-bit-counters-instead-of-a-key-table), [1.3](#13-dedup-that-marks-losers-in-place) |
-| 4 | Sort 8-byte `(ts << 32) \| pc` keys per person instead of 16-byte `SRec`s | `process_partition`, `main.rs:814-830` and `:893-896` | Estimate 10 to 25% of the sessions phase, 2 to 4% of wall; halves the scratch buffer | None: `person` is constant within a group and equal-`ts` order does not affect any output | [7.1](#71-sort-8-byte-keys-per-person) |
-| 5 | Known-date table for F1/F2 timestamps and `ingest_ts` | `civil_swar` and `parse_ingest_s`, `parse.rs:772` and `:889` | Estimate 2 to 5% of parse CPU; three competitors ship it | Low: exact 11-byte compare, full parser on a miss | [1.4](#14-known-date-table-for-timestamps) |
+| 1 | Look up the product category only for purchase rows (3% of events) | `parse_events`, `main.rs:632` | A competitor measured 3.01 to 2.94 s (-2.3%) for exactly this change at 20M | None: the category byte is read only when `price != 0` | [1.1](#11-product-lookup-only-for-purchases), [11.3](#113-measured-numbers-for-ideas-already-in-this-file) |
+| 2 | Dedup without a key table: two-bit counters find the few repeated ids and only those are sorted | `dedup_partition` pass 1, `main.rs:708-728` | Table shrinks from 2 to 4 MB to under 256 KB per partition; estimate 3 to 5% of wall, more at 60M. Five teams use a filter or sketch prepass | Low: same winner rule, pass 2 unchanged | [9.1](#91-two-bit-counters-instead-of-a-key-table) |
+| 3 | Sort 8-byte `(ts << 32) \| pc` keys per person instead of 16-byte `SRec`s | `process_partition`, `main.rs:814-830`, `:893-896` | A competitor measured 1.78 to 1.73 s (-2.8%) for the same change; three teams do it | None: `person` is constant within a group and equal-`ts` order affects no output | [7.1](#71-sort-8-byte-keys-per-person) |
+| 4 | `pread` in 512 KB units instead of mapping the input (`IOMODE=4` with smaller chunks) | `chunks_of` call at `main.rs:411-412`, `chunk_data` | A competitor measured sys time halved and total -10% going to 512 KB units; another measured mmap +7.5% slower on a VM. `/data` on the scorer is reported to be tmpfs. Three teams measured mmap faster, so this needs an A/B | Low to medium: more chunk seams | [1.5](#15-pread-in-l2-sized-blocks), [11.2](#112-what-the-scorer-facts-change) |
+| 5 | Software write-combining with non-temporal stores for the 512-way scatters | `BList::push`, `mem.rs:128` | Mixed since iteration 11: -12% on Ice Lake for one team, "no gain" for two others. The scorer is reported to be Cascade Lake, where nobody has published a number | Low | [1.2](#12-write-combining-buffers-with-non-temporal-stores), [6.1](#61-stage-size-start-at-4-cache-lines-per-partition-sweep-2), [11.3](#113-measured-numbers-for-ideas-already-in-this-file) |
 
-Runners-up, in order: splitting each line from its own masks ([2.1](#21-split-each-line-from-its-own-masks), 3 to 8% but it rewrites the routine that decides which lines are malformed), `pread` in L2-sized blocks ([1.5](#15-pread-in-l2-sized-blocks), demoted in iteration 2: three teams measured mmap faster, two measured `read` faster), sessions from 30-minute bins instead of a sort ([1.6](#16-sessions-from-30-minute-bins)), one-multiply hash ([1.7](#17-one-multiply-hash)), smaller Parquet ([1.8](#18-smaller-parquet-output)), `readahead(2)` tuning for a cold cache ([1.9](#19-cold-cache-read-ahead)).
+Runners-up, in order: known-date table for timestamps ([1.4](#14-known-date-table-for-timestamps); five teams ship one, and a last-date cache was measured missing 93% of the time, so it must be keyed by date); routing valid events straight to their user partition and marking dedup losers in place ([1.3](#13-dedup-that-marks-losers-in-place), after 9.1); catalog load off the serial path ([8.1](#81-catalog-load-is-about-60m-serial-instructions-before-anything-parallel-starts)); splitting each line from its own masks ([2.1](#21-split-each-line-from-its-own-masks)); sessions from 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)); one-multiply hash ([1.7](#17-one-multiply-hash)); smaller Parquet ([1.8](#18-smaller-parquet-output)).
+
+Closed since iteration 11: everything for a cold page cache (1.9, 3.1), because `/data` on the scorer is reported to be tmpfs.
 
 ## A finding to act on before trusting the TSBL toggle
 
@@ -450,7 +452,93 @@ These are checks of the logic in scratch Python models, not builds or benchmarks
 - If the dataset stays on the same machine between the repeats, at most the first run sees a cold page cache, and the middle of three is then a warm run. So cold-cache work (entries 1.9 and 3.1) can only matter if the scorer drops caches between runs or the three runs land on different machines, neither of which any source establishes. Eagle Eye assumed cold runs and tuned for them; its best score was 1.01 s.
 - **Consequence.** Rank warm-path CPU work above everything cold-cache. The readahead step fix in 3.1 is still worth its three lines because it costs nothing warm.
 
+---
+
+## Iteration 11 (2026-11-21): what other teams learned about the scorer itself
+
+Sources: notes committed in a second batch of public repos (arnabxero, joch44, jklein07, TejasviniChawla, axhiao, niranjankumarnk, sonalrajapaksha), read from shallow clones. These are other teams' reports; none was verified here.
+
+### 11.1 The scorer, as reported from diagnostic submissions
+
+- [arnabxero `STATUS.md`](https://github.com/arnabxero/xero-shopping-sessions/blob/93f1173/STATUS.md) ("What the scorer looks like", from two diagnostic builds): Xeon at 2.80 GHz, Cascade Lake (AVX-512 F/BW/VL/VNNI), 8 CPUs by affinity and by cgroup quota, host with 32 vCPUs and 128 GB, kernel 7.0, THP in `madvise` mode. **`/data` is tmpfs**, so inputs are always in RAM; `/output` and `/scratch` are ext4. On the dev set, about 50 ms pass from container exec to `main` and about 75 ms in the process.
+- How they got it: a submission that fails the dev check is the only case in which the track page shows a submission's log ([Vibhor7-7 BENCH.md](https://github.com/Vibhor7-7/shopping-sessions/blob/1359a83/BENCH.md), "The probe"). A rejected submission does not change the best score but uses one of the two hourly slots. This repo's binary already prints per-phase times and `rusage` to stderr, so one deliberately failing submission would return this repo's own phase split on the scorer for the 1M dev set. That is the user's call, not something to do unasked.
+- [jklein07 `HANDOVER.md`](https://github.com/jklein07/shopping-sessions/blob/c631cd1/HANDOVER.md): times on a 4-core, 8-thread x86 laptop under Docker tracked the board closely (1.35 s local against 1.44 s on the board), "so the board time is almost all our own compute; the fixed part is small".
+- [joch44 `NOTES.md`](https://github.com/joch44/shopping-sessions/blob/0e62970/NOTES.md): on an Ice Lake 8370C VM, a `FROM scratch` container that only reads the 20M input warm takes 0.24 s; a warm 8-thread newline count runs at about 14 to 15 GB/s, which is the memory-bandwidth ceiling from 4 threads up. Their builds score about 12% faster on the grader than on that VM.
+
+### 11.2 What the scorer facts change
+
+- **No cold cache.** With `/data` on tmpfs nothing is ever read from a disk. `background_readahead` (`parse.rs:328`) can only cost a thread; arnabxero removed theirs (`93f1173`: "No readahead thread when every input is mapped"). Entries 1.9 and 3.1 are closed.
+- **Reading tmpfs.** A mapping of tmpfs is zero-copy but still 4 KiB PTEs unless the mount uses `huge=`, which nobody reported. `pread` from tmpfs is a memory copy. Measurements, all from other teams' machines:
+  - For `pread`: [TejasviniChawla `docs/NOTES.md`](https://github.com/TejasviniChawla/shopping-sessions/blob/cd1ddca/docs/NOTES.md), 2026-11-22 entry: going to 512 KB work units "halve sys time (1.02 to 0.50 s) and cut total about 10%" on the same runner; the same notes record that populating mappings hurt. Vibhor7-7 experiment 10 (entry 1.5). cherylaurelia reads with `pread`.
+  - For mmap: arnabxero maps tmpfs inputs deliberately; AbhirajTiwari12, joshuamuellenbach25 and micah-andelman returned to or stayed with mappings (entry 2.3).
+  - **Here.** The cheapest decisive test is `IOMODE=4` with the chunk target at 512 KB instead of 4 MB (`main.rs:411-412`), A/B against the default on an x86 VM or the board. The existing `pread` path already keeps an 8-byte margin (`parse.rs:261`).
+- **Cascade Lake, confirmed by one team.** The `x86-64-v3` default stays (entry 4.5). L2 is 1 MB per core, shared by two hyperthreads.
+- **THP is `madvise`.** The arena is advised (`mem.rs:32`); for the mimalloc heap see iteration 12.
+- **Fixed cost.** About 50 ms before `main` on the scorer by arnabxero's log, outside the entrant's control. Start-up work inside `main` (entry 8.1) is the only fixed part that can be cut.
+
+### 11.3 Measured numbers for ideas already in this file
+
+From [joch44 `EXPERIMENTS.md`](https://github.com/joch44/shopping-sessions/blob/0e62970/EXPERIMENTS.md), medians on an Ice Lake 8370C VM with 4 cores and 8 hyperthreads, interleaved A/B, 20M and 60M:
+
+| Change | 20M | 60M | Entry here |
+|---|---|---|---|
+| Skip product lookup for views and carts (v4) | 3.01 to 2.94 s | 8.81 to 8.49 s | 1.1 |
+| 16-byte per-person events, person implied by the group (v20) | 1.76 to 1.73 s | 4.89 to 4.85 s | 7.1 |
+| Dedup table of (hash32, index), winners emitted in order (v15) | 1.96 to 1.92 s | 5.53 to 5.35 s | 7.4, 9.1 |
+| 1024 dedup partitions with a date cache and one-pass splitter (v5) | 2.94 to 2.66 s; dedup 0.49 to 0.33 s | 8.49 to 7.72 s | bundled |
+| Dense campaign counters and 1024 person partitions (v19) | 1.82 to 1.78 s | 5.12 to 4.97 s | none; this repo's counters are already dense |
+| 2048 or 4096 dedup partitions | dedup -0.01 s, parse +0.03 to 0.06 s | | rejected there |
+| Radix sort for sessions | no gain over counting sort | | rejected there |
+| Shared lock-free global dedup table | 1.7x slower than partitioning | | rejected there |
+| Software write-combining | "no gain on Ice Lake" | | 1.2 |
+
+Other reports on the same ideas:
+
+- **Write-combining.** arnabxero lists "write-combining scatter stores" under tried and dropped (measured on an EPYC 9554). joch44 found no gain on Ice Lake. Vibhor7-7 measured -12% on the same Ice Lake model (entry 1.2); axhiao (`a77b4dc`), Th3r0n, explorer-skp, cherylaurelia and TejasviniChawla (16-record staging, 512-byte bursts) kept it. The difference may be whether the destination was already cheap to write: joch44's note says it "needs THP", and this repo's arena is on huge pages. No one has published a Cascade Lake number, so this is an A/B, not a sure win; hence its drop from second to fifth.
+- **Date cache.** joch44 v10: a last-date cache "missed 93% (shuffled rows)"; v11 replaced it with a 16-slot cache keyed by month. arnabxero (`08cce5d`), niranjankumarnk (`871eec9`), TejasviniChawla and jklein07 ("table-based dates") also cache validated dates. This confirms entry 1.4's design point: key the table by date, never by "last seen".
+- **Dedup sketch.** TejasviniChawla: "sketch-based dedup (2-bit counters, 16 slots/record; exact table only for candidates)"; axhiao `124164e`: "bitmap pre-pass so only candidate duplicates use the exact table". With Vibhor7-7, cherylaurelia and micah-andelman that is five teams on entry 9.1's scheme.
+- **Global user table at parse time.** TejasviniChawla restructured to a lock-free global user table and scored 2.17 s against 1.79 s before, then reverted (`a805d87`). This supports keeping this repo's per-partition resolve (`b3c1d38`).
+- **Mid-size units and kernel time.** jklein07: with one `Vec` per partition "about 20% of all CPU was the kernel zeroing and faulting 4 KB pages"; huge-page arenas cut the kernel share from 15% to 5%. This repo already has that.
+- **Exit.** TejasviniChawla added a fork-and-exit wrapper early and later "parallel unmap of the pool before exit" (`cd1ddca`); entry 3.2 explains why the wrapper cannot hide teardown from the clock. jklein07 `1a2371f` and axhiao release consumed buffers in parallel during the run. `DROP=1` and `AREL=1` here were measured as no help in the audit's sandbox, on 2 vCPUs.
+
+### 11.4 Cross-machine comparisons mislead
+
+- TejasviniChawla: "Cross-runner CI comparisons misled; only same-runner A/B from now on" after a restructure that looked faster on CI scored worse. joch44: gains measured on a Zen 5 VM "roughly halve" on the Ice Lake mirror, and memory-layout changes must be A/B'd interleaved on the mirror because drift is 2 to 4%. Vibhor7-7 saw -12%, -6% and -1% for the same change on three CPUs.
+- **Consequence for this repo.** Development is on an ARM Mac. Rank changes by instruction count there (ideas 1 to 3 in the table cut instructions or bytes on any CPU), and treat cache and memory-system changes (ideas 4 and 5) as unknown until measured on x86.
+
+---
+
+## Iteration 12 (2026-11-21): the allocator already asks for huge pages; build flags; threads
+
+Opened by a research agent, with the mimalloc claim checked against the vendored source on this machine.
+
+### 12.1 Correction to 3.4: mimalloc v3 advises huge pages by default
+
+- `Cargo.lock` pins `libmimalloc-sys 0.1.49`, whose `build.rs` compiles mimalloc **v3** unless the `v2` feature is set. In `c_src/mimalloc/v3/src/prim/unix/prim.c:413-421` it calls `madvise(MADV_HUGEPAGE)` when `allow_thp` is on (the default) and the size and alignment are 2 MiB multiples; the heap reserves 1 GiB arenas and commits them eagerly when overcommit mode is 0 or 1.
+- So under THP `madvise`, `KMap` slots, `Scratch` vectors, `Vec<URow>` and the Parquet buffers should already be on 2 MiB pages. Entry 3.4's statement that they get huge pages only under `always` is wrong for this build. Not verified by a run.
+- **How to verify without guessing.** Print `AnonHugePages` from `/proc/self/smaps_rollup` next to the `rusage` line at the end of `main`, or compare `ru_minflt` with heap size: about one fault per 2 MB means huge pages, about 256 per MB means 4 KiB pages. The audit's 12,000 to 14,000 minor faults for 1.27 GB anonymous memory at 20M already points to huge pages.
+- **Consequence.** No `HugeVec` wrapper is needed. joch44's and TejasviniChawla's huge-page allocator work (entry 11.3) solved a problem their glibc-malloc builds had and this one does not.
+- If overcommit mode is 2 on the scorer, `MAP_NORESERVE` is ignored ([overcommit accounting](https://docs.kernel.org/mm/overcommit-accounting.html)) and `Arena::new` would fail over to per-block heap allocation, correct but slow. arnabxero's diagnostics do not report the mode.
+
+### 12.2 What 2 MiB pages are worth, for calibration
+
+- 10M random inserts into a hash map: 0.709 s on 4 KiB pages against 0.544 s on 2 MiB (-23%), with dTLB misses falling from 19.4M to 6.3K ([Rigtorp](https://rigtorp.se/hugepages/)). That table is far beyond TLB reach; a 2 to 4 MB dedup table is inside the roughly 6 MB reach of a 1,536-entry second-level TLB ([Jones](https://www.evanjones.ca/hugepages-are-a-good-idea.html)), so expect much less there.
+
+### 12.3 Direct compaction can stall huge-page faults
+
+- With `defrag` at its default `madvise`, a fault in an advised region may enter direct reclaim and compaction ([kernel THP doc](https://docs.kernel.org/admin-guide/mm/transhuge.html)). On a fragmented host both the arena and the mimalloc heap can stall, and nothing inside the container can change it.
+- **Possible mitigation.** Prefault the first part of the arena from helper threads during phase 0 and 1 with `MADV_POPULATE_WRITE` (Linux 5.14 and later; the scorer is reported on 7.0), ignoring errors, and only for memory that will certainly be used, since populated pages are charged to the cgroup. The arena estimate at `main.rs:382` gives the size.
+- **Expected gain.** Unknown; it moves page zeroing (which parse threads pay today at first touch) onto threads that are otherwise idle during the link phase. TejasviniChawla reports `MADV_POPULATE_WRITE` after `MADV_HUGEPAGE` as part of a +5% build. Risk: none to exactness; memory use rises if the estimate is high.
+
+### 12.4 Build flags and threads: nothing worth a submission
+
+- `tune-cpu` is unstable ([rustc codegen options](https://doc.rust-lang.org/rustc/codegen-options/index.html)). `-C target-cpu=skylake` gives Skylake tuning without AVX-512, which mainly removes a false-dependency `xor` before `tzcnt`/`lzcnt` ([LLVM X86.td](https://raw.githubusercontent.com/llvm/llvm-project/main/llvm/lib/Target/X86/X86.td)); no measurement found, expect under 1%.
+- Thread spawn is about 5 µs ([Bendersky](https://eli.thegreenplace.net/2018/launching-linux-threads-and-processes-with-clone/)); eight `par_for` phases of 8 threads cost about 0.3 ms. A persistent pool is not worth writing.
+- Pinning: no measurement for an 8-vCPU VM. TejasviniChawla included pinning in a batch that was 3 to 10% faster overall, without isolating it.
+- `available_parallelism` honours cgroup quota and affinity ([std docs](https://doc.rust-lang.org/std/thread/fn.available_parallelism.html)); `main.rs:331-335` reads `NCPU` first, which the scorer sets to 8.
+
 ## Next iteration
 
-- Re-read `OVERNIGHT_LOG.md` if it exists and drop anything it marks tried.
-- Primary sources still to open: non-temporal store behaviour and buffer sizing (Intel optimization manual; Balkesen et al. ICDE 2013 on software-managed buffers), `read` against `mmap` under virtualization (EPT page-walk cost), and the remaining competitor repos (Th3r0n `src/arena.rs`, AbhirajTiwari12, joshuamuellenbach25) for anything the five read so far do not cover.
+- Re-read `OVERNIGHT_LOG.md` if it exists (absent through iteration 12) and drop anything it marks tried.
+- Pull the competitor clones again for new commits and new scorer reports.
+- Still unread: enkyuan/polaris `OPTIMIZATION_RESEARCH.md` and `PERFORMANCE.md`, toM0dots logs, SsjRaz.
