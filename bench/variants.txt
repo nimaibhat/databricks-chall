@@ -1,3 +1,6 @@
 # label|ref|build-args|env
-v3|main||
-v4|main|XCPU=x86-64-v4|
+p9_9|main||P1BITS=9 P2BITS=9
+p11_9|main||P1BITS=11 P2BITS=9
+p11_11|main||P1BITS=11 P2BITS=11
+p10_10|main||P1BITS=10 P2BITS=10
+p12_10|main||P1BITS=12 P2BITS=10
