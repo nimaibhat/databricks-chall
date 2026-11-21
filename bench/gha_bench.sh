@@ -35,7 +35,9 @@ runone() { # ds label envs keep
   t1=$(date +%s.%N)
   w=$(echo "$t1 - $t0" | bc)
   ph=$(grep -E '^(phase1|phase2|phase3 |phase3b|phase4 s|done)' $out.err | sed -E 's/\[[^]]*\]//; s/arena.*//; s/\(parse only[^)]*\)//' | awk '{print $NF}' | tr '\n' ' ')
-  echo "$ds $label rc=$rc wall=$w | $ph" >> /tmp/results.txt
+  es=$(grep -oE '^epoch_start [0-9.]+' $out.err | awk '{print $2}'); ed=$(grep -oE '^epoch_done [0-9.]+' $out.err | awk '{print $2}')
+  pre=""; post=""; [ -n "$es" ] && pre=$(echo "$es - $t0" | bc); [ -n "$ed" ] && post=$(echo "$t1 - $ed" | bc)
+  echo "$ds $label rc=$rc wall=$w pre=$pre post=$post | $ph" >> /tmp/results.txt
   if [ -n "$keep" ]; then sudo chmod -R a+rwX $out; rm -rf /tmp/out_${ds}_$label; mv $out /tmp/out_${ds}_$label; else sudo rm -rf $out; fi
   sudo rm -rf $scr $out.err
 }
@@ -69,11 +71,12 @@ for l in open('/tmp/results.txt'):
     w=float(re.search(r'wall=([0-9.]+)',l).group(1))
     st=[sec(x) for x in l.split('|')[1].split()]
     ph=[st[0]]+[st[i]-st[i-1] for i in range(1,len(st))] if len(st)==6 else []
-    rows[key].append((w,ph))
+    mp=re.search(r'pre=(-?[0-9.]+)',l); mq=re.search(r'post=(-?[0-9.]+)',l)
+    rows[key].append((w,ph,float(mp.group(1)) if mp else float('nan'),float(mq.group(1)) if mq else float('nan')))
 for (ds,lab),v in rows.items():
     ws=[x[0] for x in v]
     pm=' '.join('%.3f'%statistics.median(x[1][i] for x in v) for i in range(6)) if all(len(x[1])==6 for x in v) else '-'
-    print(f"SUM {ds} {lab:22s} n={len(ws)} | {statistics.median(ws):.3f} {min(ws):.3f} {max(ws):.3f} | {pm}")
+    print(f"SUM {ds} {lab:22s} n={len(ws)} | {statistics.median(ws):.3f} {min(ws):.3f} {max(ws):.3f} | {pm} | pre {statistics.median(x[2] for x in v):.3f} post {statistics.median(x[3] for x in v):.3f}")
 PY
 echo "=== output equality vs first variant"
 first=$(echo "${V[0]}" | cut -d'|' -f1)
