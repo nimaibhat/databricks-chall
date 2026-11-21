@@ -6,13 +6,17 @@ The notes for the old codebase are at `git show 3a5f601:RESEARCH_NOTES.md`. What
 
 ## Top five untried (ranked by expected gain per unit of risk to exact output)
 
+Re-ranked in iteration 2. PGO is being built by the coding agent (uncommitted `scripts/pgo.sh`, `pgo.profdata`), so it moves to "in progress" below the table. Every item here leaves the output bytes unchanged.
+
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
-| 1 | Profile-guided build, with three traps handled (profile never written because of `_exit`; `RUSTFLAGS` wiping `target-cpu`; unpinned toolchain) | `Dockerfile`, `.cargo/config.toml`, `main.rs:539`, `sys.rs:122` | 0 to 4% of in-process time | Quoted: Tejas -5%, joch44 -2.7%/-4.1% (`FOR_NIMAI.md`); this repo's old code -1.5 to -2.7% (old log, experiments 33, 42). Lower end likely here: hot paths are already hand-laid-out | None from PGO itself; the code has aliasing patterns that a different inlining could expose, so the full gate at 1, 2 and 8 threads decides | 1.1 |
-| 2 | Find out which AVX frequency licence the cores hold during parse (one probe, no behaviour change); if it is L1, move the few 256-bit multiplies to 128-bit or scalar | probe: `parse.rs:2051` `stage1`; multiplies: `parse.rs:259-315`, `:642`, `:750`, `:889`, `:1110`; `k_free.rs:875` | Probe: none. If L1 is held and can be avoided: up to about 10% of parse clock rate, minus the extra instructions; **my estimate** net 0 to 6% of parse | Quoted: Skylake-SP runs 256-bit integer multiplies under licence L1 (Lemire 2018); W-2104 L0 3.2 GHz, L1 2.8 GHz (Downs 2020). Not measured for this code or the scorer | Probe: none. Rewrite: low, `ev_vec_matches_scalar`, `ck_vec_matches_scalar`, `b36_vec4_matches_scalar` already pin the results | 1.2 |
-| 3 | Fault the arena's first blocks on the workers that sit idle during setup | `setup.rs:826-833` (worker wait loop), `:968-969` (arenas made after the job), `parse.rs:180` `new_chunk` | **My estimate** 1 to 2 ms of about 210 (0.5 to 1%); needs the `tl` idle figure for job 0 to size it | Quoted: old experiments 47/48, arena pre-fault on idle threads -1.4 to -4.3% on Intel (old code); Th3r0n "storing into fresh memory is what costs" | None: same bytes written to the same places | 1.3 |
-| 4 | A/B the input mapping on a tmpfs `/data` (the scorer's case): default map, `XL_RD=128`, `XL_REL=0`, and one new variant, `MADV_POPULATE_READ` per chunk | `parse.rs:2140-2164`, `:1805` `fault_around_check` | Unknown sign, **my estimate** within ±1.5% of parse; worth one same-run A/B only because the test VM's `/data` may not be tmpfs | **My estimate** of kernel time in the map path: about 7% of parse thread time (1.4) | None: read-only input mapping | 1.4 |
-| 5 | Start writeback of each output file as soon as it is written (`sync_file_range`, no wait) | `pqw.rs:1087` `UserFile::finish`, `:1111` `write_file` | 0 on a fast disk; on a slow one this repo measured post-exit 0.13 to 0.04 s at 20M (old experiment 39, old code, other runner) | Quoted: old log experiment 39; old notes 29.4 (about 1 ms per MB written after exit on that runner) | None: same bytes, same files | 1.5 |
+| 1 | Input mapping A/B on a tmpfs `/data`, three variants: `XL_CH=32768`, `XL_REL=0`, and `MADV_POPULATE_READ` on each chunk before it is parsed | `parse.rs:1800` (`CH_DEFAULT`), `:2140-2164` (`stage1`) | **My estimate** 1 to 3% of parse (2 to 5 ms) if either mechanism in 2.1 is real; could be 0 | Read from the code: the parser's only prefetch is 1 KiB ahead (`k_free.rs:1738`) and cannot reach a page that is not mapped yet; each per-chunk `MADV_DONTNEED` is a TLB shootdown to the other 7 CPUs, about 400 times per run. Costs are my estimates, not measured | None: read-only input mapping, two of the three are existing knobs | 1.4, 2.1 |
+| 2 | Fault the arena's first blocks on the workers that sit idle during setup | `setup.rs:826-833`, `:968-969`, `parse.rs:180` `new_chunk` | **My estimate** 1 to 2 ms (0.5 to 1%); needs the `tl` idle figure for job 0 to size it | Quoted: old experiments 47/48, arena pre-fault on idle threads -1.4 to -4.3% on Intel (old code) | None | 1.3 |
+| 3 | Find out which AVX frequency licence the cores hold during parse (one probe); if L1, move the 256-bit multiplies in the event path to the 128-bit forms the click path already uses | probe: `parse.rs:2181`; multiplies: `parse.rs:259-315`, `:642`; `k_free.rs:875` `ids2j`, `:1349` `ev_d` | Probe: none. If L1 is held: **my estimate** net 0 to 6% of parse; lower if parse turns out memory-bound (2.2) | Quoted: Lemire 2018 (256-bit integer multiplies are "heavy", L1); Downs 2020 (L0 3.2 GHz, L1 2.8 GHz on a W-2104). Not measured here | Probe: none. Rewrite: low, existing differential tests pin the results | 1.2, 2.3 |
+| 4 | Start writeback of each output file when it is complete (`sync_file_range`, no wait) | `pqw.rs:1087`, `:1111` | 0 on a fast disk; old experiment 39 measured post-exit 0.13 to 0.04 s at 20M (old code, another runner) | Quoted: old log experiment 39, old notes 29.4 | None | 1.5 |
+| 5 | Give the PGO profile a second and third seed before the final pick | `scripts/pgo.sh` | Small; protects the PGO gain on a hidden set whose dirt rates differ | Rules: dirt rates are drawn per seed | None | 1.1 |
+
+**In progress (coding agent):** PGO. The working tree's version already handles the three traps of 1.1: `__llvm_profile_write_file()` before `_exit` under a `pgogen` feature, the image pinned to `rust:1.100.0-alpine`, and `--config 'build.rustflags=[...]'` (cargo joins arrays from `--config` with the file's, unlike the `RUSTFLAGS` variable, and the build would have stopped at `k_free.rs:11` otherwise). Two things left to check: `pgo.profdata` must be committed (the Dockerfile copies it; `.dockerignore` and `.gitignore` do not exclude it), and the plain build stays the fallback if the same-run A/B is not faster on both sizes.
 
 Not in the table because they are not code changes: the board-noise note (1.6) and the bench-fidelity checklist (1.7). Read both before trusting any A/B.
 
@@ -128,10 +132,48 @@ The scorer, as reported: `/data` on tmpfs, `/output` on ext4, `--cpus 8` quota w
 - **Lazy `ingest_ts`, 30-minute bins, VNNI, a new scanner**: closed in `FOR_NIMAI.md` with reasons; agreed. Lazy `ingest_ts` in particular would skip the 24-hour lateness check that every row needs (rules, Events step 4).
 - From the old notes, still closed for the same reasons: cold-cache read-ahead (input is tmpfs), 512-bit vectors on Cascade Lake, more threads than CPUs, a smaller runtime image.
 
+## Iteration 2 (2026-11-21): the event hot path line by line, and what it says about the mapping
+
+Read: `k_free.rs:1126-1415` (`ev_masks`, `ev_s`, `ev_d`, `ev_fast`), `:1720-1804` (the pipelined driver), with `parse.rs:94-159` (`push_many`, `flush_lines`) and `:642-735` (`ev_vec`) from the first pass.
+
+### 2.1 Two mechanisms in the mapped-input path that the existing knobs can test
+
+**(a) The prefetch stops at every unmapped page.** The driver issues one `prefetcht0 [p + 1024]` per line (`k_free.rs:1738`, `PFD = 1024` at `:1683`); that is the only prefetch, and the hardware streamer does not cross a 4 KiB boundary. A software prefetch to an address whose page is not mapped is dropped. The input is mapped lazily, 16 pages per fault (the kernel's 64 KiB fault-around), so at every 64 KiB the last kilobyte of prefetches is lost: the thread takes the fault and then reads the first 16 cache lines of the new window with no prefetch behind them.
+- **My estimate:** per 64 KiB window, about 1.5 to 2 µs of fault plus 0.5 to 1.5 µs of unprefetched misses, against about 36 µs to parse the window (51 ns per line, about 90 bytes per line). That is 6 to 9% of parse thread time in and around faults, of which the miss part (1.5 to 4%) is what a populate call removes; the fault work itself only moves into the call.
+- **Change:** in `stage1`, before `parse_buf` at `parse.rs:2156`, `madvise(buf.as_ptr() rounded down to a page, len, MADV_POPULATE_READ = 22)`. Every page of the chunk is then mapped before the first line is read, so the 1 KiB prefetch always lands. Ignore the return value. Chunks are at most 8 MiB (`CH_DEFAULT`), so this is at most 2,048 pages per call.
+- Correction to 1.4: `MADV_POPULATE_READ` still maps 16 pages per internal fault, so it does not save kernel time; the gain, if any, is the unbroken prefetch stream and no exceptions in the middle of the hot loop.
+
+**(b) Each per-chunk release is a TLB shootdown.** After each chunk `stage1` calls `madvise(MADV_DONTNEED)` on its pages (`parse.rs:2158-2163`). Removing PTEs from an address space that 8 running threads share makes the kernel interrupt the other 7 CPUs, and for a range above 33 pages (`tlb_single_page_flush_ceiling`) each of them drops its whole TLB for this process. Chunk sizes are `rem / (4 * nt)` clamped to 256 KiB..8 MiB (`parse.rs:1961`), which for 2.3 GB is about 400 chunks, so about 400 shootdown rounds and 2,800 interrupts during parse.
+- **My estimate:** 3 µs per interrupted CPU (interrupt in a VM plus refilling 30 to 60 TLB entries) and 5 to 20 µs for the caller to wait for the acknowledgements: 10 to 16 thread-ms, about 1% of parse thread time. On bare metal less; on a VM without IPI virtualisation (Cascade Lake has none) more.
+- **Variants, all existing knobs:** `XL_CH=32768` (32 MiB chunks: a quarter of the calls for the bulk of the input; the tail still shrinks to 256 KiB so balance at the end is unchanged); `XL_REL=0` (no per-chunk release; the single `munmap` in the write stage, `out.rs:541-546`, then has 560,000 PTEs to remove on one thread, **my estimate** 30 to 45 ms, which is longer than the write stage, so I expect this one to lose, but it bounds the effect).
+- **Not proposed yet:** one `process_madvise` call per thread for many ranges. Kernel 6.15 batches the TLB flush across the ranges of one `process_madvise` call (the "batch tlb flushes for MADV_DONTNEED" series), which would cut 400 rounds to a handful, but it needs a pidfd and is only worth writing if `XL_CH=32768` shows the effect is real.
+
+**How to read the result.** Run the four builds interleaved on tmpfs input (1.7): default, `XL_CH=32768`, populate-read, both. If none moves parse by more than noise, close 1.4 and 2.1 together.
+
+### 2.2 Instruction count of the event path, and what the timing then implies
+
+Counted by reading, not by a tool, so ±20%:
+- `ev_masks` (`k_free.rs:1127`): 3 loads, 5 compares, 3 mask merges: about 11.
+- `ev_s` (`:1281-1336`): about 25 scalar bit operations for the six separators, one tail-row lookup with a 32-byte quote test, one kind-row compare, `ids2j` (about 18 vector operations for both IDs), two date-cache lookups (`pext`, load, xor, and each), two 16-byte loads for the time fields: about 75.
+- `ev_d` (`:1349-1400`): one fused 256-bit digit conversion for both timestamps (about 16), two stores, one combined validity test, the purchase test, the batch-full test: about 28.
+- Per 64 rows, `ev_vec` (`parse.rs:642`) is about 60 instructions per 4 rows, and `push_many` plus `flush_lines` about 15 per row plus 12 per filled line: about 35 per row together.
+- **Total: about 150 to 170 instructions per event line**, with about 12 table loads, all from rows that stay in L1 for a given line shape.
+
+Against `FOR_NIMAI.md`'s 160 ms for parse (machine not stated): 51 ns per line per hardware thread is 145 to 170 cycles at 2.8 to 3.3 GHz. So each hyperthread runs at about one instruction per cycle, about two per core. Code this branch-light and table-driven can run at three or more per core when it is not waiting. **My reading:** a visible part of parse is waiting on memory or in the kernel (input misses, the fault path, page clearing, shootdowns), not executing instructions. This is why the mapping items are ranked above the licence probe, and why I am not proposing instruction-level changes to `ev_s`/`ev_d`: I found none that would remove more than two or three instructions per line. The `pmu` line (request 4) settles it: if user-mode IPC is above 1.6 per thread and `stime` is under 5% of task time, reverse this ranking.
+
+### 2.3 Addition to 1.2: the click path is already 128-bit
+
+`cl_s`/`cl_d` (`k_free.rs:1582-1666`) decode a click with `ids2v` and 128-bit multiply-adds; only the event path (`ids2j` at `:875`, `ev_d` at `:1365-1373`) and the batch code in `parse.rs` use 256-bit multiplies. So the licence question is specifically about the event path, and a 128-bit event path is not new code so much as the pre-fusion form (`ids2v` twice, `ts_time` twice). If the probe of 1.2 is positive, the A/B is "fused 256-bit" against "two 128-bit halves" for events, plus scalar multiplies in `ev_vec`.
+
+### 2.4 Checked and left alone
+
+- **The purchase test** (`k_free.rs:1388`): reads one byte of the `pp` word stored a few instructions earlier; a byte inside a just-stored quadword forwards from the store buffer, so no stall. 3% taken, well predicted.
+- **Batch size 64** (`iface.rs:36`): the five batch columns are 2.5 KB and `Out` about 2 KB, both L1-resident. Nothing to gain from another size that the authors' `XL_*` build knobs would not already have shown.
+- **Record scatter** (`parse.rs:94-159`): about 830 buckets at 20M (`ecap >> 15`), one 64-byte staging line each (53 KB per thread, in L2), full lines leave with two 32-byte non-temporal stores into 4 KiB chunks cut from 2 MiB blocks. The active chunks of a thread span a few huge pages, so the TLB is not a factor.
+
 ## Next passes (in this order)
 
-1. `k_free.rs` hot loop (`ev_s`, `ev_d`, `run_events`, click loop) line by line: instructions and loads per line, table footprint (`T` is about 1 MB of `.rodata` on 4 KiB pages), what is recomputed per line.
-2. `events.rs` `stage3a` and `core.rs`: the 35 ms stage, pass by pass.
-3. `links.rs`: what runs serially after parse (`odd_events`, deferred sorts, `uf_tail`).
-4. `pqw.rs` encoders and output size.
-5. Outside material on each: first-touch and huge-page clearing cost in the 7.0 kernel, tmpfs large folios, `MADV_POPULATE_*` behaviour.
+1. `events.rs` `stage3a` and `core.rs`: the 35 ms stage, pass by pass.
+2. `links.rs`: what runs serially after parse (`odd_events`, deferred sorts, `uf_tail`).
+3. `pqw.rs` encoders and output size.
+4. Outside material on each: first-touch and huge-page clearing cost in the 7.0 kernel, tmpfs large folios, `MADV_POPULATE_*` behaviour.
