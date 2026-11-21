@@ -11,7 +11,7 @@ Re-ranked in iteration 31 against `OVERNIGHT_LOG.md` at 02:12. The pick is `79cb
 | # | Idea | Where | Expected gain | Risk to exactness | Entry |
 |---|---|---|---|---|---|
 | 1 | Profile-guided optimisation generated inside the Docker build, with a fallback to the plain build | `Dockerfile`, a new build script | Now measured by two teams: -5% (0.806 to 0.813 s against 0.839 to 0.861 s, same runner) and -2.7% / -4.1% (20M / 60M). Training on 1M or 3M events made no difference; about 23 s more build time | None to exactness. With the fallback and a non-empty-profile check, no build risk | [24.6](#246-a-pgo-recipe-that-cannot-break-the-build), [25.1](#251-pgo-a-second-measurement--5), [16.4](#164-profile-guided-optimisation-a-measured-3-to-4-reopening-a-rejected-item) |
-| 2 | Scanner field loop on 64-bit halves with byte-packed offsets | `scan_lines` field loop in `parse.rs` | About 130 of roughly 1,000 instructions per line; the stage is 34.5 of 130 ns. Queued by the optimizer; the algorithm is model-checked here | Medium (scanner) | [24.2](#242-the-scanners-field-loop-is-most-of-its-cost) |
+| 2 | Scanner diet in three stages on x86 only: branch-free field offsets with `pext`/`pdep` (A), masks at the line start (B), byte-packed fields to the row body (C) | `scan_lines` in `parse.rs` | About 85 instructions per line for stage A and 155 for all three, of about 315 in the scanner and 1,575 per line; expect -2% and -3 to -4% of wall on the runner. Experiment 22 (an array version, Mac only, one thread) does not test this | Low for A, medium for B and C; model-checked with 0 mismatches | [34](#iteration-34-2026-11-21-0300-a-staged-scanner-diet-for-x86-checked-against-split-why-experiment-22-says-little-about-x86), [24.2](#242-the-scanners-field-loop-is-most-of-its-cost) |
 | 3 | Sessions by half-hour bins and counting passes over a narrow `(group, ts offset)` list, instead of the per-person sort | `process_partition` in `main.rs` | Vibhor7-7 -2.7% for the bins; joch44 a further -4.5% of the phase from one read per survivor and -8% at 60M from u32 offsets. Sessions is 16% of in-process time here. Queued by the optimizer | Medium: u32 offsets need a fallback for windows over 49.7 days | [1.6](#16-sessions-from-30-minute-bins), [31.3](#313-sessions-phase-what-others-measured-since-iteration-17) |
 | 4 | Tune the scatter on Intel: 256-bit streaming stores, stage size sweep, plain stores for clicks | `Scatter::push` in `mem.rs` | The write-combining series gained far more on Intel than on Zen; a competitor gained -0.9% from stage size alone and found streaming clicks a loss | None | [23.2](#232-what-is-still-slow-on-that-branch) |
 | 5 | Finish the output shrink: `DELTA_BINARY_PACKED` for `revenue_cents`, `day` and the counts (35 MB to roughly 20 MB at 20M) | `pq.rs` `write`, `out.rs` | Post-exit time is 1 to 3 ms per MB on the runners (29.4); 0 to 0.05 s at 20M, more at 60M. Layout and golden vectors are in iteration 30; cherylaurelia's accepted writer uses it | None to values; a second encoding for the scorer's reader to accept | [30](#iteration-30-2026-11-21-0220-an-implementation-ready-spec-for-smaller-parquet-output-with-test-vectors) |
@@ -1349,6 +1349,92 @@ Run [44879687999](https://github.com/nimaibhat/databricks-chall/actions/runs/448
 - **Our pick is now 7% behind Vibhor7-7** (it was 20% behind in iteration 27 with `0a06317`; different runner, so compare ratios only) and 34% behind cherylaurelia. Scaled from Vibhor7-7's 0.78 s, our pick would score about 0.84 s; one board score is good to about 20% (31).
 - **Post-exit time is still 0.185 s at 20M and 0.463 s at 60M on this runner** (pre 0.09), against about 0.06 s for an empty container's share: 35 MB of output still costs about 0.1 s at 20M and 0.4 s at 60M here. The remaining output shrink (delta encoding for `revenue_cents`, 30) is worth up to that.
 - Our phases here (20M): links 0.078, parse 0.639, dedup 0.057, sessions 0.173, output 0.024.
+
+## Iteration 34 (2026-11-21, ~03:00): a staged scanner diet for x86, checked against `split`; why experiment 22 says little about x86
+
+Refines 24.2 and 28.1 into one staged change. Nothing here was built or timed; instruction counts are my estimates from reading source.
+
+### 34.1 Where the 315 instructions go (`scan_lines`, `parse.rs:586-697`, AVX2)
+
+| Part | Lines | Estimate per event line |
+|---|---|---|
+| Stage 1: masks for 1.2 blocks per 77-byte line, with the edge tests and three stores per block | 603-632 | about 45 |
+| Three `win!` windows: 9 loads, about 27 shifts and ors | 637-644, 660-661 | about 40 |
+| Line length, `below`, the `u128` validity expression, popcount | 656-675 | about 45 |
+| Field loop, 7 rounds: `u128` `trailing_zeros` (6), clear lowest bit (5), variable `u128` shift for the quote bit (7), slice pointer and length and two stores (9) | 678-690 | about 190 |
+
+### 34.2 What the local data rules out and requires (first 2,000,000 lines of `~/ss-data/d20`, read-only)
+
+- **A "no quote in the line" fast path is useless: 79.05% of event lines and 59.02% of click lines contain a quote.** Each field is quoted with probability 0.2, independently (about 400,000 quoted per field index per 2M lines). Quotes must stay branch-free.
+- **The number of commas in the first 64 bytes of an event line is 3, 4 or 5 in 20%, 49% and 31% of lines.** Any loop that runs "while this word has bits" mispredicts on about half the lines; the rounds must be a fixed count on both words.
+- Event lines: 99.88% are 64 bytes or longer, none reaches 128. Click lines: none reaches 64. Malformed lines: 0.027%.
+
+### 34.3 How four public builds do it
+
+| Build | Shape | What makes it small |
+|---|---|---|
+| [cherylaurelia `scan_lines` + `fast_split`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L1259-L1380) (AVX2, fastest on our runner) | Masks from an unaligned load at the line start, two `u64` words; validity as mask arithmetic on the two words; comma offsets by N-1 fixed rounds on both words packed into bytes; quoted flags by `pext`/`pdep`; the row body reads byte `i` of `at` and `len` | No stored mask streams, no 128-bit arithmetic, no array of slices, no data-dependent branch. About 115 instructions for the split plus about 35 for the masks by my count |
+| [joch44 `for_each_record` + `split_masked`](https://github.com/joch44/shopping-sessions/blob/3261746/pipeline/src/csv.rs#L55-L190) | Line-start `u128` masks; validity by two `pext128` compares and popcounts; the same per-field `u128` loop as ours | Its log credits the PEXT splitter with 1.565 to 1.414 s (v25). It keeps the `u128` loop and an array of `Option<&[u8]>` |
+| [Vibhor7-7 `split::<N>`](https://github.com/Vibhor7-7/shopping-sessions/blob/bee0cbf/src/reader.rs#L95) (19.1) | One delimiter offset stream, then all fields of a line in about a dozen vector instructions | Measured -4.4% at two threads per core and 0% at one thread (its experiment 22: 145 to about 60 instructions per line) |
+| [micah-andelman `scan3`](https://github.com/micah-andelman/shopping-sessions/blob/2b46b02/src/scan.rs#L372-L560) | All quote validation in stage 1 by one add per block (`(open << 1) + !structural` lands on the next structural byte); stage 2 only compares the N-th delimiter with the newline | Scanner 0.372 to 0.302 s at one thread. Its lazy per-field `get` (a byte load and a test per field) was slower than building the array and was rejected there |
+
+### 34.4 The design, in three stages (x86-64 with BMI2 only; other targets keep today's code)
+
+**Stage A, the smallest: replace only the field loop** (`parse.rs:678-690`). Everything before it, including the `bad` test, stays, so which lines are accepted does not change. `c`, `x`, `st` and `ll` are the existing locals:
+
+```rust
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+{
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let (c0, c1) = (c as u64, (c >> 64) as u64);
+    let n0 = c0.count_ones();
+    let (mut a, mut b, mut p0, mut p1) = (c0, c1, 0u64, 0u64);
+    for j in 0..N - 1 {                      // fixed count on both words
+        p0 |= (a.trailing_zeros() as u64) << (8 * j);
+        a &= a.wrapping_sub(1);
+        p1 |= (64 + b.trailing_zeros() as u64) << (8 * j);
+        b &= b.wrapping_sub(1);
+    }
+    let commas = ((p0 & ((1u64 << (8 * n0)) - 1)) | (p1 << (8 * n0))) & ((1u64 << (8 * (N - 1))) - 1);
+    let ends = commas | (ll as u64) << (8 * (N - 1));
+    let starts = (ends << 8).wrapping_add(ONES << 8);
+    let (x0, x1, s0, s1) = (x as u64, (x >> 64) as u64, st as u64, (st >> 64) as u64);
+    let quoted = _pdep_u64(_pext_u64(x0, s0) | _pext_u64(x1, s1) << s0.count_ones(), ONES);
+    let at = starts.wrapping_add(quoted);
+    let ln = ends.wrapping_sub(at).wrapping_sub(quoted);
+    for i in 0..N {
+        fields[i] = std::slice::from_raw_parts(lp.add((at >> (8 * i)) as u8 as usize), (ln >> (8 * i)) as u8 as usize);
+    }
+}
+```
+
+Needs `N <= 8` (a const assert) and a line under 128 bytes, which the enclosing branch already guarantees. About 70 instructions plus about 35 to fill the array, against about 190.
+
+**Stage B: masks at the line start** (28.1). `masks64(lp)`; events take the second word unconditionally, clicks and links only when the first has no newline. The validity expression moves to two words exactly as in cherylaurelia's lines 1352 to 1363. Edge rule that keeps "bytes after `end` are never interpreted": when `ls + 128 > len`, copy the remaining bytes into a zeroed 128-byte stack buffer, take the masks from the copy, and set the newline bit at `len - ls`; pointers still come from `lp`. Otherwise all 128 bytes are inside the range and no clipping is needed, because no line crosses `end`. Removes the three mask arrays and the windows: about 85 instructions become about 35 (about 10 with AVX-512BW).
+
+**Stage C: hand the closure `(lp, at, ln)` instead of `&[&[u8]; N]`** and read field `k` as byte `k` of each word where it is used. Removes the array fill (about 35) for two shifts per use. The long-line fallback fills the same two words when the line is under 256 bytes. This is cherylaurelia's interface, not micah-andelman's rejected one: no byte is loaded and no branch is taken per field.
+
+Budget: about 315 now, about 230 after A, about 180 after B, about 160 after C (about 135 with AVX-512BW masks).
+
+### 34.5 Model check
+
+`/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/chk2/halves2.py` implements stages A and B on 64-bit words (fixed rounds, `pext`/`pdep`, the tail copy with the terminator bit, the long-line fallback) and compares every emitted field boundary with a transcription of `split` (`parse.rs:10-46`) under the range rules of `scan_lines`.
+
+- 786,253 cases, 0 mismatches: random lines for N = 2, 4 and 7 with quoted, half-quoted, stray-quote, lone-quote and empty fields, field counts off by one or two, `\r`, empty lines, lines of 62 to 130 and up to 200 bytes, a last line without a newline, sub-ranges with junk after `end`; and every string of length 0 to 9 over `{a , " \n}` for N = 2 and 3.
+- 3 MB of the real event file and of the real click file: the same lines and boundaries as the reference (38,999 and 63,926 lines emitted, 17 and 44 declined by both).
+
+### 34.6 Why experiment 22 says little about x86
+
+The optimizer's experiment 22 (field ends through a small array from two 64-bit words, quote test by byte) was slower on the Mac at one thread and was not taken to x86. Three reasons it may not carry over, none measured here:
+
+- **arm64 has no `pext`/`pdep`**, so the quoted flags there need a byte load per field (seven loads that depend on the offsets) and an array in memory. On x86 with BMI2 they are six register instructions (34.4).
+- **The data makes loop counts and quote tests unpredictable** (34.2); if the array version looped per word or branched on the quote byte, it paid mispredictions that the fixed-round version does not.
+- **One thread on a core without hyperthreads is the wrong test for an instruction diet.** Vibhor7-7's own splitter change measured 0% at one thread and -4.4% with two threads per core; the scorer runs two threads per core.
+
+So judge stage A on the x86 runner at 4 threads, with the arm64 build left on today's loop (the Mac gate then tests the unchanged path, and the x86-64-v3 gate under Rosetta tests the new one).
+
+- **Expected gain.** About 85 instructions per line for stage A and about 155 for all three, of about 1,575 per event line for the whole run. Vibhor7-7 got -4.4% of wall for 85 of 650, so expect about -2% for stage A and -3 to -4% for all three on the runner, and about half of that on the board (25.2).
+- **Risk to exactness.** Stage A: low; acceptance is decided by the unchanged `bad` test and only boundaries of accepted lines are recomputed. Stages B and C: medium (scanner); `fuzz_scan`, `fuzz_scan_events`, `exhaustive_small` and `scan_subrange` cover them unchanged.
 
 ## Next iteration
 
