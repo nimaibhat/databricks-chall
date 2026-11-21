@@ -1,5 +1,2 @@
 # label|ref|build-args|env
-s24|origin/gate-s24-11f3bcf||
-s25|origin/gate-s25-2962ffe||
-s26|origin/gate-s26-a94e82c||
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+pgo|origin/gate-pgo-dad6892||
