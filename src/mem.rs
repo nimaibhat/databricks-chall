@@ -126,6 +126,51 @@ impl<T: Copy> BList<T> {
             f(unsafe { std::slice::from_raw_parts(b, l) });
         }
     }
+    /// In-place filter-map: `f` may modify each element; elements for which it
+    /// returns false are removed (order kept). Emptied blocks go to `free`.
+    pub fn compact(&mut self, free: &mut Vec<*mut u8>, mut f: impl FnMut(&mut T) -> bool) {
+        let per = Self::PER;
+        let n = self.len;
+        let mut w = 0usize;
+        let mut wb = 0usize; // write block
+        let mut wp: *mut T = if self.blocks.is_empty() { std::ptr::null_mut() } else { self.blocks[0] };
+        let mut wleft = per;
+        let nblk = self.blocks.len();
+        for bi in 0..nblk {
+            let b = self.blocks[bi];
+            let l = if bi + 1 == nblk { n - bi * per } else { per };
+            for j in 0..l {
+                unsafe {
+                    let p = b.add(j);
+                    if f(&mut *p) {
+                        if wleft == 0 {
+                            wb += 1;
+                            wp = *self.blocks.get_unchecked(wb);
+                            wleft = per;
+                        }
+                        *wp = *p;
+                        wp = wp.add(1);
+                        wleft -= 1;
+                        w += 1;
+                    }
+                }
+            }
+        }
+        let nb = w.div_ceil(per);
+        for &b in &self.blocks[nb..] {
+            free.push(b as *mut u8);
+        }
+        self.blocks.truncate(nb);
+        self.len = w;
+        if nb == 0 {
+            self.cur = std::ptr::null_mut();
+            self.left = 0;
+        } else {
+            let used = w - (nb - 1) * per;
+            self.left = per - used;
+            self.cur = unsafe { self.blocks[nb - 1].add(used) };
+        }
+    }
     /// Gives the blocks back for reuse (contents become garbage).
     pub fn release(&mut self, free: &mut Vec<*mut u8>) {
         for &b in &self.blocks {
