@@ -2,8 +2,8 @@
 # Stage timing: parse cut off after stage n (diag feature), native, 1 and N threads.
 set -u
 source bench/config.env
-[ -z "${DIAG_REF:-}" ] && exit 0
 N=$(nproc)
+if [ -n "${DIAG_REF:-}" ]; then
 rm -rf /tmp/t && git worktree prune && git worktree add -f /tmp/t "$DIAG_REF" -q && cd /tmp/t
 RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static" cargo build --release -q --features diag 2>&1 | tail -2
 for n in 1 $N; do
@@ -15,6 +15,7 @@ for n in 1 $N; do
     done
   done
 done
+fi
 # Cachegrind on the 1M set (instruction counts per line), normal build with line tables
 if [ -n "${CG_REF:-}" ]; then
   sudo apt-get install -y -qq valgrind >/dev/null 2>&1

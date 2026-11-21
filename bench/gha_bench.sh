@@ -40,6 +40,13 @@ runone() { # ds label envs keep
   sudo rm -rf $scr $out.err
 }
 : > /tmp/results.txt
+# fixed container cost: the first image with no data (the binary exits at once)
+first_label=$(echo "${V[0]}" | cut -d'|' -f1)
+for i in 1 2 3 4 5 6 7; do
+  t0=$(date +%s.%N)
+  docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus $N --memory 14g --memory-swap 14g --user 1000:1000 -e DATA_DIR=/nonexistent "sut:$first_label" >/dev/null 2>&1
+  t1=$(date +%s.%N); echo "EMPTY $(echo "$t1 - $t0" | bc)"
+done
 for ds in d20 d60; do
   R=$R20; [ $ds = d60 ] && R=$R60
   [ "$R" -gt 0 ] || continue
