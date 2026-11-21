@@ -829,6 +829,20 @@ What this says:
 - **Delta integers plus `DELTA_BYTE_ARRAY` plus a `top_category` dictionary would be about 8 B/row, roughly 18 MB**: a fifth of today's bytes with no compressor. Snappy on plain INT32 pages lands at the same size with one mechanism but needs an encoder.
 - `revenue_cents` fits in 32 bits for this dataset by a factor of 60, but a whale's day can exceed any assumed bound at 60M, so it stays INT64 (delta packing makes the width irrelevant anyway).
 
+### 20.4 A reference byte layout for the delta encodings, accepted by three readers
+
+- **What exists.** `/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/pqsize/refwriter.py`: a 130-line Python port of `src/pq.rs` (same Thrift footer, one row group, one v1 page per column) with `DELTA_BINARY_PACKED` (encoding 5) for INT32 and INT64, `DELTA_LENGTH_BYTE_ARRAY` (6) and `DELTA_BYTE_ARRAY` (7) for strings, including the optional string column. It is a specification to port, not code for the repo.
+- **Checked.** Files of 0, 1, 2, 31, 32, 33, 127, 128, 129, 130, 257, 1,000 and 40,000 rows, in four encoding mixes, with values that include negatives, `2^31 - 1`, `2^62` and empty strings: pyarrow 26.0.1, polars 2.1.0 (the version the starters pin) and duckdb 2.0.1 all return exactly the rows written. On the first golden 20M `user_daily` file (218,405 rows) the layout with delta integers and `DELTA_BYTE_ARRAY` `user_id` is 2,093,250 bytes against 9,376,877 now (42.9 to 9.6 B/row), and polars reads it equal to the original.
+- **The layout, as it passed.**
+  - Header: `uleb(128)`, `uleb(4)`, `uleb(total values)`, `zigzag(first value)`.
+  - Then blocks of up to 128 deltas (wrapping in the column's width): `zigzag(min delta)`, four bit-width bytes (0 for unused miniblocks), then each used miniblock as 32 values of `delta - min` packed LSB first at its width, the last one padded with zeros to 32 values. Unused miniblocks have no body.
+  - A column with zero values is just the header with a zero first value.
+  - `DELTA_LENGTH_BYTE_ARRAY`: the lengths as a delta-packed INT32 stream, then all bytes concatenated.
+  - `DELTA_BYTE_ARRAY`: prefix lengths as a delta-packed INT32 stream, then the suffixes as a delta-length byte array.
+  - Page header and column metadata only change in the encoding id (`PageHeader.data_page_header.encoding`, and the `encodings` list `[RLE, 5]` and so on); the definition levels of the optional column stay as they are, in front of the values.
+- **Where it goes.** `pq.rs:130-159` (the three `match` arms that build `page`) and `:216-218` (the encodings list). `out.rs:48-50` would pass `sessions` and `events` as 32-bit.
+- **Not checked.** Spark's reader (the notes in 5.1 say 4.0.1 supports these); pages larger than about 10 MB with these encodings.
+
 ### 20.2 Other new commits
 
 - [Vibhor7-7 `80df6c5`](https://github.com/Vibhor7-7/shopping-sessions/commit/80df6c5) (experiment 23, no number yet): `ingest_ts` validity checked with ordinary compare-and-branch instead of a folded flag, because unlike `ts` its form is always F1 and the branches predict; its whole seconds come straight from the parse "instead of from multiplying by 1000 and dividing again". This repo already keeps ingest in seconds (`parse_ingest_s`).
