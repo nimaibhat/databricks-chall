@@ -224,12 +224,6 @@ pub struct Mapped {
     pub files: Vec<File>,
 }
 
-#[inline(always)]
-pub fn ts_bl() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("TSBL").map(|v| v == "1").unwrap_or(false))
-}
-
 /// I/O strategy, from env IOMODE: 0 none, 1 whole-file WILLNEED at open,
 /// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread.
 pub fn io_mode() -> u32 {
@@ -868,87 +862,88 @@ fn civil_swar(p: *const u8) -> Option<i64> {
     Some(days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + s) as i64)
 }
 
-/// Days in month, index 1..=12 (16 entries so a garbage month indexes safely).
-static DIM: [u8; 16] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0];
+/// Dates already validated by this thread: the 11 bytes `YYYY-MM-DDT` and
+/// the epoch seconds of that midnight, indexed by the day-of-month digits. A
+/// window touches about 30 dates, so nearly every timestamp is a hit: two
+/// word compares instead of digit checks, range checks and the calendar math.
+pub struct DateMemo {
+    e: [(u64, u64, i64); 64],
+    #[cfg(test)]
+    pub hits: u64,
+}
+impl DateMemo {
+    pub fn new() -> DateMemo {
+        // no timestamp starts with eight NUL bytes
+        DateMemo {
+            e: [(0, 0, 0); 64],
+            #[cfg(test)]
+            hits: 0,
+        }
+    }
+}
 
-#[allow(dead_code)]
-/// Branch-free `ts` parse: F1, F2 and 9..=16-digit F3 are all computed and
-/// one is selected; any other or invalid input falls back to `parse_ts`
-/// (exact). Needs 25 readable bytes from `s` and 16 before its end.
+/// Seconds of day of `HH:MM:SS` at p (8 readable bytes); None unless it is
+/// exactly two digits, a colon, two digits, a colon, two digits, in range.
 #[inline(always)]
-pub fn parse_ts_bl(s: &[u8], floor: *const u8, ceil: *const u8) -> Option<i64> {
-    let n = s.len();
-    let p = s.as_ptr();
-    let e = p as usize + n;
-    if (p as usize) + 25 > ceil as usize || e < floor as usize + 16 {
-        return parse_ts(s);
+fn tod_checked(p: *const u8) -> Option<i64> {
+    const SEP: u64 = 0x0000_FF00_00FF_0000;
+    let w = ld8(p);
+    let w2 = (w & !SEP) | 0x0000_3000_0030_0000;
+    if (w & SEP) != 0x0000_3A00_003A_0000 || !digits8(w2) {
+        return None;
     }
-    // civil part (F1 / F2)
-    const SA: u64 = 0xFF00_00FF_0000_0000;
-    const SB: u64 = 0x0000_FF00_00FF_0000;
-    const SC: u64 = 0x0000_00FF_0000_0000;
+    let pa = pairs(w2);
+    let h = pa & 0xFF;
+    let mi = (pairs(w2 >> 8) >> 16) & 0xFF;
+    let sec = (pa >> 48) & 0xFF;
+    if h > 23 || mi > 59 || sec > 59 {
+        return None;
+    }
+    Some((h * 3600 + mi * 60 + sec) as i64)
+}
+
+/// Same result as `civil_swar` for every input (20+ readable bytes at p).
+#[inline(always)]
+fn civil_memo(p: *const u8, memo: &mut DateMemo) -> Option<i64> {
     let a = ld8(p);
-    let b = ld8(unsafe { p.add(8) });
-    let c = ld8(unsafe { p.add(12) });
-    let t = ld8(unsafe { p.add(17) }); // bytes 17..25: "SS" + zone
-    let sep = ((a & SA) ^ 0x2D00_002D_0000_0000) | ((b & SB) ^ 0x0000_3A00_0054_0000) | ((c & SC) ^ 0x0000_003A_0000_0000);
-    let a2 = (a & !SA) | 0x3000_0030_0000_0000;
-    let b2 = (b & !SB) | 0x0000_3000_0030_0000;
-    let c2 = (c & 0x00FF_FFFF_FFFF_FFFF & !SC) | 0x3000_0030_0000_0000;
-    let dig = digits8(a2) & digits8(b2) & digits8(c2);
-    let pa = pairs(a2);
-    let pa8 = pairs(a2 >> 8 | 0x3000_0000_0000_0000);
-    let pb = pairs(b2);
-    let pb8 = pairs(b2 >> 8 | 0x3000_0000_0000_0000);
-    let pc8 = pairs(c2 >> 8 | 0x3000_0000_0000_0000);
-    let y = (pa & 0xFF) * 100 + ((pa >> 16) & 0xFF);
-    let mo = (pa8 >> 32) & 0xFF;
-    let d = pb & 0xFF;
-    let h = (pb8 >> 16) & 0xFF;
-    let mi = (pb >> 48) & 0xFF;
-    let sec = (pc8 >> 32) & 0xFF;
-    let leap = ((y % 4 == 0) & (y % 100 != 0)) | (y % 400 == 0);
-    let dim = DIM[(mo & 15) as usize] as u64 + ((mo == 2) & leap) as u64;
-    let civ_ok = (sep == 0) & dig & (mo.wrapping_sub(1) < 12) & (d >= 1) & (d <= dim) & (h <= 23) & (mi <= 59) & (sec <= 59);
-    let civ = days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + sec) as i64;
-    // zone: byte 19 (index 2 of t) is 'Z' for F1; "+HH:MM" for F2
-    let z = (t >> 16) as u8;
-    let o1 = ((t >> 24) as u8).wrapping_sub(b'0') as u64;
-    let o2 = ((t >> 32) as u8).wrapping_sub(b'0') as u64;
-    let colon = (t >> 40) as u8 == b':';
-    let o3 = ((t >> 48) as u8).wrapping_sub(b'0') as u64;
-    let o4 = ((t >> 56) as u8).wrapping_sub(b'0') as u64;
-    let oh = o1 * 10 + o2;
-    let om = o3 * 10 + o4;
-    let off_ok = (z == b'+' || z == b'-') & colon & (o1 < 10) & (o2 < 10) & (o3 < 10) & (o4 < 10) & (oh <= 23) & (om <= 59);
-    let off = ((oh * 60 + om) * 60) as i64;
-    let off = if z == b'+' { -off } else { off };
-    let is1 = (n == 20) & (z == b'Z') & civ_ok;
-    let is2 = (n == 25) & off_ok & civ_ok;
-    // F3, 9..=16 digits
-    let lo = ld8((e - 16) as *const u8);
-    let hi = ld8((e - 8) as *const u8);
-    let keep = 16usize.wrapping_sub(n).min(8);
-    let lo = (lo & (!0u64).wrapping_shl(8 * keep as u32)) | (0x3030_3030_3030_3030 & !(!0u64).wrapping_shl(8 * keep as u32));
-    let is3 = (n >= 9) & (n <= 16) & digits8(lo) & digits8(hi);
-    let f3 = (val8(lo) * 100_000_000 + val8(hi)) as i64;
-    let v1 = (civ + if is2 { off } else { 0 }) * 1000;
-    if is1 | is2 {
-        Some(v1)
-    } else if is3 {
-        Some(f3)
-    } else {
-        parse_ts(s)
+    let b = ld8(unsafe { p.add(8) }) & 0x00FF_FFFF; // "DDT"
+    let idx = (((b & 3) << 4) | ((b >> 8) & 15)) as usize;
+    let e = unsafe { *memo.e.get_unchecked(idx) };
+    if e.0 == a && e.1 == b {
+        // the date bytes equal a date that passed every check before
+        #[cfg(test)]
+        {
+            memo.hits += 1;
+        }
+        return tod_checked(unsafe { p.add(11) }).map(|t| e.2 + t);
     }
+    let v = civil_swar(p)?;
+    // fully valid: remember its midnight
+    memo.e[idx] = (a, b, v - v.rem_euclid(86400));
+    Some(v)
 }
 
 /// `ingest_ts` is always valid F1 (rules): seconds since the epoch of a
 /// 20-byte "YYYY-MM-DDTHH:MM:SSZ" without validation; anything of another
 /// shape goes through the checked parser.
 #[inline(always)]
-pub fn parse_ingest_s(s: &[u8], ceil: *const u8) -> Option<i64> {
+pub fn parse_ingest_s(s: &[u8], ceil: *const u8, memo: &mut DateMemo) -> Option<i64> {
     let p = s.as_ptr();
     if s.len() == 20 && (p as usize) + 20 <= ceil as usize && s[19] == b'Z' {
+        // a known date with a well-formed time of day (the value is then the
+        // same as the unvalidated arithmetic below, which stays for the rest)
+        let ka = ld8(p);
+        let kb = ld8(unsafe { p.add(8) }) & 0x00FF_FFFF;
+        let e = unsafe { *memo.e.get_unchecked((((kb & 3) << 4) | ((kb >> 8) & 15)) as usize) };
+        if e.0 == ka && e.1 == kb {
+            if let Some(t) = tod_checked(unsafe { p.add(11) }) {
+                #[cfg(test)]
+                {
+                    memo.hits += 1;
+                }
+                return Some(e.2 + t);
+            }
+        }
         const SA: u64 = 0xFF00_00FF_0000_0000;
         const SB: u64 = 0x0000_FF00_00FF_0000;
         const SC: u64 = 0x0000_00FF_0000_0000;
@@ -966,7 +961,12 @@ pub fn parse_ingest_s(s: &[u8], ceil: *const u8) -> Option<i64> {
         let h = (pb8 >> 16) & 0xFF;
         let mi = (pb >> 48) & 0xFF;
         let sec = (pc8 >> 32) & 0xFF;
-        return Some(days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + sec) as i64);
+        let v = days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + sec) as i64;
+        // remember the date only if the whole timestamp is valid
+        if let Some(cv) = civil_swar(p) {
+            memo.e[(((kb & 3) << 4) | ((kb >> 8) & 15)) as usize] = (ka, kb, cv - cv.rem_euclid(86400));
+        }
+        return Some(v);
     }
     parse_ts(s).map(|v| v.div_euclid(1000))
 }
@@ -976,12 +976,12 @@ pub fn parse_ingest_s(s: &[u8], ceil: *const u8) -> Option<i64> {
 /// (true inside a scanned line: at least the newline or 64-byte tail padding
 /// is not guaranteed, so callers pass `ceil` = one past the last readable byte).
 #[inline(always)]
-pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8) -> Option<i64> {
+pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8, memo: &mut DateMemo) -> Option<i64> {
     let n = s.len();
     let p = s.as_ptr();
     if n == 20 && (p as usize) + 20 <= ceil as usize {
         if s[19] == b'Z' {
-            if let Some(v) = civil_swar(p) {
+            if let Some(v) = civil_memo(p, memo) {
                 return Some(v * 1000);
             }
         }
@@ -992,7 +992,7 @@ pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8) -> Option<i64>
         let oh = d2(s, 20);
         let om = d2(s, 23);
         if (sign == b'+' || sign == b'-') && s[22] == b':' && oh <= 23 && om <= 59 {
-            if let Some(base) = civil_swar(p) {
+            if let Some(base) = civil_memo(p, memo) {
                 let off = (oh * 60 + om) as i64 * 60;
                 return Some(if sign == b'+' { base - off } else { base + off } * 1000);
             }
@@ -1026,6 +1026,8 @@ mod swar_tests {
             x % n
         };
         let mut hits = 0;
+        let mut memo = DateMemo::new();
+        let mut hits_memo = 0u64;
         for i in 0..3_000_000u32 {
             let mut s = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 1990 + rnd(60), rnd(14), rnd(33), rnd(26), rnd(62), rnd(62)).into_bytes();
             if i % 3 == 0 {
@@ -1036,8 +1038,24 @@ mod swar_tests {
             buf.extend_from_slice(&s);
             buf.extend_from_slice(&[b','; 16]);
             let f = &buf[16..36];
-            let r = parse_ts_fast(f, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
+            // a fresh table every 1000 cases: misses, then hits, on the same dates
+            if i % 1000 == 0 {
+                hits_memo += memo.hits;
+                memo = DateMemo::new();
+            }
+            let r = parse_ts_fast(f, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo);
             assert_eq!(r, parse_ts(&s), "{:?}", String::from_utf8_lossy(&s));
+            let r2 = parse_ts_fast(f, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo);
+            assert_eq!(r2, parse_ts(&s), "warm {:?}", String::from_utf8_lossy(&s));
+            if f[19] == b'Z' {
+                // ingest path: unvalidated for malformed input, exact for valid input, and
+                // always equal to what it returns with an empty table
+                let cold = parse_ingest_s(f, unsafe { buf.as_ptr().add(buf.len()) }, &mut DateMemo::new());
+                assert_eq!(parse_ingest_s(f, unsafe { buf.as_ptr().add(buf.len()) }, &mut memo), cold, "ingest {:?}", String::from_utf8_lossy(&s));
+                if let Some(v) = parse_ts(&s) {
+                    assert_eq!(cold, Some(v / 1000));
+                }
+            }
             if f[19] == b'Z' {
                 let c = civil_swar(f.as_ptr());
                 assert_eq!(c.map(|v| v * 1000), parse_ts(&s), "{:?}", String::from_utf8_lossy(&s));
@@ -1045,6 +1063,7 @@ mod swar_tests {
             }
         }
         assert!(hits > 100_000);
+        assert!(hits_memo > 1_000_000, "memo hits {hits_memo}");
     }
     #[test]
     fn civil_swar_hits() {
@@ -1066,6 +1085,7 @@ mod swar_tests {
             b"2028-02-29T00:00:00-10:00", b"2000-12-31T00:00:00Z",
         ];
         let alpha = b"0123456789-+:TZtz .e";
+        let mut memo = DateMemo::new();
         for _ in 0..300_000 {
             let t = tmpl[(rnd() % 6) as usize];
             let mut v = t.to_vec();
@@ -1090,8 +1110,8 @@ mod swar_tests {
             let sl = &buf[32..32 + v.len()];
             let (fl, ce) = (buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
             let want = parse_ts(&v);
-            assert_eq!(parse_ts_bl(sl, fl, ce), want, "bl {:?}", String::from_utf8_lossy(&v));
-            assert_eq!(parse_ts_fast(sl, fl, ce), want, "fast {:?}", String::from_utf8_lossy(&v));
+            assert_eq!(parse_ts_fast(sl, fl, ce, &mut memo), want, "fast {:?}", String::from_utf8_lossy(&v));
+            assert_eq!(parse_ts_fast(sl, fl, ce, &mut DateMemo::new()), want, "cold {:?}", String::from_utf8_lossy(&v));
         }
     }
     #[test]
@@ -1106,6 +1126,7 @@ mod swar_tests {
             "12345678901234567", "2026-00-10T00:00:00Z", "2026-10-00T00:00:00Z", "1900-02-29T00:00:00Z",
             "2000-02-29T00:00:00Z", "2026-10-03T23:58:1\rZ", "00000000086400000", "999999999",
         ].into_iter().map(String::from).collect();
+        let mut memo = DateMemo::new();
         // all F1 seconds of a few days plus random digit strings
         for c in ["2026-10-03T19:58:10+00:00", "2026-10-03T19:58:10-00:00", "2026-10-03T19:58:10+23:59", "2026-10-03T19:58:10+24:00",
                   "2026-10-03T19:58:10+05:60", "2026-10-03T19:58:10+0500", "2026-10-03T19:58:10 05:00", "2026-02-29T19:58:10+05:00",
@@ -1120,13 +1141,13 @@ mod swar_tests {
             buf.extend_from_slice(c.as_bytes());
             buf.extend_from_slice(&[b','; 32]);
             let s = &buf[32..32 + c.len()];
-            let r = parse_ts_fast(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
-            assert_eq!(r, parse_ts(c.as_bytes()), "{c:?}");
-            let r = parse_ts_bl(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
-            assert_eq!(r, parse_ts(c.as_bytes()), "bl {c:?}");
+            for _ in 0..2 {
+                let r = parse_ts_fast(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo);
+                assert_eq!(r, parse_ts(c.as_bytes()), "{c:?}");
+            }
             if let Some(v) = parse_ts(c.as_bytes()) {
                 if c.len() == 20 && c.ends_with('Z') {
-                    assert_eq!(parse_ingest_s(s, unsafe { buf.as_ptr().add(buf.len()) }), Some(v.div_euclid(1000)), "{c:?}");
+                    assert_eq!(parse_ingest_s(s, unsafe { buf.as_ptr().add(buf.len()) }, &mut memo), Some(v.div_euclid(1000)), "{c:?}");
                 }
             }
         }
