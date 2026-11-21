@@ -402,13 +402,17 @@ pub fn masks64_pub(b: &[u8]) -> (u64, u64, u64) {
     unsafe { masks64(b.as_ptr()) }
 }
 
+const SEG: usize = 32; // blocks per segment (2 KiB)
+const QR: usize = 64; // quote-mask ring, in blocks
+
 /// Calls `f` with the N fields of every well-formed line in `data[start..end]`.
 /// Lines start at `start` and none crosses `end`.
 ///
-/// Structural iteration: for each 64-byte block, the set bits of
-/// (comma | newline) are visited in order; a line's separators are recorded and
-/// on its newline the fields are cut and quote-checked with bit tests on a
-/// small ring of quote masks. Lines longer than the ring take the scalar path.
+/// Per 2 KiB segment: SIMD masks per 64-byte block; the positions of all
+/// separators (comma | newline) are flattened branch-free into `pos`, and each
+/// newline records its rank there. A line is well-formed only if it holds
+/// exactly N separators; its fields are cut from `pos` and quote-checked with
+/// bit tests on a ring of quote masks. Long lines take the scalar path.
 #[inline(always)]
 pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = end - start;
@@ -416,67 +420,104 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
         return;
     }
     let base = unsafe { data.as_ptr().add(start) };
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut seps = [0u32; N]; // positions of the commas, then the newline
-    let mut k = 0usize; // commas seen in the current line
-    let mut line_start = 0usize;
-    let mut qr = [0u64; 4]; // quote masks of the last 4 blocks
     let nblocks = len.div_ceil(64);
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut pos: Vec<u32> = vec![0; SEG * 64 + 256];
+    let mut nl = [(0u32, 0u32); SEG * 64];
+    let mut qr = [0u64; QR];
     let mut tail = [0u8; 64];
-    let qbit = |qr: &[u64; 4], p: usize| -> u64 { (qr[(p >> 6) & 3] >> (p & 63)) & 1 };
-    for b in 0..nblocks {
-        let off = b * 64;
-        let (c, q, n) = if off + 64 <= len {
-            unsafe { masks64(base.add(off)) }
-        } else {
-            let rem = len - off;
-            unsafe { std::ptr::copy_nonoverlapping(base.add(off), tail.as_mut_ptr(), rem) };
-            for x in tail[rem..].iter_mut() {
-                *x = 0;
-            }
-            unsafe { masks64(tail.as_ptr()) }
-        };
-        qr[b & 3] = q;
-        let mut sep = c | n;
-        while sep != 0 {
-            let bit = sep.trailing_zeros();
-            sep &= sep - 1;
-            let p = off + bit as usize;
-            if (n >> bit) & 1 == 0 {
-                if k < N {
-                    seps[k] = p as u32;
+    let mut k = 0usize; // entries in pos
+    let mut ls = 0usize; // current line start
+    let mut ls_rank = 0usize; // index in pos of the current line's first separator
+    let qbit = |qr: &[u64; QR], p: usize| -> u64 { (qr[(p >> 6) % QR] >> (p & 63)) & 1 };
+    let mut seg = 0usize;
+    while seg < nblocks {
+        let seg_end = (seg + SEG).min(nblocks);
+        if pos.len() < k + (seg_end - seg) * 64 + 64 {
+            pos.resize(k + (seg_end - seg) * 64 + 256, 0);
+        }
+        let pp = pos.as_mut_ptr();
+        let mut nn = 0usize;
+        for b in seg..seg_end {
+            let off = b * 64;
+            let (c, q, n) = if off + 64 <= len {
+                unsafe { masks64(base.add(off)) }
+            } else {
+                let rem = len - off;
+                unsafe { std::ptr::copy_nonoverlapping(base.add(off), tail.as_mut_ptr(), rem) };
+                for x in tail[rem..].iter_mut() {
+                    *x = 0;
                 }
-                k += 1;
-                continue;
+                unsafe { masks64(tail.as_ptr()) }
+            };
+            qr[b % QR] = q;
+            let sm = c | n;
+            let cnt = sm.count_ones() as usize;
+            let o = off as u32;
+            let mut x = sm;
+            let mut i = 0usize;
+            while i < cnt {
+                unsafe {
+                    let d = pp.add(k + i);
+                    *d = o + x.trailing_zeros();
+                    x &= x.wrapping_sub(1);
+                    *d.add(1) = o + x.trailing_zeros();
+                    x &= x.wrapping_sub(1);
+                    *d.add(2) = o + x.trailing_zeros();
+                    x &= x.wrapping_sub(1);
+                    *d.add(3) = o + x.trailing_zeros();
+                    x &= x.wrapping_sub(1);
+                    *d.add(4) = o + x.trailing_zeros();
+                    x &= x.wrapping_sub(1);
+                    *d.add(5) = o + x.trailing_zeros();
+                    x &= x.wrapping_sub(1);
+                    *d.add(6) = o + x.trailing_zeros();
+                    x &= x.wrapping_sub(1);
+                    *d.add(7) = o + x.trailing_zeros();
+                    x &= x.wrapping_sub(1);
+                }
+                i += 8;
             }
-            // newline at p: line [line_start, p)
-            let ls = line_start;
-            line_start = p + 1;
-            let kk = k;
-            k = 0;
-            if kk != N - 1 || p == ls {
-                continue;
+            let mut y = n;
+            while y != 0 {
+                let bit = y.trailing_zeros();
+                let below = sm & ((1u64 << bit) - 1);
+                nl[nn] = (o + bit, (k + below.count_ones() as usize) as u32);
+                nn += 1;
+                y &= y - 1;
             }
-            seps[N - 1] = p as u32;
-            if p - ls > 190 {
-                // too long for the quote ring
-                let line = unsafe { std::slice::from_raw_parts(base.add(ls), p - ls) };
+            k += cnt;
+        }
+        for &(p, r) in &nl[..nn] {
+            let p = p as usize;
+            let r = r as usize;
+            let nsep = r + 1 - ls_rank;
+            let line_start = ls;
+            let first = ls_rank;
+            ls = p + 1;
+            ls_rank = r + 1;
+            if nsep != N {
+                continue; // wrong field count, or an empty line
+            }
+            if p - line_start > (QR - 2) * 64 {
+                let line = unsafe { std::slice::from_raw_parts(base.add(line_start), p - line_start) };
                 if split(line, &mut fields) {
                     f(&fields);
                 }
                 continue;
             }
-            // quotes in the line
+            // quotes in [line_start, p)
             let mut qcount = 0u32;
             {
-                let mut w = ls >> 6;
-                let last = (p - 1) >> 6;
-                while w <= last {
-                    let mut m = qr[w & 3];
-                    if w == ls >> 6 {
-                        m &= !0u64 << (ls & 63);
+                let w0 = line_start >> 6;
+                let w1 = (p - 1) >> 6;
+                let mut w = w0;
+                while w <= w1 {
+                    let mut m = qr[w % QR];
+                    if w == w0 {
+                        m &= !0u64 << (line_start & 63);
                     }
-                    if w == last {
+                    if w == w1 {
                         let e = ((p - 1) & 63) as u32;
                         m &= if e == 63 { !0 } else { (1u64 << (e + 1)) - 1 };
                     }
@@ -484,29 +525,44 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
                     w += 1;
                 }
             }
-            let mut fs = ls;
+            let mut fs = line_start;
+            if qcount == 0 {
+                for i in 0..N {
+                    let fe = unsafe { *pp.add(first + i) } as usize;
+                    fields[i] = unsafe { std::slice::from_raw_parts(base.add(fs), fe - fs) };
+                    fs = fe + 1;
+                }
+                f(&fields);
+                continue;
+            }
             let mut bad = 0u64;
             let mut seen = 0u32;
             for i in 0..N {
-                let fe = seps[i] as usize;
+                let fe = unsafe { *pp.add(first + i) } as usize;
                 let flen = fe - fs;
                 let nz = (flen != 0) as u64;
-                let a = qbit(&qr, fs) & nz;
-                let z = qbit(&qr, fe.wrapping_sub(1).max(fs)) & nz;
-                bad |= (a ^ z) | (a & (flen < 2) as u64);
-                seen += 2 * a as u32;
-                let a = a as usize;
-                fields[i] = unsafe { std::slice::from_raw_parts(base.add(fs + a), flen - 2 * a.min(flen / 2)) };
+                let qa = qbit(&qr, fs) & nz;
+                let qz = qbit(&qr, fe.wrapping_sub(1).max(fs)) & nz;
+                bad |= (qa ^ qz) | (qa & (flen < 2) as u64);
+                seen += 2 * qa as u32;
+                let qa = qa as usize;
+                fields[i] = unsafe { std::slice::from_raw_parts(base.add(fs + qa), flen - 2 * qa.min(flen / 2)) };
                 fs = fe + 1;
             }
             if bad == 0 && seen == qcount {
                 f(&fields);
             }
         }
+        // carry the current line's separators to the front
+        if ls_rank > 0 {
+            pos.copy_within(ls_rank..k, 0);
+            k -= ls_rank;
+            ls_rank = 0;
+        }
+        seg = seg_end;
     }
-    // a final line without a newline
-    if line_start < len {
-        let line = unsafe { std::slice::from_raw_parts(base.add(line_start), len - line_start) };
+    if ls < len {
+        let line = unsafe { std::slice::from_raw_parts(base.add(ls), len - ls) };
         if split(line, &mut fields) {
             f(&fields);
         }
@@ -580,6 +636,150 @@ mod tests {
             }
             assert_eq!(scalar::<4>(&d), simd::<4>(&d));
             assert_eq!(scalar::<2>(&d), simd::<2>(&d));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SWAR fast paths. Each falls back to the exact scalar parser when unsure.
+// ---------------------------------------------------------------------------
+#[inline(always)]
+fn ld8(p: *const u8) -> u64 {
+    u64::from_le(unsafe { (p as *const u64).read_unaligned() })
+}
+
+/// Every byte is an ASCII digit (fast_float's check).
+#[inline(always)]
+fn digits8(x: u64) -> bool {
+    ((x & 0xF0F0_F0F0_F0F0_F0F0) | (((x.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
+        == 0x3333_3333_3333_3333
+}
+
+/// The value of 8 ASCII digits, first byte most significant.
+#[inline(always)]
+fn val8(x: u64) -> u64 {
+    let v = x.wrapping_sub(0x3030_3030_3030_3030);
+    let v = (v.wrapping_mul(10)).wrapping_add(v >> 8) & 0x00FF_00FF_00FF_00FF;
+    let v = (v.wrapping_mul(100)).wrapping_add(v >> 16) & 0x0000_FFFF_0000_FFFF;
+    (v.wrapping_mul(10000)).wrapping_add(v >> 32) & 0xFFFF_FFFF
+}
+
+/// Pairs: byte 2k of the result = 10 * digit(2k) + digit(2k+1).
+#[inline(always)]
+fn pairs(x: u64) -> u64 {
+    let v = x.wrapping_sub(0x3030_3030_3030_3030) & 0x0F0F_0F0F_0F0F_0F0F;
+    v.wrapping_mul(2561) >> 8
+}
+
+#[inline(always)]
+fn days_from_civil_u(y: u64, m: u64, d: u64) -> i64 {
+    // y in 0..=9999; shift by 400 years to stay non-negative
+    let y = y + 400 - (m <= 2) as u64;
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe) as i64 - 719_468 - 146_097
+}
+
+/// Seconds of an F1/F2 civil prefix "YYYY-MM-DDTHH:MM:SS" at p (20+ readable bytes).
+#[inline(always)]
+fn civil_swar(p: *const u8) -> Option<i64> {
+    let a = ld8(p);
+    let b = ld8(unsafe { p.add(8) });
+    let c = ld8(unsafe { p.add(12) });
+    const SA: u64 = 0xFF00_00FF_0000_0000;
+    const SB: u64 = 0x0000_FF00_00FF_0000;
+    const SC: u64 = 0x0000_00FF_0000_0000;
+    let sep = ((a & SA) ^ 0x2D00_002D_0000_0000) | ((b & SB) ^ 0x0000_3A00_0054_0000) | ((c & SC) ^ 0x0000_003A_0000_0000);
+    let a2 = (a & !SA) | 0x3000_0030_0000_0000;
+    let b2 = (b & !SB) | 0x0000_3000_0030_0000;
+    let c2 = (c & 0x00FF_FFFF_FFFF_FFFF & !SC) | 0x3000_0030_0000_0000;
+    if sep != 0 || !digits8(a2) || !digits8(b2) || !digits8(c2) {
+        return None;
+    }
+    let pa = pairs(a2);
+    let pa8 = pairs(a2 >> 8 | 0x3000_0000_0000_0000);
+    let pb = pairs(b2);
+    let pb8 = pairs(b2 >> 8 | 0x3000_0000_0000_0000);
+    let pc8 = pairs(c2 >> 8 | 0x3000_0000_0000_0000);
+    let y = (pa & 0xFF) * 100 + ((pa >> 16) & 0xFF);
+    let mo = (pa8 >> 32) & 0xFF;
+    let d = pb & 0xFF;
+    let h = (pb8 >> 16) & 0xFF;
+    let mi = (pb >> 48) & 0xFF;
+    let s = (pc8 >> 32) & 0xFF;
+    if mo.wrapping_sub(1) >= 12 || d == 0 || h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let dim = match mo {
+        2 => 28 + ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) as u64,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if d > dim {
+        return None;
+    }
+    Some(days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + s) as i64)
+}
+
+/// Same result as `parse_ts`, faster for the common shapes. `floor` is the
+/// first readable byte before `s`; `s` must be followed by >= 8 readable bytes
+/// (true inside a scanned line: at least the newline or 64-byte tail padding
+/// is not guaranteed, so callers pass `ceil` = one past the last readable byte).
+#[inline(always)]
+pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8) -> Option<i64> {
+    let n = s.len();
+    let p = s.as_ptr();
+    if n == 20 && (p as usize) + 20 <= ceil as usize {
+        if s[19] == b'Z' {
+            if let Some(v) = civil_swar(p) {
+                return Some(v * 1000);
+            }
+        }
+        return parse_ts(s);
+    }
+    let e = p as usize + n;
+    if n >= 9 && n <= 16 && e >= floor as usize + 16 {
+        let lo = ld8((e - 16) as *const u8);
+        let hi = ld8((e - 8) as *const u8);
+        let keep = 16 - n; // leading bytes of `lo` outside the field
+        let lo = (lo & (!0u64 << (8 * keep))) | (0x3030_3030_3030_3030 & !(!0u64 << (8 * keep)));
+        if digits8(lo) && digits8(hi) {
+            return Some((val8(lo) * 100_000_000 + val8(hi)) as i64);
+        }
+        return parse_ts(s);
+    }
+    parse_ts(s)
+}
+
+#[cfg(test)]
+mod swar_tests {
+    use super::*;
+    #[test]
+    fn ts_fast_matches() {
+        let mut cases: Vec<String> = vec![
+            "2026-10-03T23:58:10Z", "2026-10-03T19:58:10-04:00", "1791071890000", "0001791071890000",
+            "2028-02-29T00:00:00Z", "2027-02-29T00:00:00Z", "2026-13-01T00:00:00Z", "2026-02-30T00:00:00Z",
+            "2026-10-03T24:00:00Z", "2026-10-03T23:60:00Z", "2026-10-03T23:59:60Z", "2026-10-03t23:58:10Z",
+            "2026-10-03 23:58:10Z", "2026-10-03T23:58:10z", "2026-10-03T23:58:10", "1791071890000.0",
+            "1.79e12", "-5", "86400000", "", "0000-01-01T00:00:00Z", "9999-12-31T23:59:59Z",
+            "2026-1a-03T23:58:10Z", "2026/10/03T23:58:10Z", "123456789012345678901", "1234567890123456",
+            "12345678901234567", "2026-00-10T00:00:00Z", "2026-10-00T00:00:00Z", "1900-02-29T00:00:00Z",
+            "2000-02-29T00:00:00Z", "2026-10-03T23:58:1\rZ", "00000000086400000", "999999999",
+        ].into_iter().map(String::from).collect();
+        // all F1 seconds of a few days plus random digit strings
+        for d in 0..40 {
+            cases.push(format!("2027-12-{:02}T{:02}:{:02}:{:02}Z", 1 + d % 31, d % 24, (d * 7) % 60, (d * 13) % 60));
+        }
+        for c in &cases {
+            let mut buf = vec![b'x'; 32];
+            buf.extend_from_slice(c.as_bytes());
+            buf.extend_from_slice(&[b','; 32]);
+            let s = &buf[32..32 + c.len()];
+            let r = parse_ts_fast(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
+            assert_eq!(r, parse_ts(c.as_bytes()), "{c:?}");
         }
     }
 }

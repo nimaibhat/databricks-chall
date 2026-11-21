@@ -287,7 +287,7 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     parse_ts(rest[..q2].as_bytes()).expect("manifest ts")
 }
 
-const P1_BITS: u32 = 10;
+const P1_BITS: u32 = 9;
 const P1: usize = 1 << P1_BITS;
 const P1_SHIFT: u32 = 64 - P1_BITS;
 const P2_BITS: u32 = 9;
@@ -377,6 +377,10 @@ fn main() {
         link_shift,
     };
 
+    if env("BENCH", "0") == "2" {
+        microbench(&ctx, &ev_m, &arena);
+        return;
+    }
     // ---- phase 2: parse events + clicks
     let t_parse = Instant::now();
     let mut chunks = Vec::new();
@@ -421,11 +425,21 @@ fn main() {
     let ncat = ctx.cat_names.len();
     let acc = PerThread::new(threads, || out::Acc::new(ncamp + 1, ndays));
     let pscr = PerThread::new(threads, Scratch::default);
+    let ptimes = std::sync::Mutex::new(Vec::new());
     par_for(P2, threads, |t, p| {
         let a = unsafe { acc.get(t) };
         let sc = unsafe { pscr.get(t) };
+        let t0 = Instant::now();
         process_partition(&ctx, &sparts[p], &cparts[p], a, sc, ncat);
+        let n: usize = sparts[p].iter().map(|l| l.len).sum();
+        ptimes.lock().unwrap().push((t0.elapsed().as_micros(), n, p));
     });
+    {
+        let mut v = ptimes.into_inner().unwrap();
+        v.sort();
+        let tot: u128 = v.iter().map(|x| x.0).sum();
+        eprintln!("phase4 partitions: total {} us, top: {:?}", tot, &v[v.len().saturating_sub(5)..]);
+    }
     let accs = acc.into_inner();
     eprintln!("phase4 sessions {:?} arena used {} MB of {} MB", t_start.elapsed(), arena.used() >> 20, (est * 3 / 2) >> 20);
 
@@ -434,6 +448,53 @@ fn main() {
     eprintln!("done {:?}", t_start.elapsed());
     // everything is leaked to the kernel: no destructor walks
     std::process::exit(0);
+}
+
+fn microbench(ctx: &Ctx, ev_m: &Mapped, arena: &Arena) {
+    let mut ch = Vec::new();
+    chunks_of(0, ev_m, 4 << 20, &mut ch);
+    let ch = &ch[..ch.len().min(40)];
+    for c in ch {
+        let m = &ev_m.maps[c.file as usize];
+        let mut x = 0u64;
+        for i in (c.start..c.end).step_by(4096) {
+            x = x.wrapping_add(m[i] as u64);
+        }
+        std::hint::black_box(x);
+    }
+    let mut lines = 0u64;
+    let mut acc = 0u64;
+    let run = |name: &str, lines: u64, f: &mut dyn FnMut(&[&[u8]; 7])| {
+        let t = Instant::now();
+        for c in ch {
+            scan_lines::<7>(&ev_m.maps[c.file as usize], c.start, c.end, |x| f(x));
+        }
+        eprintln!("  {name:10} {:.1} ns/line", t.elapsed().as_nanos() as f64 / lines.max(1) as f64);
+    };
+    for c in ch {
+        scan_lines::<7>(&ev_m.maps[c.file as usize], c.start, c.end, |_| lines += 1);
+    }
+    run("scan", lines, &mut |f| acc = acc.wrapping_add(f[6].len() as u64));
+    run("pack eid", lines, &mut |f| acc = acc.wrapping_add(pack(f[0])));
+    run("pack uid", lines, &mut |f| acc = acc.wrapping_add(pack(f[1])));
+    run("ts", lines, &mut |f| acc = acc.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64));
+    run("ingest", lines, &mut |f| acc = acc.wrapping_add(parse_ts(f[3]).unwrap_or(0) as u64));
+    let (fl, ce) = (ev_m.maps[0].as_ptr(), unsafe { ev_m.maps[0].as_ptr().add(ev_m.maps[0].len()) });
+    run("ts fast", lines, &mut |f| acc = acc.wrapping_add(parse_ts_fast(f[2], fl, ce).unwrap_or(0) as u64));
+    run("ing fast", lines, &mut |f| acc = acc.wrapping_add(parse_ts_fast(f[3], fl, ce).unwrap_or(0) as u64));
+    run("type", lines, &mut |f| acc = acc.wrapping_add(match f[4] { b"view" => 1, b"cart" => 2, b"purchase" => 3, _ => 0 }));
+    run("price", lines, &mut |f| acc = acc.wrapping_add(parse_price(f[6]).unwrap_or(0) as u64));
+    let floor = ev_m.maps[0].as_ptr();
+    run("raw7 prod", lines, &mut |f| acc = acc.wrapping_add(raw7(f[5], floor).unwrap_or(0)));
+    run("prod get", lines, &mut |f| acc = acc.wrapping_add(ctx.products.raw.get(raw7(f[5], floor).unwrap_or(0)).unwrap_or(0) as u64));
+    run("person", lines, &mut |f| { let u = pack(f[1]); acc = acc.wrapping_add(ctx.person_h(u, hk(u))) });
+    let mut bs = Blocks::new(arena);
+    let mut eb: Vec<BList<ERec>> = (0..P1).map(|_| BList::new()).collect();
+    let t = Instant::now();
+    for c in ch {
+        parse_events(ctx, &ev_m.maps[c.file as usize], c.start, c.end, &mut eb, &mut bs);
+    }
+    eprintln!("  full       {:.1} ns/line ({} lines, {})", t.elapsed().as_nanos() as f64 / lines as f64, lines, acc);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -457,11 +518,13 @@ fn resolve_event(ctx: &Ctx, p: &EPend, eb: &mut [BList<ERec>], bs: &mut Blocks) 
     unsafe { eb.get_unchecked_mut((hk(r.eid) >> P1_SHIFT) as usize) }.push(r, bs);
 }
 
+#[inline(never)]
 fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<ERec>], bs: &mut Blocks) {
     let ws = ctx.ws;
     let we = ctx.we;
     let ws_s = ws.div_euclid(1000);
     let floor = d.as_ptr();
+    let ceil = unsafe { floor.add(d.len()) };
     let mut ring = [EPend::default(); LAG];
     let mut n = 0usize;
     scan_lines::<7>(d, start, end, |f| {
@@ -469,7 +532,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             return;
         }
         let eid = pack(f[0]);
-        let ingest = match parse_ts(f[3]) {
+        let ingest = match parse_ts_fast(f[3], floor, ceil) {
             Some(v) => (v.div_euclid(1000) - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
         };
@@ -478,7 +541,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let Some(ts) = parse_ts(f[2]) else { break 'v };
+            let Some(ts) = parse_ts_fast(f[2], floor, ceil) else { break 'v };
             if ts < ws || ts >= we || (ingest as i64 + ws_s) * 1000 - ts > DAY_MS {
                 break 'v;
             }
@@ -527,17 +590,19 @@ fn resolve_click(ctx: &Ctx, r: &CRec, uh: u64, cb: &mut [BList<CRec>], bs: &mut 
     unsafe { cb.get_unchecked_mut((hk(r.person) >> P2_SHIFT) as usize) }.push(r, bs);
 }
 
+#[inline(never)]
 fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<CRec>], bs: &mut Blocks) {
     let cws = ctx.ws - WEEK_MS;
     let we = ctx.we;
     let floor = d.as_ptr();
+    let ceil = unsafe { floor.add(d.len()) };
     let mut ring = [(CRec::default(), 0u64); LAG];
     let mut n = 0usize;
     scan_lines::<4>(d, start, end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let Some(ts) = parse_ts(f[3]) else { return };
+        let Some(ts) = parse_ts_fast(f[3], floor, ceil) else { return };
         if ts < cws || ts >= we {
             return;
         }
@@ -565,6 +630,7 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
 }
 
 /// Keeps, per event_id, the copy with the smallest ingest_ts; emits it if valid.
+#[inline(never)]
 fn dedup_partition(
     lists: &mut [BList<ERec>],
     mp: &mut KMap<u64>,
@@ -638,6 +704,7 @@ struct Scratch {
     ac: Vec<(u32, i64)>,
 }
 
+#[inline(never)]
 fn process_partition(
     ctx: &Ctx,
     slists: &[BList<SRec>],
