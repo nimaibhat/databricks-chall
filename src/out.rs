@@ -45,8 +45,8 @@ fn write_users(path: &Path, rows: &[URow], cats: &[Vec<u8>]) {
         key_bytes(r.person, &mut ub);
         ue.push(ub.len() as u32);
         days.push(r.day);
-        se.push(r.sessions as i64);
-        ev.push(r.events as i64);
+        se.push(r.sessions as i32);
+        ev.push(r.events as i32);
         rv.push(r.revenue as i64);
         if r.top == u16::MAX {
             def.push(false);
@@ -59,8 +59,8 @@ fn write_users(path: &Path, rows: &[URow], cats: &[Vec<u8>]) {
     let cols = [
         Column { name: "user_id", data: Data::Str { bytes: ub, ends: ue, def: None } },
         Column { name: "day", data: Data::Date(days) },
-        Column { name: "sessions", data: Data::I64(se) },
-        Column { name: "events", data: Data::I64(ev) },
+        Column { name: "sessions", data: Data::I32(se) },
+        Column { name: "events", data: Data::I32(ev) },
         Column { name: "revenue_cents", data: Data::I64(rv) },
         Column { name: "top_category", data: Data::Str { bytes: cb, ends: ce, def: Some(def) } },
     ];
