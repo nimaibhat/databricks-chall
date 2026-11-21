@@ -402,9 +402,9 @@ fn main() {
     chunks_of(0, &ev_m, chunk_kb << 10, &mut chunks);
     chunks_of(1, &cl_m, chunk_kb << 10, &mut chunks);
     let blocks = PerThread::new(threads, || Blocks::new(&arena));
-    let ebl = PerThread::new(threads, || (0..(1usize << p1_bits())).map(|_| BList::<DRec>::new()).collect::<Vec<_>>());
-    let sbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
-    let cbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
+    let ebl = PerThread::new(threads, || Scatter::<DRec>::new(1usize << p1_bits()));
+    let sbl = PerThread::new(threads, || Scatter::<SRec>::new(1usize << p2_bits()));
+    let cbl = PerThread::new(threads, || Scatter::<CRec>::new(1usize << p2_bits()));
     let iobufs = PerThread::new(threads, Vec::<u8>::new);
     par_for(chunks.len(), threads, |t, i| {
         let c = chunks[i];
@@ -424,14 +424,14 @@ fn main() {
         }
     });
     std::mem::forget(iobufs);
-    let eparts = PerThread::from_vec(transpose(ebl.into_inner(), 1usize << p1_bits()));
-    let cparts = transpose(cbl.into_inner(), 1usize << p2_bits());
+    let eparts = PerThread::from_vec(transpose(ebl.into_inner().into_iter().map(|s| s.finish()).collect(), 1usize << p1_bits()));
+    let cparts = transpose(cbl.into_inner().into_iter().map(|s| s.finish()).collect(), 1usize << p2_bits());
     eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
     if diag_stage() != 0 {
         std::process::exit(0);
     }
 
-    let sparts = transpose(sbl.into_inner(), 1usize << p2_bits());
+    let sparts = transpose(sbl.into_inner().into_iter().map(|s| s.finish()).collect(), 1usize << p2_bits());
 
     // ---- phase 3: dedup per eid partition; losers are marked dead in place
     let dscr = PerThread::new(threads, || KMap::<u64>::with_capacity(16));
@@ -509,19 +509,19 @@ const RING: usize = 16;
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn emit_event(tab: &LinkTab, p: &PendE, eb: &mut [BList<DRec>], sb: &mut [BList<SRec>], bs: &mut Blocks, sh1: u32, sh2: u32, abase: usize) {
+fn emit_event(tab: &LinkTab, p: &PendE, eb: &mut Scatter<DRec>, sb: &mut Scatter<SRec>, bs: &mut Blocks, sh1: u32, sh2: u32, abase: usize) {
     let (person, hp) = match tab.get(p.user, p.h) {
         Some(v) => (v, hk(v)),
         None => (p.user, p.h),
     };
-    let at = unsafe { sb.get_unchecked_mut((hp >> sh2) as usize) }.push_at(SRec { person, ts: p.ts, pc: p.pc }, bs);
+    let at = sb.push((hp >> sh2) as usize, SRec { person, ts: p.ts, pc: p.pc }, bs);
     let loc = ((at as usize - abase) / 16) as u32 + 1;
-    unsafe { eb.get_unchecked_mut((hk(p.eid) >> sh1) as usize) }.push(DRec { eid: p.eid, ingest: p.ingest, loc }, bs);
+    eb.push((hk(p.eid) >> sh1) as usize, DRec { eid: p.eid, ingest: p.ingest, loc }, bs);
 }
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<DRec>], sb: &mut [BList<SRec>], bs: &mut Blocks, abase: usize) {
+fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<DRec>, sb: &mut Scatter<SRec>, bs: &mut Blocks, abase: usize) {
     let ws = ctx.ws;
     let we = ctx.we;
     let ws_s = ws.div_euclid(1000);
@@ -590,7 +590,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<D
                     sink = sink.wrapping_add(pr);
                     if stage >= 6 {
                         let hp = hk(pr);
-                        let at = unsafe { sb.get_unchecked_mut((hp >> sh2) as usize) }.push_at(SRec { person: pr, ts: old.ts, pc: old.pc }, bs);
+                        let at = sb.push((hp >> sh2) as usize, SRec { person: pr, ts: old.ts, pc: old.pc }, bs);
                         sink = sink.wrapping_add(at as u64);
                     }
                 } else {
@@ -602,7 +602,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<D
             return;
         }
         // an invalid copy still takes part in dedup
-        unsafe { eb.get_unchecked_mut((hk(eid) >> sh1) as usize) }.push(DRec { eid, ingest, loc: 0 }, bs);
+        eb.push((hk(eid) >> sh1) as usize, DRec { eid, ingest, loc: 0 }, bs);
     });
     std::hint::black_box(sink);
     if cfg!(feature = "diag") && stage != 0 {
@@ -611,6 +611,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<D
     for p in &ring[..rn.min(RING)] {
         emit_event(tab, p, eb, sb, bs, sh1, sh2, abase);
     }
+    Scatter::<SRec>::fence();
 }
 
 /// Diagnostic stage (feature `diag` only): 0 = full run.
@@ -625,16 +626,16 @@ fn diag_stage() -> u32 {
 }
 
 #[inline(always)]
-fn emit_click(tab: &LinkTab, p: &PendC, cb: &mut [BList<CRec>], bs: &mut Blocks, sh2: u32) {
+fn emit_click(tab: &LinkTab, p: &PendC, cb: &mut Scatter<CRec>, bs: &mut Blocks, sh2: u32) {
     let (person, hp) = match tab.get(p.user, p.h) {
         Some(v) => (v, hk(v)),
         None => (p.user, p.h),
     };
-    unsafe { cb.get_unchecked_mut((hp >> sh2) as usize) }.push(CRec { person, cid: p.cid, ts: p.ts, camp: p.camp }, bs);
+    cb.push((hp >> sh2) as usize, CRec { person, cid: p.cid, ts: p.ts, camp: p.camp }, bs);
 }
 
 #[inline(never)]
-fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<CRec>], bs: &mut Blocks) {
+fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut Scatter<CRec>, bs: &mut Blocks) {
     let cws = ctx.ws - WEEK_MS;
     let we = ctx.we;
     let tsbl = ts_bl();
@@ -667,6 +668,7 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
     for p in &ring[..rn.min(RING)] {
         emit_click(tab, p, cb, bs, sh2);
     }
+    Scatter::<CRec>::fence();
 }
 
 /// Keeps, per event_id, the copy with the smallest ingest_ts: every other
