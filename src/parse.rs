@@ -444,7 +444,7 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
     let nblocks = len.div_ceil(64);
     let mut fields: [&'a [u8]; N] = [&[]; N];
     let mut pos: Vec<u32> = vec![0; SEG * 64 + 256];
-    let mut nl = [(0u32, 0u32); SEG * 64];
+    let mut nl = [(0u32, 0u32); SEG * 64 + 2];
     let mut qr = [0u64; QR];
     let mut tail = [0u8; 64];
     let mut k = 0usize; // entries in pos
@@ -499,7 +499,18 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
                 }
                 i += 8;
             }
+            // the first two newlines branch-free (nl has slack), the rest in a loop
+            let nc = n.count_ones() as usize;
             let mut y = n;
+            let b0 = y.trailing_zeros();
+            y &= y.wrapping_sub(1);
+            let b1 = y.trailing_zeros();
+            y &= y.wrapping_sub(1);
+            unsafe {
+                *nl.get_unchecked_mut(nn) = (o + b0, (k + (sm & !(!0u64).wrapping_shl(b0)).count_ones() as usize) as u32);
+                *nl.get_unchecked_mut(nn + 1) = (o + b1, (k + (sm & !(!0u64).wrapping_shl(b1)).count_ones() as usize) as u32);
+            }
+            nn += nc.min(2);
             while y != 0 {
                 let bit = y.trailing_zeros();
                 let below = sm & ((1u64 << bit) - 1);
@@ -547,15 +558,6 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
                 }
             }
             let mut fs = line_start;
-            if qcount == 0 {
-                for i in 0..N {
-                    let fe = unsafe { *pp.add(first + i) } as usize;
-                    fields[i] = unsafe { std::slice::from_raw_parts(base.add(fs), fe - fs) };
-                    fs = fe + 1;
-                }
-                f(&fields);
-                continue;
-            }
             let mut bad = 0u64;
             let mut seen = 0u32;
             for i in 0..N {
@@ -745,6 +747,35 @@ fn civil_swar(p: *const u8) -> Option<i64> {
     Some(days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + s) as i64)
 }
 
+/// `ingest_ts` is always valid F1 (rules): seconds since the epoch of a
+/// 20-byte "YYYY-MM-DDTHH:MM:SSZ" without validation; anything of another
+/// shape goes through the checked parser.
+#[inline(always)]
+pub fn parse_ingest_s(s: &[u8], ceil: *const u8) -> Option<i64> {
+    let p = s.as_ptr();
+    if s.len() == 20 && (p as usize) + 20 <= ceil as usize && s[19] == b'Z' {
+        const SA: u64 = 0xFF00_00FF_0000_0000;
+        const SB: u64 = 0x0000_FF00_00FF_0000;
+        const SC: u64 = 0x0000_00FF_0000_0000;
+        let a = (ld8(p) & !SA) | 0x3000_0030_0000_0000;
+        let b = (ld8(unsafe { p.add(8) }) & !SB) | 0x0000_3000_0030_0000;
+        let c = (ld8(unsafe { p.add(12) }) & 0x00FF_FFFF_FFFF_FFFF & !SC) | 0x3000_0030_0000_0000;
+        let pa = pairs(a);
+        let pa8 = pairs(a >> 8 | 0x3000_0000_0000_0000);
+        let pb = pairs(b);
+        let pb8 = pairs(b >> 8 | 0x3000_0000_0000_0000);
+        let pc8 = pairs(c >> 8 | 0x3000_0000_0000_0000);
+        let y = (pa & 0xFF) * 100 + ((pa >> 16) & 0xFF);
+        let mo = (pa8 >> 32) & 0xFF;
+        let d = pb & 0xFF;
+        let h = (pb8 >> 16) & 0xFF;
+        let mi = (pb >> 48) & 0xFF;
+        let sec = (pc8 >> 32) & 0xFF;
+        return Some(days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + sec) as i64);
+    }
+    parse_ts(s).map(|v| v.div_euclid(1000))
+}
+
 /// Same result as `parse_ts`, faster for the common shapes. `floor` is the
 /// first readable byte before `s`; `s` must be followed by >= 8 readable bytes
 /// (true inside a scanned line: at least the newline or 64-byte tail padding
@@ -801,6 +832,11 @@ mod swar_tests {
             let s = &buf[32..32 + c.len()];
             let r = parse_ts_fast(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
             assert_eq!(r, parse_ts(c.as_bytes()), "{c:?}");
+            if let Some(v) = parse_ts(c.as_bytes()) {
+                if c.len() == 20 && c.ends_with('Z') {
+                    assert_eq!(parse_ingest_s(s, unsafe { buf.as_ptr().add(buf.len()) }), Some(v.div_euclid(1000)), "{c:?}");
+                }
+            }
         }
     }
 }

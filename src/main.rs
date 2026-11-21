@@ -579,8 +579,8 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             return;
         }
         let eid = pack(f[0]);
-        let ingest = match parse_ts_fast(f[3], floor, ceil) {
-            Some(v) => (v.div_euclid(1000) - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        let ingest = match parse_ingest_s(f[3], ceil) {
+            Some(v) => (v - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
         };
         let mut r = ERec { eid, ingest, pc: INVALID, ..Default::default() };
