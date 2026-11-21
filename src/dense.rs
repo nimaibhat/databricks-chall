@@ -84,24 +84,67 @@ impl Dense {
     }
 }
 
-/// The packed key of the ID `prefix` + base 36 of `y`.
+/// The packed key of the ID `prefix` + base 36 of `y`: what `pack` gives
+/// for those bytes, computed from the number without writing the string.
 #[inline]
 pub fn num_key(prefix: u8, y: u64) -> Key {
-    {
-        let mut buf = [0u8; 14];
-        let mut at = buf.len();
-        let mut rest = y;
-        loop {
-            at -= 1;
-            buf[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize];
-            rest /= 36;
-            if rest == 0 {
-                break;
+    const P: [u64; 8] = [36, 1_296, 46_656, 1_679_616, 60_466_176, 2_176_782_336, 78_364_164_096, 2_821_109_907_456];
+    let pk = pack(&[prefix]);
+    if y >= P[7] || pk & 15 != 1 {
+        return num_key_slow(prefix, y);
+    }
+    // key codes: '0'..'9' are 1..10, 'a'..'z' are 38..63
+    let code = |d: u32| -> u64 { (d + 1 + if d >= 10 { 27 } else { 0 }) as u64 };
+    let quad = |x: u32| -> u64 {
+        let (a, b) = (x / 1296, x % 1296);
+        (code(a / 36) << 18) | (code(a % 36) << 12) | (code(b / 36) << 6) | code(b % 36)
+    };
+    let all = (quad((y / P[3]) as u32) << 24) | quad((y % P[3]) as u32);
+    // number of digits without leading zeros
+    let n = 1 + P[..7].iter().map(|&p| (y >= p) as u32).sum::<u32>();
+    let digits = (all << (6 * (8 - n))) & ((1u64 << 48) - 1);
+    (pk & !15) | (digits << 10) | (n as u64 + 1)
+}
+
+#[inline(never)]
+fn num_key_slow(prefix: u8, y: u64) -> Key {
+    let mut buf = [0u8; 14];
+    let mut at = buf.len();
+    let mut rest = y;
+    loop {
+        at -= 1;
+        buf[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize];
+        rest /= 36;
+        if rest == 0 {
+            break;
+        }
+    }
+    at -= 1;
+    buf[at] = prefix;
+    pack(&buf[at..])
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    #[test]
+    fn num_key_matches_pack() {
+        let mut x = 0x1234_5678_9ABC_DEFu64;
+        let mut r = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..3_000_000u64 {
+            let y = if i < 200_000 { i } else { (r() >> 12) >> (i % 52) };
+            for prefix in [b'u', b'e', b'k', b'U', b'-', b'.'] {
+                assert_eq!(num_key(prefix, y), num_key_slow(prefix, y), "{} {y}", prefix as char);
             }
         }
-        at -= 1;
-        buf[at] = prefix;
-        pack(&buf[at..])
+        for p in [35u64, 36, 1295, 1296, 46_655, 46_656, 1_679_615, 1_679_616, 60_466_175, 60_466_176, 2_176_782_335, 2_176_782_336, 78_364_164_095, 78_364_164_096, 2_821_109_907_455, 2_821_109_907_456, u64::MAX >> 1] {
+            assert_eq!(num_key(b'u', p), num_key_slow(b'u', p));
+        }
     }
 }
 
@@ -1132,12 +1175,81 @@ mod vk {
         fn ev(&mut self) -> *mut EvBatch {
             self.b
         }
+        /// Eight rows at a time for the common kind of row (a dense event
+        /// number, an ingest time in range, and either an invalid row or a
+        /// valid one of a dense user that is not a purchase); every other
+        /// row goes through `one`, which is also the definition of what the
+        /// vector code computes.
         #[inline(never)]
         fn ev_flush(&mut self) {
+            use core::arch::x86_64::*;
             let n = self.b.n;
-            for i in 0..n {
+            let dn = self.dn;
+            let mut i = 0;
+            unsafe {
+                let m40 = _mm512_set1_epi64(gen::M40 as i64);
+                let (binv, ainv) = (_mm512_set1_epi64(gen::INV_B as i64), _mm512_set1_epi64(gen::INV_A as i64));
+                let (ekey, ukey) = (_mm512_set1_epi64(dn.keys.event as i64), _mm512_set1_epi64(dn.keys.user as i64));
+                let (ecap, ucap) = (_mm512_set1_epi64(dn.ecap as i64), _mm512_set1_epi64(dn.ucap as i64));
+                let ws = _mm512_set1_epi64(self.ws);
+                let wlen = _mm512_set1_epi64(self.we - self.ws);
+                let ing_base = _mm512_set1_epi64((self.ws_s - 86_400) * 1000);
+                let ing_lim = _mm512_set1_epi64(ING_NONE as i64 * 1000);
+                let unscramble = |y: __m512i, key: __m512i| -> __m512i {
+                    let x = _mm512_and_si512(_mm512_mullo_epi64(y, binv), m40);
+                    let x = _mm512_xor_si512(x, _mm512_xor_si512(_mm512_srli_epi64::<17>(x), _mm512_srli_epi64::<34>(x)));
+                    _mm512_and_si512(_mm512_mullo_epi64(_mm512_xor_si512(x, key), ainv), m40)
+                };
+                while i + 8 <= n {
+                    let eid = _mm512_loadu_si512(self.b.eid.as_ptr().add(i) as *const _);
+                    let uid = _mm512_loadu_si512(self.b.uid.as_ptr().add(i) as *const _);
+                    let ts = _mm512_loadu_si512(self.b.ts.as_ptr().add(i) as *const _);
+                    let ing = _mm512_loadu_si512(self.b.ing.as_ptr().add(i) as *const _);
+                    let pp = _mm512_loadu_si512(self.b.pp.as_ptr().add(i) as *const _);
+                    let en = unscramble(eid, ekey);
+                    let e_ok = _mm512_cmple_epu64_mask(eid, m40) & _mm512_cmplt_epu64_mask(en, ecap);
+                    let un = unscramble(uid, ukey);
+                    let ui = _mm512_srli_epi64::<{ gen::ALIAS_BITS }>(un);
+                    let ua = _mm512_and_si512(un, _mm512_set1_epi64((1 << gen::ALIAS_BITS) - 1));
+                    let u_ok = _mm512_cmple_epu64_mask(uid, m40) & _mm512_cmplt_epu64_mask(ui, ucap) & _mm512_cmplt_epu64_mask(ua, _mm512_set1_epi64(NALIAS as i64));
+                    // seconds since window start - 1 day (the times are whole seconds)
+                    let rel = _mm512_sub_epi64(ing, ing_base);
+                    let ing_ok = _mm512_cmplt_epu64_mask(rel, ing_lim);
+                    let ing_s = _mm512_srli_epi64::<38>(_mm512_mul_epu32(rel, _mm512_set1_epi64(274_877_907)));
+                    let tsrel = _mm512_sub_epi64(ts, ws);
+                    let valid = _mm512_cmpneq_epi64_mask(uid, _mm512_set1_epi64(-1))
+                        & _mm512_cmpge_epi64_mask(pp, _mm512_setzero_si512())
+                        & _mm512_cmplt_epu64_mask(tsrel, wlen)
+                        & _mm512_cmple_epi64_mask(_mm512_sub_epi64(ing, ts), _mm512_set1_epi64(DAY_MS));
+                    let purchase = _mm512_cmpeq_epi64_mask(_mm512_and_si512(_mm512_srli_epi64::<56>(pp), _mm512_set1_epi64(3)), _mm512_set1_epi64(KIND_PURCHASE as i64));
+                    let fast = e_ok & ing_ok & (!valid | (u_ok & !purchase));
+                    let w0 = _mm512_mask_blend_epi64(valid, _mm512_set1_epi64(-1), _mm512_slli_epi64::<32>(tsrel));
+                    let user = _mm512_maskz_mov_epi64(valid, _mm512_or_si512(_mm512_slli_epi64::<4>(ui), ua));
+                    let w1 = _mm512_or_si512(
+                        _mm512_or_si512(_mm512_and_si512(en, _mm512_set1_epi64(SLOT_MASK as i64)), _mm512_slli_epi64::<{ SLOT_BITS }>(ing_s)),
+                        _mm512_slli_epi64::<{ USER_SHIFT }>(user),
+                    );
+                    let bucket = _mm512_srli_epi64::<{ SLOT_BITS }>(en);
+                    let (mut a0, mut a1, mut ab) = ([0u64; 8], [0u64; 8], [0u64; 8]);
+                    _mm512_storeu_si512(a0.as_mut_ptr() as *mut _, w0);
+                    _mm512_storeu_si512(a1.as_mut_ptr() as *mut _, w1);
+                    _mm512_storeu_si512(ab.as_mut_ptr() as *mut _, bucket);
+                    for j in 0..8 {
+                        if (fast >> j) & 1 != 0 {
+                            self.eb.push(ab[j] as usize, [a0[j], a1[j]], self.bs);
+                        } else {
+                            let k = i + j;
+                            let (eid, uid, ts, ing, pp) = (self.b.eid[k], self.b.uid[k], self.b.ts[k], self.b.ing[k], self.b.pp[k]);
+                            self.one(eid, uid, ts, ing, pp);
+                        }
+                    }
+                    i += 8;
+                }
+            }
+            while i < n {
                 let (eid, uid, ts, ing, pp) = (self.b.eid[i], self.b.uid[i], self.b.ts[i], self.b.ing[i], self.b.pp[i]);
                 self.one(eid, uid, ts, ing, pp);
+                i += 1;
             }
             self.b.n = 0;
         }

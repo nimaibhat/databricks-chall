@@ -24,8 +24,8 @@ const fn inverse(a: u64) -> u64 {
     }
     x
 }
-const INV_A: u64 = inverse(MUL_A);
-const INV_B: u64 = inverse(MUL_B);
+pub const INV_A: u64 = inverse(MUL_A);
+pub const INV_B: u64 = inverse(MUL_B);
 
 /// The generator's mix (text.rs): multiply, xor the key, xor-shift, multiply.
 #[inline(always)]
