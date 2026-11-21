@@ -105,6 +105,18 @@ Experiment 19: build-time constants on 9363748, one at a time, seed 20, 6 rounds
 
 The four best re-run at 15 rounds: seed 20 control 195.7 / 199.8, UB=11 195.0 / 197.9, HEAVY_DIV=2 196.2 / 200.0, LSD_MIN=4096 196.9 / 199.5, SPIN_DEF=1500 196.5 / 199.8; seed 7 control 198.9 / 202.8, UB=11 198.6 / 202.4, HEAVY_DIV=2 201.0 / 203.6, LSD_MIN=4096 200.2 / 203.4, SPIN_DEF=1500 201.0 / 202.9. Nothing reaches 1 ms on both seeds. All rejected; the defaults stay.
 
+Frequency probe (research 22.1), run on 9363748. Probe as written in 22.1 (60,000 dependent multiplies, minimum of three), taken on each pool worker (threads 1 to 7) immediately before and after every pool job; values in thousands of TSC ticks, lower is a faster clock. VM CPU is a Xeon Platinum 8252C, `/proc/cpuinfo` reads 4499 MHz. Two runs, 20M seed 20:
+
+| Job | Before | After |
+|---|---|---|
+| setup (1 to 3 ms) | 389 to 412 (thread 1: 498 to 503, it is the first thread started) | 388 to 412 |
+| parse (the long job) | 405 to 412 | 386 to 413 |
+| ev3a | 410 to 412 (thread 1: 461) | 454 to 488 |
+| ev3b | 411 to 413 on most, 454 to 466 on some | 448 to 488 |
+| write | 411 to 413 on most, up to 489 | 388 to 490, mixed |
+
+Reading: **parse runs at full clock.** The probe after parse equals the probe before it on every thread, so the 256-bit multiplies do not hold a reduced state here; row 1's remedy is not needed on this CPU. **Stage 3 does run at a reduced clock:** after ev3a every thread is 11 to 19% slower (456 to 488 against 411), and it recovers between jobs (most "before" values of the next job are back at 411). So ev3a, ev3b and part of the write stage, about 45 ms of wall, run 11 to 19% under the parse clock because of their 512-bit code. `fast_name_v` (the only 512-bit multiply, `events.rs:978`) is not the cause: it is only called from the self-test, and forcing its scalar path changes nothing (after-ev3a 456 to 478). `_mm512_` intrinsics by file: events.rs 171 lines, ckix.rs 34, core.rs 14, parse.rs 3, pqw.rs 2. Nothing changed in the source.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
