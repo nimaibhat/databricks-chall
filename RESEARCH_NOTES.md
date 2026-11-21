@@ -600,6 +600,14 @@ for i in 0..n {
 
 **A side observation, not proposed:** 3 of every 16 rows (fill offsets 52, 56, 60 within a line) make the 16-byte masked store cross a cache line. That is a split store on 19% of rows. On this CPU a split store costs a cycle or two, so I do not think it is worth a layout change; noted in case the annotate shows time on that store.
 
+## Iteration 20 (2026-11-21): the new stage 3 scatter read
+
+Read `scatter_chunk12` (`events.rs:262-330`). Per record: one unaligned load, one load of the slot's old tag from the dedup table, a predictable branch, a 16-byte store of the widened record. Records come two at a time through one 256-bit decode (`DEC2`).
+
+- **No prefetch to add.** The slot index is in the record itself and the loads of successive records are independent, so the out-of-order window already overlaps about 20 of them. A software prefetch of the slot would duplicate that.
+- **What limits it is the table size.** The table is 2^15 slots of 16 B, 512 KB per thread, so two hyperthreads fill their shared 1 MiB L2 exactly, before the input chunk. Evidence: halving it (bucket 2^14) took 3.5 ms off ev3a in experiments 9 and 15, and the second hyperthread adds only 1.14x in ev3a (experiment 13) against 1.22x in parse.
+- **Speculative idea, not ranked:** keep the slots at 12 B, as the records already are in the arena, and widen to 16 B only in the compaction that follows. That is 384 KB per thread, 768 KB per pair. If the gain scales with the size cut (a quarter against a half), it is 1 to 2 ms (**my estimate**, by proportion from the 3.5 ms above). It means rewriting the tag test, the keep-smallest-ingest rule and the 512-bit compaction for 12-byte slots, all of which decide which copy of a duplicated event survives. That is exactly the row-sensitive code, so by the rule of these notes it ranks below everything output-neutral and I would only take it up if the fresh profile (18.1) shows ev3a's scatter well above its old 98 thread-ms share.
+
 ## Next passes
 
 1. `core.rs` `feed_slice` / `feed_digest` and `events.rs` `digest_put`, for 15.2.
