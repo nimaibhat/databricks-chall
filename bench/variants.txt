@@ -1,3 +1,2 @@
 # label|ref|build-args|env
-main|origin/gate-main-ddb99e9||
-s22|origin/gate-s22-82942b4||
+s22c|origin/gate-s22c-82942b4||
