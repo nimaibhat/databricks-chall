@@ -397,8 +397,10 @@ fn main() {
     // ---- phase 2: parse events + clicks
     let t_parse = Instant::now();
     let mut chunks = Vec::new();
-    chunks_of(0, &ev_m, 4 << 20, &mut chunks);
-    chunks_of(1, &cl_m, 4 << 20, &mut chunks);
+    // chunk size: 4 MiB for mapped input; a pread buffer should stay in L2
+    let chunk_kb: usize = env("CHUNKKB", if io_mode() == 4 { "256" } else { "4096" }).parse().unwrap_or(4096);
+    chunks_of(0, &ev_m, chunk_kb << 10, &mut chunks);
+    chunks_of(1, &cl_m, chunk_kb << 10, &mut chunks);
     let blocks = PerThread::new(threads, || Blocks::new(&arena));
     let ebl = PerThread::new(threads, || (0..(1usize << p1_bits())).map(|_| BList::<DRec>::new()).collect::<Vec<_>>());
     let sbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
