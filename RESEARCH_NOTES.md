@@ -6,33 +6,28 @@ The notes for the old codebase are at `git show 3a5f601:RESEARCH_NOTES.md`. What
 
 ## Top five untried (ranked by expected gain per unit of risk to exact output)
 
-Re-ranked in iteration 9 from the measurements in `OVERNIGHT_LOG.md` (experiments 1 to 4 and "Facts for the research session"). All numbers marked "log" are quoted from that file; the baseline is the tmpfs one: wall 209.2 / 210.1 ms, parse 157.8, ev3a 35.4, write 9.5, noise about ±1 ms.
+Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c` (bucket 2^14, 64 MiB chunk cap, prefetch 512 B: kept, -2.3 to -3.1 ms at 20M). Baseline on tmpfs: 206.7 / 207.6 ms.
 
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
-| 1 | Stop releasing input pages chunk by chunk during parse; release the whole input once, in parallel on all threads, after the output is written. **No rebuild:** `XL_REL=0 XL_RGREL=0 XL_ENDREL=2` | `parse.rs:2158-2163`, `out.rs:541-546`, `main.rs:449-482` | **My estimate** 2 to 5 ms (1 to 2.4%): parse -7.7 ms, plus 3 to 6 ms for the parallel release at the end | Log, experiment 3: `XL_REL=0` alone gave parse 150.7 (-7.7) but write +22 because one thread then unmaps everything during the write stage. The three-variable combination was not in experiments 2 or 3 | None: the release happens after the last output file is closed | 9.1 |
-| 2 | Write clicks straight into the click index while parsing, instead of into records that link jobs later count, scatter and sort. **No rebuild:** `XL_CKIX=1` and `XL_CKIX=2` (two existing variants; the default is 0) | `setup.rs:662-672` (`click_cap`, `ckix_mode`), `ckix.rs:45` (`ck_vec_ix`), `parse.rs:596`, `links.rs:1090` (`prelude_ix`), `:1463` (`prelude_a`) | **My estimate** 0 to 6 ms; sign unknown, since the authors left it off | Log: `st2b=185.0` thread-ms inside parse (`pass1=18.4`, `pass2=113.2`, `sort=53.4`), 23 ms of wall-equivalent on 8 threads. Mode 1 has no count or scatter pass at all. Not in experiment 2's list | Low for rows (duplicate clicks are identical by the rules, so an overwrite is safe; both modes verify order and fall back if it fails). The real risk is a seed that trips that fallback: check stderr on at least three seeds | 9.7 |
-| 3 | Bucket of 2^14 events instead of 2^15, so two hyperthreads' dedup tables fit one core's L2 together. Build-time: `XL_BB=14` | `main.rs:64` (`BB`), `events.rs:234` (`scatter_chunk`) | **My estimate** 0 to 3 ms of ev3a's 35; can also cost up to 1 ms in parse (twice the buckets to scatter into) | Log: `scatter=98.1` thread-ms, a third of ev3a. The table is 512 KiB per thread (`BSIZE * 16`); Cascade Lake has 1 MiB of L2 per core, shared by two threads that each also hold their working arrays | Low: `BB` is an existing build parameter and the output must be byte-identical; the full gate decides. Not a code path the authors shipped, so run the gate at 1, 2 and 8 threads | 9.2 |
-| 4 | Prefetch distance of the line scanner: 1 KiB now; try 2 KiB and 4 KiB, and 512 B | `k_free.rs:1683` (`PFD`), used at `:1738`, `:1784`, `:2021`, `:2243` | **My estimate** 0 to 2 ms of parse; unknown sign | Weak, see 11.1: the thread-count result I leaned on does not show what I took it to show. What remains: on tmpfs the input is in 4 KiB pages, the hardware prefetcher stops at each page end, and the distance was tuned on another machine | None: prefetch only | 9.3, 11.1 |
-| 5 | Setup: start the workers without a page clear per tree level, and move what remains of thread 0's serial chain onto them | `sys.rs:279-292` (`pool_start`, `worker`), `:750-762` (first heap chunk), `setup.rs:835-932` | **My estimate** under 1 ms in total; below the log's 2 ms bar on its own | Log: workers start 0.9 to 1.45 ms after start; `s.list=1.0 s.mmap=1.1 s.sample=0.7`; parse starts at 2.5 ms. Mechanism read from the code (13.1), not measured | None | 9.4, 13.1 |
+| 1 | **Risk item, not a speed-up:** find which of experiment 9's three parts makes 40M events slower (+11 ms), and ship only the parts that do not | `main.rs:64` (`BB`), `parse.rs:1800` (`CH_DEFAULT`), `k_free.rs:1683` (`PFD`) | Removes a 2.7% loss if the hidden set is larger than reported, at a cost of at most about 1 ms at 20M | Log, experiment 9: 422.7 against 411.5 at 40M, parse +16.5, ev3a -5.7. **My reading:** it is the bucket size. Bucket count grows with the input (`nb = ecap >> BB`), so at 40M each parse thread scatters into about 3,100 staging lines (197 KiB) instead of 1,540; experiment 7 already showed `BB=14` costing parse 2.1 ms at 20M and `BB=13` 11 ms | None | 14.1 |
+| 2 | Frequency-licence probe at three points (worker start, end of parse, end of ev3a) | `parse.rs:2181`, `events.rs:2096` | Probe: none. If parse is held at L1 by its 256-bit multiplies: **my estimate** up to 5 ms | Log: memory traffic accounts for about 70 of parse's 158 ms, "the rest is computation". So about 88 ms scales with the core clock. Quoted: Lemire 2018, Downs 2020 (1.2) | Probe: none | 1.2, 3.3, 14.2 |
+| 3 | One thread per core run (`NCPU=4 XL_PIN=0 taskset -c 0-3`) | none | Diagnostic only; says how much the second hyperthread adds, which bounds row 2 | 11.1 | None | 11.1 |
+| 4 | Setup: spawn workers flat from main and offload thread 0's chain | `sys.rs:279-292`, `setup.rs:835-932` | Under 1 ms | 13.1 | None | 13.1 |
+| 5 | (empty: I have no fifth idea that I can support with a number or a mechanism) | | | | | |
 
-**Closed by measurement (do not re-propose):** PGO (experiment 1). Every run-time knob flipped singly, including `XL_PREFAULT`, `XL_SPIN`, `XL_PINSTART`, `XL_POPW`, `XL_QORD`, `XL_RD` (experiment 2). Chunk size 2 to 64 MiB: under 1 ms (experiment 3). `MADV_POPULATE_READ` per chunk: no gain, also with other chunk sizes (experiment 4). My iteration 2 prefetch-across-unmapped-pages mechanism (2.1a) is therefore wrong or too small to see; 2.1(b) was right in direction (see row 1).
-
-**Below the table:** early writeback and `XL_ENDREL=1` (9.5): at most the 1.5 to 2 ms of exit the log measured, and not visible outside a container.
-
-**Not ranked until one measurement is in (11.1):** the frequency-licence probe (1.2, 3.3). I demoted it in iteration 9 on the strength of the log's 4-thread run; that was a misreading (11.1). Whether parse computes or waits is open again, and the run that settles it is one command.
-
-**Still wanted from the log:** nothing blocking. The four-run ladder of 8.3 would size rows 3 and 4 before any work on them.
+**Closed by measurement since iteration 9 (do not re-propose):**
+- Row 1 of iteration 9 (release input once at the end): experiment 5. Parse does drop to 151.0, but the parallel release then takes 8.6 ms, so the wall is the same. The log's conclusion is the durable fact: **unmapping 1.8 GB of 4 KiB input pages costs about 8 ms of wall on 8 threads wherever it is done.** My estimate of 3 to 6 ms for the parallel release was too low.
+- Click-index modes (`XL_CKIX`): experiment 6. Mode 1 costs ev3a 5.5 ms (the recycling effect I flagged in 9.7 or the random stores; not separated), mode 2 is equal.
+- Bucket size and prefetch distance alone: experiment 7, each under 1 ms; together with the chunk cap they were kept (experiment 9).
+- Small pages with regular stores for the arena: experiment 8, 23 to 60 ms slower.
+- Fifteen further build constants: experiment 10.
 
 ## Requests to the coding agent
 
-Requests 1 to 5 of the first iterations are answered in `OVERNIGHT_LOG.md` ("Facts for the research session"); thank you. Open now, cheapest first:
-
-1. Row 1: `XL_REL=0 XL_RGREL=0 XL_ENDREL=2` against the default, on tmpfs, wall as the parent sees it. Also `XL_ENDREL=1` alone.
-2. Row 2: `XL_CKIX=1` and `XL_CKIX=2` against the default; `parse`, `ev3a` and wall; stderr checked for the fallback line on three seeds.
-3. 11.1: `NCPU=4 XL_PIN=0 taskset -c 0-3` (one thread per core), `parse` lap, against the 8-thread default.
-4. Row 3: a build with `XL_BB=14` (and 13), full gate, `parse` and `ev3a` laps.
-5. Optional, sizes rows 4 and 5: the four-run ladder of 8.3 (`--features knobs` build).
+1. Row 1: at 40M (seed 5), three builds on top of `801982c`, each with one part reverted: `XL_BB=15`; `XL_CH_DEF=8192`; `PFD=1024`. Also one size in between (30M) for the shipped build against `941879e`, to see where the crossover is.
+2. Row 2: the probe of 1.2 with 3.3's third measuring point.
+3. Row 3: the one-thread-per-core run of 11.1.
 
 ## Scorer facts carried over (all from other teams' probes, quoted in the old notes 11.1, 39.2, 50.1, 51.2; none verified here)
 
@@ -454,8 +449,29 @@ The log's profile lists every function above 1.1% of samples and none is in `pqw
 
 Every fallback prints `[v2b] FALLBACK: <reason>` before it re-executes (`sys.rs:123`). For the seed checks of rows 2 and 3: `grep -c FALLBACK` on stderr must be 0; a correct diff with that line present means the slow path produced the output.
 
+## Iteration 14 (2026-11-21): experiments 5 to 10 read; what is left
+
+### 14.1 The 40M regression of the shipped constants
+
+- The shipped change is right for 20M and the gate is thorough (four seeds, three thread counts, no fallback). The open point is the one the log itself raises: at 40M it is 11 ms slower.
+- **Why I think it is the bucket size, not the chunk cap.** The chunk rule is `rem / (4 * nt)` capped at `CH_DEFAULT` (`parse.rs:1961`). At 20M (1.8 GB) `rem / 32` starts at 56 MiB, so a 64 MiB cap is never reached and the chunks simply shrink with what is left; at 40M the cap applies only to the first few chunks. Neither case creates imbalance. The bucket count, on the other hand, doubles with the input and doubles again with `BB=14`: about 3,100 buckets per thread at 40M. Each has a 64-byte staging line (`parse.rs:94-159`), so two hyperthreads on one core hold about 400 KiB of staging in a 1 MiB L2 that also carries the scanner's tables, and each thread keeps 3,100 partly filled 4 KiB chunks open (12 MiB, six huge pages) as non-temporal store targets. Experiment 7 measured the same effect in small at 20M: `BB=14` parse +2.1 ms, `BB=13` parse +11 ms.
+- **If that is confirmed,** the choice is between about 1 ms at 20M and 11 ms at 40M. Other teams' probes say 20M; the generator has a comment about "the full 75M rows" (6). That is the user's call, and the answer may be to keep `BB=14`; I only want it made with the split known.
+- **A way to have both, if wanted later:** choose the bucket size from the input size at start. `BB` is a compile-time constant used in vector shifts (`parse.rs:712`) and in array sizes in `events.rs`, so this is not a small change and touches the most row-sensitive code. Not proposed unless the hidden size is in real doubt.
+
+### 14.2 The licence question is live again
+
+- Log: this VM reads 57 GB/s and writes 30 GB/s on 8 threads; the run's traffic (1.8 GB read, 0.56 GB written twice) needs about 70 ms at those rates; parse is 158 ms. So more than half of parse is computation, and my iteration 9 demotion of the probe (already withdrawn in 11.1) was wrong on the facts as well.
+- 88 ms of computation over 25.9M lines on 8 threads is 27 ns per line, about 115 cycles at this CPU's turbo clock for about 160 instructions (2.2), on hyperthreads. If parse sits in the L1 licence, the clock is several percent lower than it need be for every one of those cycles.
+- The probe is unchanged from 1.2 and 3.3: a fixed scalar loop timed with `rdtsc` at worker start, at the end of `stage1`, and at the end of `stage3a` (512-bit code, the positive control). 20 lines behind a feature, no behaviour change.
+- If positive, the first A/B is the event path's fused 256-bit decode against the 128-bit forms the click path already uses (2.3).
+
+### 14.3 What I got wrong, for calibration
+
+- Iteration 9 row 1: I estimated the parallel end release at 3 to 6 ms; it is 8.6. Removing 4 KiB file mappings does not scale across hyperthreads the way I assumed.
+- Iteration 9 row 2: I gave 0 to 6 ms with unknown sign; it was -6.4 (worse) for mode 1.
+- Rows 3 and 4 (bucket size, prefetch distance) were each under 1 ms alone, as the lower ends of my ranges said, and I had the prefetch direction open; 512 B was the better one.
+- Net: of five ranked ideas, the two I ranked highest were null or negative, and the kept gain came from the three lowest combined.
+
 ## Next passes
 
-Waiting on four results, in the order they are cheapest to get: row 1 (`XL_REL=0 XL_RGREL=0 XL_ENDREL=2`), row 2 (`XL_CKIX=1`, `XL_CKIX=2`), 11.1's one-thread-per-core run, row 3 (`XL_BB=14` build). Meanwhile:
-1. `links.rs` `sort_users` and the sorting networks: `st2b_sort=53.4` thread-ms (log).
-2. `parse.rs` `ev_vec` and `push_many` once more with the log's 10.5% share for `ev_batch` in hand.
+Nothing in the queue that I can support. I will re-read `OVERNIGHT_LOG.md` when it changes and re-rank.
