@@ -552,6 +552,15 @@ fn main() {
         let tot: u128 = v.iter().map(|x| x.0).sum();
         eprintln!("phase4 partitions: total {} us, top: {:?}", tot, &v[v.len().saturating_sub(5)..]);
     }
+    {
+        let mut tot = [0f64; 5];
+        for s in pscr.into_inner() {
+            for (a, b) in tot.iter_mut().zip(s.t.iter()) {
+                *a += b.as_secs_f64();
+            }
+        }
+        eprintln!("phase4 steps (thread-seconds): group {:.3} scatter {:.3} clicks {:.3} sort {:.3} sweep {:.3}", tot[0], tot[1], tot[2], tot[3], tot[4]);
+    }
     let accs = acc.into_inner();
     eprintln!("phase4 sessions {:?} {} arena used {} MB of {} MB", t_start.elapsed(), cpu(), arena.used() >> 20, arena.cap() >> 20);
 
@@ -839,6 +848,31 @@ fn dedup_partition(lists: &mut [BList<DRec>], sc: &mut DedupScratch, bs: &mut Bl
 }
 
 #[cfg(test)]
+mod sort_tests {
+    use super::*;
+    /// The radix sort orders by timestamp exactly like a stable comparison
+    /// sort by timestamp, and keeps every word.
+    #[test]
+    fn radix_matches_sort() {
+        let mut x: u64 = 0x1357_9BDF_2468_ACE0;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut tmp = Vec::new();
+        for &(n, span) in &[(0usize, 1u64), (1, 1), (2, 5), (2048, 1), (5000, 3), (5000, 1 << 11), (70_000, 1_209_600_000), (300_000, u32::MAX as u64 + 1), (10_000, 1 << 22), (4096, 2049)] {
+            let mut v: Vec<u64> = (0..n).map(|_| ((rnd() % span) << 32) | (rnd() & 0xFFFF_FFFF)).collect();
+            let mut want = v.clone();
+            want.sort_by_key(|w| w >> 32);
+            radix_sort_by_ts(&mut v, &mut tmp);
+            assert_eq!(v, want, "n {n} span {span}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod dedup_tests {
     use super::*;
     /// `dedup_partition` against the rule stated directly: per id the copy
@@ -934,6 +968,53 @@ struct Scratch {
     apos: Vec<u32>,
     since: Vec<u32>,
     active: Vec<u32>,
+    /// time per step, summed over partitions: group, scatter, clicks, sort, sweep
+    t: [std::time::Duration; 5],
+    rtmp: Vec<u64>,
+}
+
+/// Groups at least this large are radix sorted.
+const RADIX_MIN: usize = 2048;
+
+/// Sorts event words (ts << 32 | pc) by `ts`: least-significant-digit radix
+/// sort, three 11-bit digits over the timestamp (a timestamp is below 2^32;
+/// a digit on which all keys agree is skipped). Only the order by `ts`
+/// matters to the caller; this sort is stable, so the result is one of the
+/// orders a comparison sort by `ts` could produce.
+fn radix_sort_by_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
+    let n = v.len();
+    tmp.clear();
+    tmp.resize(n, 0);
+    let mut cnt = [[0u32; 2048]; 3];
+    for &x in v.iter() {
+        let t = (x >> 32) as usize;
+        cnt[0][t & 2047] += 1;
+        cnt[1][(t >> 11) & 2047] += 1;
+        cnt[2][t >> 22] += 1;
+    }
+    let mut src_is_v = true;
+    for (d, c) in cnt.iter_mut().enumerate() {
+        if c.iter().any(|&k| k as usize == n) {
+            continue; // every key has the same digit here
+        }
+        let mut sum = 0u32;
+        for k in c.iter_mut() {
+            let t = *k;
+            *k = sum;
+            sum += t;
+        }
+        let shift = 32 + 11 * d as u32;
+        let (src, dst): (&[u64], &mut [u64]) = if src_is_v { (&*v, &mut tmp[..]) } else { (&tmp[..], &mut *v) };
+        for &x in src {
+            let b = ((x >> shift) & 2047) as usize;
+            unsafe { *dst.get_unchecked_mut(c[b] as usize) = x };
+            c[b] += 1;
+        }
+        src_is_v = !src_is_v;
+    }
+    if !src_is_v {
+        v.copy_from_slice(tmp);
+    }
 }
 
 #[inline(never)]
@@ -949,6 +1030,7 @@ fn process_partition(
     if n == 0 {
         return;
     }
+    let t0 = Instant::now();
     let gmap = sc.gmap.get_or_insert_with(|| KMap::<u32>::with_capacity(16));
     gmap.reset(n / 4 + 16);
     // group events by person (counting sort); copies that lost dedup are skipped
@@ -976,6 +1058,7 @@ fn process_partition(
         });
     }
     let ng = gkeys.len();
+    let t1 = Instant::now();
     let off = &mut sc.off;
     off.clear();
     off.push(0);
@@ -1009,6 +1092,7 @@ fn process_partition(
         }
     }
     // group clicks by person (only persons with events)
+    let t2 = Instant::now();
     let ccounts = &mut sc.ccounts;
     ccounts.clear();
     ccounts.resize(ng, 0);
@@ -1058,6 +1142,10 @@ fn process_partition(
         }
     }
 
+    let t3 = Instant::now();
+    sc.t[0] += t1 - t0;
+    sc.t[1] += t2 - t1;
+    sc.t[2] += t3 - t2;
     let cat_rev = &mut sc.cat_rev;
     cat_rev.clear();
     cat_rev.resize(ncat, 0);
@@ -1075,15 +1163,25 @@ fn process_partition(
     let ws = ctx.ws;
     const WEEK: u64 = WEEK_MS as u64;
 
+    // sort every group first (timed apart from the sweep); large groups
+    // (whales, shared devices) by radix
     for g in 0..ng {
         let evs = &mut ev[off[g] as usize..off[g + 1] as usize];
-        if evs.len() > 1 {
+        if evs.len() >= RADIX_MIN {
+            radix_sort_by_ts(evs, &mut sc.rtmp);
+        } else if evs.len() > 1 {
             evs.sort_unstable();
         }
         let cls = &mut cl[coff[g] as usize..coff[g + 1] as usize];
         if cls.len() > 1 {
             cls.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
         }
+    }
+    let t4 = Instant::now();
+    sc.t[3] += t4 - t3;
+    for g in 0..ng {
+        let evs = &ev[off[g] as usize..off[g + 1] as usize];
+        let cls = &cl[coff[g] as usize..coff[g + 1] as usize];
         let person = gkeys[g];
         let mut cur_day: i32 = i32::MIN;
         // sessions, events, revenue of the current day so far
@@ -1196,6 +1294,7 @@ fn process_partition(
         active.clear();
         flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
     }
+    sc.t[4] += t4.elapsed();
 }
 
 #[inline]
