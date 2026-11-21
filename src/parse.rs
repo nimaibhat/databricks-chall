@@ -747,6 +747,80 @@ fn civil_swar(p: *const u8) -> Option<i64> {
     Some(days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + s) as i64)
 }
 
+/// Days in month, index 1..=12 (16 entries so a garbage month indexes safely).
+static DIM: [u8; 16] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0];
+
+#[allow(dead_code)]
+/// Branch-free `ts` parse: F1, F2 and 9..=16-digit F3 are all computed and
+/// one is selected; any other or invalid input falls back to `parse_ts`
+/// (exact). Needs 25 readable bytes from `s` and 16 before its end.
+#[inline(always)]
+pub fn parse_ts_bl(s: &[u8], floor: *const u8, ceil: *const u8) -> Option<i64> {
+    let n = s.len();
+    let p = s.as_ptr();
+    let e = p as usize + n;
+    if (p as usize) + 25 > ceil as usize || e < floor as usize + 16 {
+        return parse_ts(s);
+    }
+    // civil part (F1 / F2)
+    const SA: u64 = 0xFF00_00FF_0000_0000;
+    const SB: u64 = 0x0000_FF00_00FF_0000;
+    const SC: u64 = 0x0000_00FF_0000_0000;
+    let a = ld8(p);
+    let b = ld8(unsafe { p.add(8) });
+    let c = ld8(unsafe { p.add(12) });
+    let t = ld8(unsafe { p.add(17) }); // bytes 17..25: "SS" + zone
+    let sep = ((a & SA) ^ 0x2D00_002D_0000_0000) | ((b & SB) ^ 0x0000_3A00_0054_0000) | ((c & SC) ^ 0x0000_003A_0000_0000);
+    let a2 = (a & !SA) | 0x3000_0030_0000_0000;
+    let b2 = (b & !SB) | 0x0000_3000_0030_0000;
+    let c2 = (c & 0x00FF_FFFF_FFFF_FFFF & !SC) | 0x3000_0030_0000_0000;
+    let dig = digits8(a2) & digits8(b2) & digits8(c2);
+    let pa = pairs(a2);
+    let pa8 = pairs(a2 >> 8 | 0x3000_0000_0000_0000);
+    let pb = pairs(b2);
+    let pb8 = pairs(b2 >> 8 | 0x3000_0000_0000_0000);
+    let pc8 = pairs(c2 >> 8 | 0x3000_0000_0000_0000);
+    let y = (pa & 0xFF) * 100 + ((pa >> 16) & 0xFF);
+    let mo = (pa8 >> 32) & 0xFF;
+    let d = pb & 0xFF;
+    let h = (pb8 >> 16) & 0xFF;
+    let mi = (pb >> 48) & 0xFF;
+    let sec = (pc8 >> 32) & 0xFF;
+    let leap = ((y % 4 == 0) & (y % 100 != 0)) | (y % 400 == 0);
+    let dim = DIM[(mo & 15) as usize] as u64 + ((mo == 2) & leap) as u64;
+    let civ_ok = (sep == 0) & dig & (mo.wrapping_sub(1) < 12) & (d >= 1) & (d <= dim) & (h <= 23) & (mi <= 59) & (sec <= 59);
+    let civ = days_from_civil_u(y, mo, d) * 86400 + (h * 3600 + mi * 60 + sec) as i64;
+    // zone: byte 19 (index 2 of t) is 'Z' for F1; "+HH:MM" for F2
+    let z = (t >> 16) as u8;
+    let o1 = ((t >> 24) as u8).wrapping_sub(b'0') as u64;
+    let o2 = ((t >> 32) as u8).wrapping_sub(b'0') as u64;
+    let colon = (t >> 40) as u8 == b':';
+    let o3 = ((t >> 48) as u8).wrapping_sub(b'0') as u64;
+    let o4 = ((t >> 56) as u8).wrapping_sub(b'0') as u64;
+    let oh = o1 * 10 + o2;
+    let om = o3 * 10 + o4;
+    let off_ok = (z == b'+' || z == b'-') & colon & (o1 < 10) & (o2 < 10) & (o3 < 10) & (o4 < 10) & (oh <= 23) & (om <= 59);
+    let off = ((oh * 60 + om) * 60) as i64;
+    let off = if z == b'+' { -off } else { off };
+    let is1 = (n == 20) & (z == b'Z') & civ_ok;
+    let is2 = (n == 25) & off_ok & civ_ok;
+    // F3, 9..=16 digits
+    let lo = ld8((e - 16) as *const u8);
+    let hi = ld8((e - 8) as *const u8);
+    let keep = 16usize.wrapping_sub(n).min(8);
+    let lo = (lo & (!0u64).wrapping_shl(8 * keep as u32)) | (0x3030_3030_3030_3030 & !(!0u64).wrapping_shl(8 * keep as u32));
+    let is3 = (n >= 9) & (n <= 16) & digits8(lo) & digits8(hi);
+    let f3 = (val8(lo) * 100_000_000 + val8(hi)) as i64;
+    let v1 = (civ + if is2 { off } else { 0 }) * 1000;
+    if is1 | is2 {
+        Some(v1)
+    } else if is3 {
+        Some(f3)
+    } else {
+        parse_ts(s)
+    }
+}
+
 /// `ingest_ts` is always valid F1 (rules): seconds since the epoch of a
 /// 20-byte "YYYY-MM-DDTHH:MM:SSZ" without validation; anything of another
 /// shape goes through the checked parser.
@@ -792,6 +866,18 @@ pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8) -> Option<i64>
         }
         return parse_ts(s);
     }
+    if n == 25 && (p as usize) + 25 <= ceil as usize {
+        let sign = s[19];
+        let oh = d2(s, 20);
+        let om = d2(s, 23);
+        if (sign == b'+' || sign == b'-') && s[22] == b':' && oh <= 23 && om <= 59 {
+            if let Some(base) = civil_swar(p) {
+                let off = (oh * 60 + om) as i64 * 60;
+                return Some(if sign == b'+' { base - off } else { base + off } * 1000);
+            }
+        }
+        return parse_ts(s);
+    }
     let e = p as usize + n;
     if n >= 9 && n <= 16 && e >= floor as usize + 16 {
         let lo = ld8((e - 16) as *const u8);
@@ -810,6 +896,48 @@ pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8) -> Option<i64>
 mod swar_tests {
     use super::*;
     #[test]
+    fn ts_fuzz() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let tmpl: [&[u8]; 6] = [
+            b"2027-12-13T10:11:44Z", b"2027-02-28T23:59:59+05:30", b"1828126192000", b"0001828126192000",
+            b"2028-02-29T00:00:00-10:00", b"2000-12-31T00:00:00Z",
+        ];
+        let alpha = b"0123456789-+:TZtz .e";
+        for _ in 0..300_000 {
+            let t = tmpl[(rnd() % 6) as usize];
+            let mut v = t.to_vec();
+            let muts = rnd() % 3;
+            for _ in 0..muts {
+                let i = (rnd() as usize) % v.len();
+                match rnd() % 4 {
+                    0 => v[i] = alpha[(rnd() as usize) % alpha.len()],
+                    1 => v[i] = b'0' + (rnd() % 10) as u8,
+                    2 => {
+                        v.remove(i);
+                    }
+                    _ => v.insert(i, b'0' + (rnd() % 10) as u8),
+                }
+                if v.is_empty() {
+                    break;
+                }
+            }
+            let mut buf = vec![b'7'; 32];
+            buf.extend_from_slice(&v);
+            buf.extend_from_slice(&[b','; 32]);
+            let sl = &buf[32..32 + v.len()];
+            let (fl, ce) = (buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
+            let want = parse_ts(&v);
+            assert_eq!(parse_ts_bl(sl, fl, ce), want, "bl {:?}", String::from_utf8_lossy(&v));
+            assert_eq!(parse_ts_fast(sl, fl, ce), want, "fast {:?}", String::from_utf8_lossy(&v));
+        }
+    }
+    #[test]
     fn ts_fast_matches() {
         let mut cases: Vec<String> = vec![
             "2026-10-03T23:58:10Z", "2026-10-03T19:58:10-04:00", "1791071890000", "0001791071890000",
@@ -822,6 +950,11 @@ mod swar_tests {
             "2000-02-29T00:00:00Z", "2026-10-03T23:58:1\rZ", "00000000086400000", "999999999",
         ].into_iter().map(String::from).collect();
         // all F1 seconds of a few days plus random digit strings
+        for c in ["2026-10-03T19:58:10+00:00", "2026-10-03T19:58:10-00:00", "2026-10-03T19:58:10+23:59", "2026-10-03T19:58:10+24:00",
+                  "2026-10-03T19:58:10+05:60", "2026-10-03T19:58:10+0500", "2026-10-03T19:58:10 05:00", "2026-02-29T19:58:10+05:00",
+                  "2028-02-29T00:00:00-10:00", "2026-10-03T19:58:10*05:00", "2026-10-03T19:58:10+0a:00", "2026-10-03T19:58:10+05:0a"] {
+            cases.push(c.to_string());
+        }
         for d in 0..40 {
             cases.push(format!("2027-12-{:02}T{:02}:{:02}:{:02}Z", 1 + d % 31, d % 24, (d * 7) % 60, (d * 13) % 60));
         }
@@ -832,6 +965,8 @@ mod swar_tests {
             let s = &buf[32..32 + c.len()];
             let r = parse_ts_fast(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
             assert_eq!(r, parse_ts(c.as_bytes()), "{c:?}");
+            let r = parse_ts_bl(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
+            assert_eq!(r, parse_ts(c.as_bytes()), "bl {c:?}");
             if let Some(v) = parse_ts(c.as_bytes()) {
                 if c.len() == 20 && c.ends_with('Z') {
                     assert_eq!(parse_ingest_s(s, unsafe { buf.as_ptr().add(buf.len()) }), Some(v.div_euclid(1000)), "{c:?}");

@@ -66,6 +66,36 @@ pub fn pack(s: &[u8]) -> Key {
     pack_long(s)
 }
 
+/// Same as `pack`; `ceil` = one past the last readable byte after `s`.
+/// Codes of up to 10 bytes are looked up independently and combined in
+/// parallel instead of a serial shift chain.
+#[inline(always)]
+pub fn pack_fast(s: &[u8], ceil: *const u8) -> Key {
+    let n = s.len();
+    let p = s.as_ptr();
+    if n <= 10 && (p as usize) + 16 <= ceil as usize {
+        let lo = u64::from_le(unsafe { (p as *const u64).read_unaligned() });
+        let hi = u64::from_le(unsafe { (p.add(8) as *const u64).read_unaligned() });
+        let mut v: u64 = 0;
+        let mut bad: u8 = 0;
+        let mut i = 0;
+        while i < 10 {
+            let b = if i < 8 { (lo >> (8 * i)) as u8 } else { (hi >> (8 * (i - 8))) as u8 };
+            let c = unsafe { *CODE.get_unchecked(b as usize) };
+            let m = if i < n { 0xFFu8 } else { 0 };
+            let c = c & m;
+            bad |= c;
+            v |= ((c & 63) as u64) << (58 - 6 * i);
+            i += 1;
+        }
+        if bad & 0x80 == 0 {
+            return v | n as u64;
+        }
+        return pack_long(s);
+    }
+    pack(s)
+}
+
 #[inline(always)]
 pub fn is_long(k: Key) -> bool {
     (k & 15) == 15
@@ -247,6 +277,9 @@ mod tests {
         for &x in &words {
             for &y in &words {
                 let (a, b) = (pack(x), pack(y));
+                let mut buf = x.to_vec();
+                buf.extend_from_slice(&[b'\xff'; 16]);
+                assert_eq!(pack_fast(&buf[..x.len()], unsafe { buf.as_ptr().add(buf.len()) }), a);
                 assert_eq!(key_cmp(a, b), x.cmp(y), "{:?} {:?}", x, y);
                 assert_eq!(a == b, x == y);
                 let mut o = Vec::new();

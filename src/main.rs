@@ -534,7 +534,7 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, arena: &Arena) {
     run("ingest", lines, &mut |f| acc = acc.wrapping_add(parse_ts(f[3]).unwrap_or(0) as u64));
     let (fl, ce) = (ev_m.maps[0].as_ptr(), unsafe { ev_m.maps[0].as_ptr().add(ev_m.maps[0].len()) });
     run("ts fast", lines, &mut |f| acc = acc.wrapping_add(parse_ts_fast(f[2], fl, ce).unwrap_or(0) as u64));
-    run("ing fast", lines, &mut |f| acc = acc.wrapping_add(parse_ts_fast(f[3], fl, ce).unwrap_or(0) as u64));
+    run("ts bl", lines, &mut |f| acc = acc.wrapping_add(parse_ts_bl(f[2], fl, ce).unwrap_or(0) as u64));
     run("type", lines, &mut |f| acc = acc.wrapping_add(match f[4] { b"view" => 1, b"cart" => 2, b"purchase" => 3, _ => 0 }));
     run("price", lines, &mut |f| acc = acc.wrapping_add(parse_price(f[6]).unwrap_or(0) as u64));
     let floor = ev_m.maps[0].as_ptr();
@@ -578,7 +578,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
         if f[0].is_empty() {
             return;
         }
-        let eid = pack(f[0]);
+        let eid = pack_fast(f[0], ceil);
         let ingest = match parse_ingest_s(f[3], ceil) {
             Some(v) => (v - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
@@ -601,7 +601,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
                 _ => break 'v,
             };
             r.ts = (ts - ws) as u32;
-            r.person = pack(f[1]);
+            r.person = pack_fast(f[1], ceil);
             r.pc = (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown);
         }
         unsafe { eb.get_unchecked_mut((hk(eid) >> P1_SHIFT) as usize) }.push(r, bs);
@@ -623,8 +623,8 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
             return;
         }
         let Some(camp) = ctx.campaigns.get(f[2], floor) else { return };
-        let u = pack(f[1]);
-        let r = CRec { person: u, cid: pack(f[0]), ts, camp };
+        let u = pack_fast(f[1], ceil);
+        let r = CRec { person: u, cid: pack_fast(f[0], ceil), ts, camp };
         unsafe { cb.get_unchecked_mut((hk(u) >> P2_SHIFT) as usize) }.push(r, bs);
     });
 }
