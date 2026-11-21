@@ -179,6 +179,41 @@ Sources opened: `src/main.rs` of cherylaurelia at `2e4261f`, `src/scan.rs` of ex
 - Two-stage link prefetch (filter word first): explorer-skp `c2a3163`, back to one stage in `f5d71b4`.
 - No transparent huge pages: AbhirajTiwari12 `e9056a1`, back to requesting them in `6aaf72c`.
 
+---
+
+## Iteration 3 (2026-11-21): primary sources on input I/O, exit and the sandbox
+
+Sources were opened by a research agent and are linked per claim. Items it could not open are listed at the end of the section.
+
+### 3.1 `background_readahead` asks for 32 MiB per call but the kernel clamps each call
+
+- **Finding.** `posix_fadvise(WILLNEED)` and `readahead(2)` both end in `force_page_cache_ra`, which clamps one call to `max(bdi->io_pages, ra->ra_pages)` pages, submits in 2 MB pieces and does not wait ([mm/readahead.c, v6.6](https://raw.githubusercontent.com/torvalds/linux/v6.6/mm/readahead.c)). `background_readahead` (`parse.rs:338-346`) requests 32 MiB and then advances 32 MiB, so everything past the clamp in each step is never requested. With a clamp in the usual 128 KiB to 1.3 MiB range (the value on the scorer's disk is unknown), the helper pre-reads only a few percent of each file.
+- **Fix.** Step by at most the clamp; 512 KiB is safe. This is why cherylaurelia's 2 threads of 512 KiB `readahead` calls worked (entry 1.9). Google's persistent-disk guide recommends I/O sizes of 256 KB or more and, for standard PD, 8 or more parallel sequential streams ([optimizing PD performance](https://docs.cloud.google.com/compute/docs/disks/optimizing-pd-performance)).
+- **Expected gain.** Zero with a warm cache; possibly large on a cold first run, where today the parse threads fault the data in themselves.
+- **Risk.** None to exactness. `readahead` can block on metadata for files without extents ([man page](https://man7.org/linux/man-pages/man2/readahead.2.html)), which is why it belongs on helper threads.
+
+### 3.2 Mapped file pages are 4 KiB on likely scorer kernels, and exit teardown is on the clock
+
+- Transparent huge pages cover only anonymous memory and tmpfs/shmem ([kernel THP doc](https://docs.kernel.org/admin-guide/mm/transhuge.html)); `filemap_map_pmd` maps a PMD only for a PMD-sized folio ([mm/filemap.c, v6.6](https://raw.githubusercontent.com/torvalds/linux/v6.6/mm/filemap.c)). So the mapped CSVs use 4 KiB PTEs, and in a VM a TLB miss costs up to 24 memory references against 4 native ([Gandhi et al., MICRO 2014](https://scail.cs.wisc.edu/papers/micro14-virtualization.pdf)). That supports the direction of Vibhor7-7's measurement (entry 1.5), not its size: a sequential scan misses the TLB far less than the paper's workloads.
+- `MADV_POPULATE_READ` removes the faults but not the PTE setup or the 4 KiB translations ([madvise(2)](https://man7.org/linux/man-pages/man2/madvise.2.html)). Fault-around was measured at about 0.45 µs per avoided fault, 110 ms/GiB, in 2014 ([LWN](https://lwn.net/Articles/588802/)).
+- `do_exit` runs `exit_mm()` before `exit_notify()`, so whoever waits on the container sees the exit only after the address space is torn down ([kernel/exit.c](https://raw.githubusercontent.com/torvalds/linux/v6.6/kernel/exit.c)). When PID 1 of a PID namespace exits, the kernel kills and reaps everything in it first ([kernel/pid_namespace.c](https://raw.githubusercontent.com/torvalds/linux/v6.6/kernel/pid_namespace.c)), so handing teardown to a child cannot hide it. This confirms the "fork-and-exit" entry on the `speedups.md` skip list.
+- Unmapping a fully mapped 13.8 GB file took 138 to 199 ms and did not improve with threads ([1BRC discussion #138](https://github.com/gunnarmorling/1brc/discussions/138)). Scaled, that is 20 to 27 ms at 20M and 55 to 80 ms at 60M, single-threaded, after the output is written. The audit measured 17 to 24 ms at 20M, which agrees.
+- **Consequence for 1.5.** A `pread` path has no file mapping, so it saves this teardown (about 3 to 5% of a 0.6 s run) in addition to any translation gain. That is an argument for the L2-block variant that the mmap-versus-read tally in 2.3 does not capture, since those teams compared in-process time.
+
+### 3.3 If the sandbox is gVisor, mmap is the wrong choice
+
+- The runtime is unknown. Under gVisor a fault on a file mapping makes the sentry allocate memory, copy the file contents into it and issue a host `mmap`, after which the application faults again ([gVisor mm README](https://raw.githubusercontent.com/google/gvisor/master/pkg/sentry/mm/README.md)): a copy plus two faults, where `pread` pays one copy.
+- gVisor syscalls that reach the file gofer cost about 45 µs against 0.3 µs under runc, and read throughput is poor at 4 to 16 KB blocks and competitive from 64 KB to 1 MB ([Young et al., HotCloud 2019](https://files.usenix.org/s3fs-public/cdn/hotcloud19-paper-young.pdf)).
+- **Here.** `pread` in 256 KB blocks is the one input strategy that is reasonable under both runtimes: about 8,000 calls at 20M. The 1,010 `madvise` calls per run are cheap under runc and of unknown cost under gVisor.
+- **Risk.** None to exactness beyond what 1.5 lists. Whether the scorer uses gVisor is not established by any source; Vibhor7-7's notes call the scorer's sandboxes `runc`, without evidence.
+
+### 3.4 Huge pages for the arena
+
+- GKE documents `madvise` as the default THP mode ([LinuxNodeConfig reference](https://docs.cloud.google.com/python/docs/reference/container/latest/google.cloud.container_v1.types.LinuxNodeConfig.TransparentHugepageEnabled)); upstream defaults to `always`. `Arena::new` (`mem.rs:32`) already calls `MADV_HUGEPAGE`, so both cases are covered. The vectors outside the arena (`Scratch`, `Acc.users`, the Parquet buffers, `KMap` slots) come from mimalloc and get huge pages only under `always`.
+- No action unless the output buffers move into the arena, which the queued "reserve or stream Parquet buffers" item would make unnecessary.
+
+Not opened or not verified: the readahead clamp on GCP persistent disk; the THP setting on the scorer image; gVisor's support for `MADV_POPULATE_READ`; any measurement of read against mmap on an n2 VM; huge-page zeroing cost (only a search snippet, so no number is recorded here).
+
 ## Next iteration
 
 - Re-read `OVERNIGHT_LOG.md` if it exists and drop anything it marks tried.
