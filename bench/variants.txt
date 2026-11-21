@@ -1,3 +1,7 @@
 # label|ref|build-args|env
-main|origin/gate-main-eaa2a89||
-v2|origin/gate-v2-e53bb9b||
+prev|ext:nimaibhat/databricks-chall@0e964c1||
+head|origin/gate-head-2277ed1||
+head_t1|origin/gate-head_t1-2277ed1||NCPU=1
+head_t2|origin/gate-head_t2-2277ed1||NCPU=2
+head_t8|origin/gate-head_t8-2277ed1||NCPU=8
+head_ab|origin/gate-head_ab-2277ed1||DENSE_ABANDON=1
