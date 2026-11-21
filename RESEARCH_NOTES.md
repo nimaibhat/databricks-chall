@@ -16,7 +16,7 @@ Re-ranked in iteration 3 after the first entry in `OVERNIGHT_LOG.md`. Every item
 | 4 | Start writeback of each output file when it is complete (`sync_file_range`, no wait) | `pqw.rs:1087`, `:1111` | 0 on a fast disk; old experiment 39 measured post-exit 0.13 to 0.04 s at 20M (old code, another runner) | Quoted: old log experiment 39, old notes 29.4 | None | 1.5 |
 | 5 | Only if `XL_CH=32768` in row 1 shows a gain: release parsed input with one batched call per thread instead of one `madvise` per chunk | `parse.rs:2158-2163` | Bounded by row 1's result; **my estimate** under 1% | Quoted: SeongJae Park's series "mm/madvise: batch tlb flushes for MADV_DONTNEED and MADV_FREE" reports 6.9% to 40% less time for batched `process_madvise` ranges. I could not confirm which kernel release it landed in | None | 2.1 |
 
-**Measure the ceiling first:** 8.1 describes a touch-only run (`--features knobs`, `XL_SKIP=512`) whose `parse` lap is the entire cost of mapping and releasing the input. If that is small, rows 1 and 5 are closed in one run.
+**Measure the ceilings first:** 8.3 lists four runs of one `--features knobs` measurement build (`XL_SKIP=512`, `XL_NOSINK=1`, `XL_SKIP=2048`, plain) whose `parse` laps split the 146 ms into mapping, line decode, batch stage and record store. Each of rows 1, 2, 3 and 5 is bounded by one of those differences, so this one build can close or confirm most of the table before any code is written.
 
 **Cheapest next experiment (no rebuild):** `XL_CH`, `XL_RD` and `XL_REL` are read from the environment in the shipped binary (`parse.rs:1791`, `main.rs:355`; they are not behind the `knobs` feature), so two of row 1's three variants are one environment variable each on the binary the log already times: `XL_CH=32768`, `XL_CH=2048`, `XL_REL=0`, `XL_RD=128`. If a value wins, the change to ship is the default constant (`CH_DEFAULT`, `parse.rs:1800`), one line. `MADV_POPULATE_READ` is not in the code anywhere (checked: the only `madvise` advice values used are 4, 14, 15 and 23), so that variant is the one that needs a build.
 
@@ -289,7 +289,24 @@ Read: `parse.rs:2118-2190` (the per-chunk loop of `stage1`).
 `stage1` has a mode that replaces parsing with one byte read per 4 KiB page of the chunk and still does the per-chunk release (`parse.rs:2146-2153`, `SKIP & 512`). It is compiled only with `--features knobs` (`parse.rs:18-25`, `main.rs:358-361`).
 - Build once with `--features knobs` (a measurement build, never shipped), run with `XL_SKIP=512 XL_TIMING=1`, and read **only the `parse` lap**. Nothing is parsed, so later stages and the output are meaningless; the run may well end in the fallback. Ignore everything after the `parse` figure.
 - That lap is the whole cost of faulting in and releasing the input on 8 threads: the page faults, the PTE work and the shootdowns, with no parsing. **It is the ceiling for everything row 1 and row 5 can gain.** If it reads 3 ms, close both rows without further work. If it reads 10 ms or more (7% of parse, my estimate in 1.4), run it again with `XL_CH=32768` and with `XL_REL=0` to split faults from releases.
-- The same build with `XL_SKIP=512 XL_RD=128` gives the cost of the `pread` path's copy for comparison.
+- Correction: this mode cannot be combined with `XL_RD`; `parse.rs:2094` forces the mapped path when the bit is set.
+
+### 8.3 The same build gives a four-step ladder that splits parse into its parts
+
+All in the `--features knobs` build, all measurement only (outputs are wrong or empty by design; read the `parse` lap and nothing else):
+
+| Run | Switch | What still runs in parse | Read off |
+|---|---|---|---|
+| A | `XL_SKIP=512` (`parse.rs:2147`) | Page touch and release only | Mapping cost |
+| B | `XL_NOSINK=1` (`parse.rs:510`) and `XL_SKIP=64` for clicks (`:589`) | A + the line kernels (`ev_s`/`ev_d`, `cl_s`/`cl_d`) filling batches | B - A = the scanner and field decode |
+| C | `XL_SKIP=2048` (`parse.rs:528`) | B + `ev_vec` (unscramble, validity, record build) | C - B = the batch stage |
+| D | none | Everything | D - C = `push_many`: the non-temporal stores and the arena's page clearing |
+
+What each difference decides:
+- **A** bounds rows 1 and 5.
+- **D - C** bounds row 2 (arena pre-fault can only remove the page-clearing part of it). If D - C is under 5 ms, row 2 is worth at most a fraction of that; close it.
+- **B - A and C - B** are the only parts the licence question (row 3) can speed up, and by at most the clock ratio the probe reports.
+- I have no estimate I trust for the split, which is the point of asking. One build, four runs each interleaved a few times.
 
 ### 8.2 Patch text for the populate-read variant of row 1 (for the coding agent to apply; I have not compiled it)
 
