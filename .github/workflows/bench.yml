@@ -43,3 +43,11 @@ jobs:
         run: bash bench/perf.sh
       - name: extra
         run: bash bench/extra.sh
+      - name: pgo
+        run: bash bench/pgo.sh
+      - name: pgo artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo
+          path: /tmp/pgo/pgo.profdata
+          if-no-files-found: ignore
