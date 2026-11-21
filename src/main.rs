@@ -601,13 +601,13 @@ fn main() {
 
     // ---- phase 3: dedup per eid partition, survivors partitioned by person
     let sbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
-    let dscr = PerThread::new(threads, || (KMap::<u64>::with_capacity(16), Vec::<u64>::new()));
+    let dscr = PerThread::new(threads, || (KMap::<u64>::with_capacity(16), Vec::<u64>::new(), Vec::<u64>::new(), Vec::new()));
     par_for(1usize << p1_bits(), threads, |t, p| {
         let lists = unsafe { eparts.get(p) };
-        let (mp, dead) = unsafe { dscr.get(t) };
+        let (mp, dead, filt, susp) = unsafe { dscr.get(t) };
         let bs = unsafe { blocks.get(t) };
         let sb = unsafe { sbl.get(t) };
-        dedup_partition(&ctx, lists, mp, dead, sb, bs);
+        dedup_partition(&ctx, lists, mp, dead, filt, susp, sb, bs);
     });
     let sparts = transpose(sbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
@@ -1046,6 +1046,8 @@ fn dedup_partition(
     lists: &mut [BList<ERec>],
     mp: &mut KMap<u64>,
     dead: &mut Vec<u64>,
+    filt: &mut Vec<u64>,
+    susp: &mut Vec<(Key, i32, u32)>,
     sb: &mut [BList<SRec>],
     bs: &mut Blocks,
 ) {
@@ -1053,29 +1055,56 @@ fn dedup_partition(
     if n == 0 {
         return;
     }
-    mp.reset(n);
     dead.clear();
     dead.resize(n / 64 + 1, 0);
-    // pass 1: value = (ingest as u32) << 32 | index
+    // pass 1a: a 16-bits-per-copy bitmap finds the ids that may repeat; every
+    // other copy is the only one of its event
+    let nb = (n * 16).next_power_of_two().max(64);
+    let words = nb / 64;
+    let m = nb - 1;
+    filt.clear();
+    filt.resize(2 * words, 0);
+    let (seen, dup) = filt.split_at_mut(words);
+    for l in lists.iter() {
+        l.for_each_slice(|sl| {
+            for r in sl {
+                let b = hk(r.eid) as usize & m;
+                let bit = 1u64 << (b & 63);
+                let w = unsafe { seen.get_unchecked_mut(b >> 6) };
+                let d = unsafe { dup.get_unchecked_mut(b >> 6) };
+                *d |= *w & bit;
+                *w |= bit;
+            }
+        });
+    }
+    susp.clear();
     let mut i = 0u32;
     for l in lists.iter() {
         l.for_each_slice(|sl| {
             for r in sl {
-                let v = ((r.ingest as u32 as u64) << 32) | i as u64;
-                let (s, ins) = mp.entry(r.eid, v);
-                if !ins {
-                    let cur = *mp.val_mut(s);
-                    if r.ingest < (cur >> 32) as u32 as i32 {
-                        let ci = cur as u32;
-                        dead[(ci / 64) as usize] |= 1 << (ci % 64);
-                        *mp.val_mut(s) = v;
-                    } else {
-                        dead[(i / 64) as usize] |= 1 << (i % 64);
-                    }
+                let b = hk(r.eid) as usize & m;
+                if unsafe { *dup.get_unchecked(b >> 6) } >> (b & 63) & 1 != 0 {
+                    susp.push((r.eid, r.ingest, i));
                 }
                 i += 1;
             }
         });
+    }
+    // pass 1b, suspects only: value = (ingest as u32) << 32 | index
+    mp.reset(susp.len());
+    for &(eid, ingest, i) in susp.iter() {
+        let v = ((ingest as u32 as u64) << 32) | i as u64;
+        let (s, ins) = mp.entry(eid, v);
+        if !ins {
+            let cur = *mp.val_mut(s);
+            if ingest < (cur >> 32) as u32 as i32 {
+                let ci = cur as u32;
+                dead[(ci / 64) as usize] |= 1 << (ci % 64);
+                *mp.val_mut(s) = v;
+            } else {
+                dead[(i / 64) as usize] |= 1 << (i % 64);
+            }
+        }
     }
     // pass 2: survivors, sequentially, with user -> person resolved through a
     // small ring so the links lookup is prefetched PD records ahead
