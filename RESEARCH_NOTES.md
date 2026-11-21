@@ -6,23 +6,21 @@ The notes for the old codebase are at `git show 3a5f601:RESEARCH_NOTES.md`. What
 
 ## Top five untried (ranked by expected gain per unit of risk to exact output)
 
-Re-ranked in iteration 3 after the first entry in `OVERNIGHT_LOG.md`. Every item here leaves the output bytes unchanged.
+Re-ranked in iteration 9 from the measurements in `OVERNIGHT_LOG.md` (experiments 1 to 4 and "Facts for the research session"). All numbers marked "log" are quoted from that file; the baseline is the tmpfs one: wall 209.2 / 210.1 ms, parse 157.8, ev3a 35.4, write 9.5, noise about ±1 ms.
 
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
-| 1 | Input mapping A/B on a tmpfs `/data`, three variants: `XL_CH=32768`, `XL_REL=0`, and `MADV_POPULATE_READ` on each chunk before it is parsed | `parse.rs:1800` (`CH_DEFAULT`), `:2140-2164` (`stage1`) | **My estimate** 1 to 3% of parse (2 to 5 ms) if either mechanism in 2.1 is real; could be 0 | Read from the code: the parser's only prefetch is 1 KiB ahead (`k_free.rs:1738`) and cannot reach a page that is not mapped yet; each per-chunk `MADV_DONTNEED` is a TLB shootdown to the other 7 CPUs, about 400 times per run. Costs are my estimates, not measured | None: read-only input mapping, two of the three are existing knobs | 1.4, 2.1 |
-| 2 | Fault the arena's first blocks on the workers that sit idle during setup | `setup.rs:826-833`, `:968-969`, `parse.rs:180` `new_chunk` | **My estimate** 1 to 2 ms (0.5 to 1%); needs the `tl` idle figure for job 0 to size it | Quoted: old experiments 47/48, arena pre-fault on idle threads -1.4 to -4.3% on Intel (old code) | None | 1.3 |
-| 3 | Find out which AVX frequency licence the cores hold during parse (one probe); if L1, move the 256-bit multiplies in the event path to the 128-bit forms the click path already uses | probe: `parse.rs:2181`; multiplies: `parse.rs:259-315`, `:642`; `k_free.rs:875` `ids2j`, `:1349` `ev_d` | Probe: none. If L1 is held: **my estimate** net 0 to 6% of parse; lower if parse turns out memory-bound (2.2) | Quoted: Lemire 2018 (256-bit integer multiplies are "heavy", L1); Downs 2020 (L0 3.2 GHz, L1 2.8 GHz on a W-2104). Not measured here | Probe: none. Rewrite: low, existing differential tests pin the results | 1.2, 2.3 |
-| 4 | Start writeback of each output file when it is complete (`sync_file_range`, no wait) | `pqw.rs:1087`, `:1111` | 0 on a fast disk; old experiment 39 measured post-exit 0.13 to 0.04 s at 20M (old code, another runner) | Quoted: old log experiment 39, old notes 29.4 | None | 1.5 |
-| 5 | Only if `XL_CH=32768` in row 1 shows a gain: release parsed input with one batched call per thread instead of one `madvise` per chunk | `parse.rs:2158-2163` | Bounded by row 1's result; **my estimate** under 1% | Quoted: SeongJae Park's series "mm/madvise: batch tlb flushes for MADV_DONTNEED and MADV_FREE" reports 6.9% to 40% less time for batched `process_madvise` ranges. I could not confirm which kernel release it landed in | None | 2.1 |
+| 1 | Stop releasing input pages chunk by chunk during parse; release the whole input once, in parallel on all threads, after the output is written. **No rebuild:** `XL_REL=0 XL_RGREL=0 XL_ENDREL=2` | `parse.rs:2158-2163`, `out.rs:541-546`, `main.rs:449-482` | **My estimate** 2 to 5 ms (1 to 2.4%): parse -7.7 ms, plus 3 to 6 ms for the parallel release at the end | Log, experiment 3: `XL_REL=0` alone gave parse 150.7 (-7.7) but write +22 because one thread then unmaps everything during the write stage. The three-variable combination was not in experiments 2 or 3 | None: the release happens after the last output file is closed | 9.1 |
+| 2 | Bucket of 2^14 events instead of 2^15, so two hyperthreads' dedup tables fit one core's L2 together. Build-time: `XL_BB=14` | `main.rs:64` (`BB`), `events.rs:234` (`scatter_chunk`) | **My estimate** 0 to 3 ms of ev3a's 35; can also cost up to 1 ms in parse (twice the buckets to scatter into) | Log: `scatter=98.1` thread-ms, a third of ev3a. The table is 512 KiB per thread (`BSIZE * 16`); Cascade Lake has 1 MiB of L2 per core, shared by two threads that each also hold their working arrays | Low: `BB` is an existing build parameter and the output must be byte-identical; the full gate decides. Not a code path the authors shipped, so run the gate at 1, 2 and 8 threads | 9.2 |
+| 3 | Prefetch distance of the line scanner: 1 KiB now; try 2 KiB and 4 KiB, and 512 B | `k_free.rs:1683` (`PFD`), used at `:1738`, `:1784`, `:2021`, `:2243` | **My estimate** 0 to 3 ms of parse; unknown sign | Log: 4 threads take 369 ms against 198 for 8 on the same cores, so a parse thread alone leaves its core idle about half the time. On tmpfs the input is in 4 KiB pages and the hardware prefetcher stops at every page end; 1 KiB ahead is about 11 lines, about 0.5 µs | None: prefetch only | 9.3 |
+| 4 | Shorten setup's serial 3 ms and fill its 9.7 idle thread-ms with page clearing that parse would otherwise do | `setup.rs:835-932` (thread 0), `:826-833` (workers spinning), `parse.rs:180` | **My estimate** 1 to 2 ms together | Log: `s.list=1.0 s.mmap=1.1 s.sample=0.7`; `job0: wall 2.46 busy 10.0 idle 9.68`; kernel page zeroing is 11.1% of all samples (about 170 thread-ms), 6.2% of it under `MADV_POPULATE_WRITE` | None | 1.3, 9.4 |
+| 5 | Start writeback of each output file when it is complete (`sync_file_range`, no wait); and `XL_ENDREL=1` for the exit | `pqw.rs:1087`, `:1111`; `main.rs:449` | 0 to 2 ms on the VM (log: the parent sees the process gone 1.5 to 2 ms after `exit at`); unknown in the scorer's container | Log: output is 18 MB; old experiment 39 saw about 1 ms per MB after exit on a slow-disk runner (old code) | None | 1.5, 9.5 |
 
-**Measure the ceilings first:** 8.3 lists four runs of one `--features knobs` measurement build (`XL_SKIP=512`, `XL_NOSINK=1`, `XL_SKIP=2048`, plain) whose `parse` laps split the 146 ms into mapping, line decode, batch stage and record store. Each of rows 1, 2, 3 and 5 is bounded by one of those differences, so this one build can close or confirm most of the table before any code is written.
+**Closed by measurement (do not re-propose):** PGO (experiment 1). Every run-time knob flipped singly, including `XL_PREFAULT`, `XL_SPIN`, `XL_PINSTART`, `XL_POPW`, `XL_QORD`, `XL_RD` (experiment 2). Chunk size 2 to 64 MiB: under 1 ms (experiment 3). `MADV_POPULATE_READ` per chunk: no gain, also with other chunk sizes (experiment 4). My iteration 2 prefetch-across-unmapped-pages mechanism (2.1a) is therefore wrong or too small to see; 2.1(b) was right in direction (see row 1).
 
-**Cheapest next experiment (no rebuild):** `XL_CH`, `XL_RD` and `XL_REL` are read from the environment in the shipped binary (`parse.rs:1791`, `main.rs:355`; they are not behind the `knobs` feature), so two of row 1's three variants are one environment variable each on the binary the log already times: `XL_CH=32768`, `XL_CH=2048`, `XL_REL=0`, `XL_RD=128`. If a value wins, the change to ship is the default constant (`CH_DEFAULT`, `parse.rs:1800`), one line. `MADV_POPULATE_READ` is not in the code anywhere (checked: the only `madvise` advice values used are 4, 14, 15 and 23), so that variant is the one that needs a build.
+**Demoted:** the frequency-licence probe (1.2, 3.3). The log's hyperthread result says parse threads wait far more than they compute, so a faster clock buys little. Keep it only as a diagnostic if rows 1 to 3 come back empty.
 
-**Closed by measurement:** PGO (log experiment 1: 197.5 / 198.5 against 197.8 / 198.6 ms, parse 146.1 against 146.3). Consistent with 1.1's caution that the hot paths are already laid out by hand. Do not re-propose.
-
-Not in the table because they are not code changes: the board-noise note (1.6) and the bench-fidelity checklist (1.7). Read both before trusting any A/B.
+**Still wanted from the log:** nothing blocking. The four-run ladder of 8.3 would size rows 3 and 4 before any work on them.
 
 ## Requests to the coding agent (so the next ranking rests on data, not estimates)
 
@@ -342,9 +340,59 @@ fn popr() -> bool {
 - A build with the environment variable `XL_XPROF=1` set **at compile time** (`option_env!`, `events.rs:652`) prints a per-phase table for stage 3a with instructions, cycles, cache misses and branch misses per kept event (`events.rs:763-800`), and `XL_XRU=1` the user/system time and faults of the stage. Measurement builds only.
 - With these and 8.3 every stage has a measured split, and I can stop ranking on estimates. Until they are in the log I will not add speculative items to the table.
 
+## Iteration 9 (2026-11-21): re-rank from the log's measurements
+
+### 9.1 Row 1: the per-chunk release costs 7.7 ms of parse, and the cheaper way to release is already in the binary
+
+- **Measured (log, experiment 3, tmpfs):** with `XL_REL=0` parse drops from 158.4 to 150.7 ms. So the roughly 400 `madvise(MADV_DONTNEED)` calls inside `stage1` cost 7.7 ms of wall, about 61 thread-ms. The same run's write stage grew by 22 ms, because the pages were then all removed by the single `munmap` at `out.rs:541-546`, which also holds the address-space lock against the other writers' page faults while it runs.
+- **Why the per-chunk form is the expensive one (my reading):** removing the same pages took 22 ms on one thread but 61 thread-ms when done chunk by chunk during parse. The difference is what each call does to the other seven threads: an interrupt each, a flushed TLB, and the refills afterwards, about 400 times.
+- **The alternative that is already there:** `main.rs:449-482` runs a parallel release on all threads after the write stage, and with `XL_ENDREL=2` it includes the input region, split evenly by address (`main.rs:469`). `XL_RGREL=0` turns off the `munmap` in the write stage (`main.rs:343`). So `XL_REL=0 XL_RGREL=0 XL_ENDREL=2` is: nothing released during parse or write, then eight `madvise` calls in parallel at the end, one shootdown each, with no other work running to disturb.
+- **Expected (my estimate):** the end release is 22 ms of single-thread work spread over 8 threads on 4 cores: 3 to 6 ms. Net 2 to 5 ms better than the default. It could be less if removing 4 KiB mappings does not scale across threads (they are in separate page-table pages, so I expect it to).
+- **What to watch:** (a) the wall as seen by the parent, not the `exit at` line, since the point is that exit must not inherit the work; (b) `XL_ENDREL=2` also releases the output columns and the click index in parallel, which the default skips when huge pages are in use; that should be neutral or slightly positive for exit; (c) the whole input stays mapped during the run, which adds nothing to this process's memory charge (tmpfs pages belong to whoever wrote them) but does show in RSS.
+- **If it wins,** the shipped change is three defaults: `parse::RELEASE` false (`main.rs:355`), `out::REGION_UNMAP` false, and the `endrel` default treated as `"2"` (`main.rs:449-451`). No new code.
+- **Variant if it only half works:** keep the per-chunk release but on fewer, larger ranges. Experiment 3 already shows the direction: `XL_CH=65536` was 1 ms better than the default, within noise.
+- **Risk:** none to output. The end block runs after `stage45` has written and closed every file.
+
+### 9.2 Row 2: the dedup table against the L2 of a shared core
+
+- `scatter_chunk` (`events.rs:234-262`) writes each record into a table of `BSIZE` 16-byte slots: 512 KiB with `BB = 15`. Each ev3a thread has its own, plus the compacted arrays it builds from it (`q`, `sidx`, `sts`, about another 300 KiB in use per bucket).
+- Log: `scatter=98.1` thread-ms for 20.9M records is 4.7 ns per record, and every record is one read from DRAM (prefetched) plus one random access into that table.
+- On the 8252C two hyperthreads share 1 MiB of L2. Two 512 KiB tables alone fill it, so a good part of the random accesses must go to L3, which on this server design is slow (it is not inclusive and sits behind the mesh). With `BB = 14` the table is 256 KiB per thread and both fit with room for the working arrays.
+- The cost side: twice as many buckets (about 1,540). In parse, each thread's write-combining staging grows from 49 to 98 KiB (`parse.rs:94-159`), still inside L2 but competing with the same L2; and each (thread, bucket) pair holds one partly filled 4 KiB chunk, so about 25 MB more arena is touched and cleared. So parse may lose up to 1 ms while ev3a gains; only the sum matters.
+- `BB` is `option_env!("XL_BB")` at `main.rs:64`, so this is a build with `XL_BB=14` in the environment (in Docker: `ENV XL_BB=14` before `cargo build`). Also try 13 for the trend. `BB > 15` switches to the old stage-3 path (`events.rs:2256`); 13 and 14 stay on the current one.
+- The authors very likely swept this on their own machine. If that machine had 2 MiB of L2 per core (Sapphire Rapids, Zen 4 has 1 MiB but per-thread behaviour differs), their optimum would sit one step larger than this CPU's. That is the whole argument; it is a guess about their bench, not a fact.
+
+### 9.3 Row 3: prefetch distance
+
+- The log's thread-count runs are the strongest fact so far about parse: 8 threads on 4 cores are 1.86 times as fast as 4 threads on 4 cores. A core running one parse thread is idle about half the time. About 21% of thread time is in the kernel (log, `stime`), mostly clearing pages; the rest of the waiting is in user code, and the two places user code can wait on memory are reading input and the non-temporal record stores.
+- Input: `PFD = 1024` bytes ahead, one `prefetcht0` per line. On tmpfs the pages are 4 KiB and physically scattered, so the hardware streamer restarts at every page; the software prefetch has to carry the stream alone. At 47 ns per line, 1 KiB is about half a microsecond of lead, which should be enough for one DRAM access, but there are eight threads asking at once and the line-fill buffers are shared between siblings.
+- Try `PFD` = 512, 2048, 4096 (one constant, four builds or a `knobs`-style `option_env!`). Experiment 4 does not close this: populate-read changed when pages are mapped, not how far ahead data is requested.
+- Also worth one build: a second prefetch per line at `PFD + 64`, since lines average about 90 bytes and one prefetch per line covers only 64 of them. If lines were being missed this way it would show as a gain here and not from distance alone.
+
+### 9.4 Row 4: setup
+
+- Log: thread 0 spends 1.0 ms listing three directories and `stat`-ing each file, 1.1 ms opening and mapping each file, 0.7 ms sampling; the other seven threads are idle for 9.68 thread-ms of that job. Parse starts at 2.5 ms.
+- (a) List the three directories on three threads (`setup.rs:835-841` is a plain loop over `events`, `clicks`, `links`; results are sorted afterwards at `:842`, so the order of arrival does not matter). Saves up to 0.6 ms.
+- (b) Open the files on the workers and leave only the `mmap` calls on thread 0 (they take the address-space lock and gain nothing from threads). Saves up to 0.5 ms.
+- (c) Use what idle time remains to clear arena blocks, as in 1.3. At the log's rate (about 170 thread-ms for about 620 MB cleared, 0.55 ms per 2 MiB block) 9.7 idle thread-ms covers about 18 blocks, about 1.2 ms of parse wall.
+- Each part is under the 2 ms the log asks for; together they may reach it. Rank 4 for that reason.
+
+### 9.5 Row 5 and the exit
+
+- Log: output is 18 MB, written with 9.18 thread-ms inside `write` calls out of 74.9 busy thread-ms in the write stage, so that stage is encoding, not I/O; and the parent sees the process gone 1.5 to 2 ms after the last timing line with 305 MB still resident.
+- `XL_ENDREL=1` (parallel release of the remaining memory before `_exit`, without the input region) was not among the knobs flipped in experiment 2. It is one run. It can gain at most that 1.5 to 2 ms and is subsumed by row 1's `XL_ENDREL=2` if that wins.
+- `sync_file_range` only matters inside a container whose teardown waits on the disk. The direct-binary timing cannot show it. If the coding agent can time `docker run` end to end with `/output` on the VM's disk, that is where to look; otherwise leave it.
+
+### 9.6 What the log changes in earlier entries
+
+- 1.4 and 2.1(a): closed by experiments 3 and 4.
+- 2.2 and 4.1: settled by the 4-against-8-thread runs. Parse is waiting, not computing; 4.1's caution was unnecessary.
+- 3.1's "7.4 ms outside the three stages": the log's lap line accounts for it: setup 3.0 ms, ev3b 2.6, stitch 0.1, exit 1.5 to 2.
+- 3.2: the VM runs kernel 7.0 like the scorer, and the tmpfs baseline is 11.5 ms slower in parse than ext4 (146.3 against 157.8). The whole run takes 9,640 page faults on ext4 against 28,762 in parse alone on tmpfs, so on ext4 the input is being mapped in units much larger than 64 KiB. Tune on tmpfs only; ext4 numbers flatter the mapped path.
+- 7: the knob table is closed by experiment 2, except `XL_ENDREL` and `XL_RGREL`, which were not in it and are now row 1.
+
 ## Next passes (in this order)
 
-1. `events.rs` `stage3a` and `core.rs`: the 35 ms stage, pass by pass.
-2. `links.rs`: what runs serially after parse (`odd_events`, deferred sorts, `uf_tail`).
-3. `pqw.rs` encoders and output size.
-4. Outside material on each: first-touch and huge-page clearing cost in the 7.0 kernel, tmpfs large folios, `MADV_POPULATE_*` behaviour.
+1. `pqw.rs` encoders: the write stage is 65 thread-ms of encoding for 2.25M rows (log).
+2. `links.rs` `bucket_a`/`sort_users`: `st2b_pass2=113.2` and `st2b_sort=53.4` thread-ms inside parse (log).
+3. `events.rs` `walk_runs`: `runs=155.3` thread-ms, the largest part of ev3a (log).
