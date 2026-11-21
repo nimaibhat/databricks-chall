@@ -1,21 +1,10 @@
 [package]
-name = "sessions"
+name = "probe"
 version = "0.1.0"
 edition = "2021"
-
-[[bin]]
-name = "sessions"
-path = "src/main.rs"
+publish = false
 
 [dependencies]
-memchr = "2.7"
-memmap2 = "0.9"
-mimalloc = { version = "0.1", default-features = false }
-libc = "0.2"
-
-[features]
-# diagnostic build: STAGE=n stops the per-line work early (timing only, output is wrong)
-diag = []
 
 [profile.release]
 opt-level = 3
@@ -23,3 +12,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+strip = true
+
+[workspace]
