@@ -1,8 +1,10 @@
 # OVERNIGHT_LOG.md
 
-**SUBMIT THIS: `fe79ca9`** (adds the links-phase trim and the dedup prefilter). x86 runner, full `docker run` wall, median of 7 (20M) and 5 (60M), EPYC 9V74 4 vCPU: 20M 1.736 s, 60M 4.860 s; in the previous run on the same CPU model the earlier picks measured 1.753 / 4.925 s (`0a06317`) and 1.799 / 5.045 s (`62abf9c`). Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); 14 unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets. Vibhor7-7's current build takes 1.372 / 3.741 s in the same run and cherylaurelia's 1.118 / 3.083 s in the run before.
+**SUBMIT THIS: `79cb1f5`** (adds INT32 counts and a dictionary-encoded `user_daily`, which cut the output from 93 to 35 MB at 20M and from 273 to 101 MB at 60M). x86 runner, full `docker run` wall, median of 7, EPYC 7763 4 vCPU, same run: 20M 1.699 s against 1.743 s for the previous pick `fe79ca9`; 60M 4.795 s against 5.178 s (-7.4%). Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); 15 unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets (duckdb), and the files read back identically with polars, pyarrow, duckdb and fastparquet. Same run: Vibhor7-7 1.401 / 3.943 s, cherylaurelia 1.295 / 3.534 s.
 
-**Open finding:** after our process prints its last line, `docker run` takes another 0.40 s at 20M and 1.10 s at 60M to return (an empty container is 0.155 s in total). Pread instead of mmap and releasing the arena do not change it. The run in flight tests output size and output-on-tmpfs as the cause.
+**If you would rather not rely on dictionary-encoded Parquet with an unknown scorer reader, submit `0f7f014` instead** (same pipeline, PLAIN pages, INT32 counts: 1.725 / 5.038 s in that run). Dictionary pages are what pyarrow, Spark, polars and duckdb write by default, so the risk is small, but it is the one change tonight that alters the file format rather than the speed of producing it.
+
+**Why the output size matters:** after the process prints its last line, `docker run` on the runner does not return until the output files have been flushed to disk. That time follows the output size and the runner's disk: at 60M it was 0.42 to 1.10 s with 273 MB, 0.39 s with 223 MB, 0.135 s with 101 MB, 0.117 s with output on tmpfs. Whether the scorer behaves the same is unknown; a smaller output can only help.
 
 How to read the numbers: "x86" is a GitHub Actions `ubuntu-latest` runner (4 vCPU, 16 GB; CPU model varies per run, so only same-run comparisons count), timed around the whole `docker run` with the scorer's flags, variants interleaved, warm page cache. "M4" is this Mac (arm64, 10 cores), process wall. The x86 number decides.
 
@@ -43,6 +45,11 @@ Before/after pairs come from one x86 run each; absolute times differ between run
 | 12 | same image | `RA=0` (no background read-ahead), `P1BITS=10`, `P1BITS=11 P2BITS=10` | 1.737 / 1.744 / 1.738 / 1.745 | 4.875 / 4.881 / 4.884 / 4.875 | | no difference; defaults stay (matches Vibhor7-7's sweep) |
 | 13 | `fe79ca9` | Dedup bitmap prefilter | 1.746 / 1.736 (dedup phase 0.078 / 0.069) | 4.886 / 4.860 (dedup 0.245 / 0.202) | dedup 0.028 / 0.021 | kept on the phase time; wall gain is inside the range |
 | 14 | same image | `AREL=1`, `IOMODE=4 CHUNKKB=1024`, both: effect on the time after exit | post-exit 0.406 / 0.405 / 0.401 / 0.399 | 1.100 / 1.099 / 1.087 / 1.080 | | neither changes it; pread wall -1.1% / -1.2% again |
+| 15 | `0f7f014` | Parquet: `sessions`, `events` as INT32; one pre-sized buffer per file | 1.743 / 1.725 (7763) ; 1.703 / 1.687 in the run before | 5.178 / 5.038 ; 5.045 / 4.952 | | kept (-1.0%, -2.7%; post-exit 0.465 -> 0.348 s at 60M) |
+| 16 | same image | Output on tmpfs instead of the runner's disk (diagnostic) | 1.687 / 1.687 | 4.952 / 4.681 (post-exit 0.348 -> 0.117) | | shows the post-exit time is output writeback |
+| 17 | same image | `MIMALLOC_ALLOW_LARGE_OS_PAGES=1` | 1.687 / 1.692 | 4.952 / 4.994 | | no gain; rejected |
+| 18 | `38f0f08` | `IOMODE=5`: pread-only input, nothing mapped (512 and 256 KiB ranges) | 1.699 / 1.982 / 1.992 | 4.795 / 5.626 / 5.600 | 0.483 / 0.481 | rejected as default: parse +30% on x86 (0.98 -> 1.28 s), unlike `IOMODE=4` (-1%); cause being investigated (native I/O-mode comparison with rusage and strace is in the next run) |
+| 19 | `79cb1f5` | Parquet: dictionary-encoded `user_daily` (user_id runs, day, sessions, events, top_category) | 1.725 / 1.699 | 5.038 / 4.795 (post-exit 0.391 -> 0.135) | out 0.024 / 0.021 | kept (-1.5%, -4.8%) |
 
 ## Current phase profile (`e75b17b`)
 
@@ -73,9 +80,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. The post-exit time (0.40 s at 20M, 1.10 s at 60M under Docker on the runner): INT32 count columns are built (output 93 -> 76 MB); the run in flight compares output on disk, output on tmpfs and a smaller output. If output bytes are the cause, dictionary and delta encodings for `user_daily` come next (the fastest public build writes 7.6 MB where we write 93 MB).
-2. Port the remaining measured wins from Vibhor7-7's log (user request): `pread` without any mapping (their mmap was +7.5%), huge pages for the large non-arena allocations (-3.7%), half-hour bins instead of the per-person sort (-2.7%), `select_unpredictable` for the timestamp form and link lookup (-2%), 4 keys + 4 people per link-table line (-1.5%).
-3. Instruction diet for the per-line path from the cachegrind line profile.
+1. Link table as 4 keys + 4 people per cache line with a vector compare and `select_unpredictable` (from Vibhor7-7, -1.5% and -2% there): built, passes the gate on both architectures, x86 A/B next.
+2. Why pread-only is 30% slower in parse on x86 when Vibhor7-7 and cherylaurelia read that way: compare I/O modes natively with rusage and strace, then fix or drop.
+3. Remaining Vibhor7-7 items: half-hour bins instead of the per-person sort (-2.7% there), huge pages for the large non-arena buffers (-3.7%), then the per-line instruction diet from cachegrind.
 
 ## Setup notes
 
