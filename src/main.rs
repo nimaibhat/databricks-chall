@@ -361,8 +361,13 @@ fn load_catalogs(data: &Path) -> Catalogs {
     Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels }
 }
 
+fn epoch() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
 fn main() {
     let t_start = Instant::now();
+    eprintln!("epoch_start {:.6}", epoch());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let outdir = PathBuf::from(env("OUTPUT_DIR", "/output"));
     let threads: usize = env("NCPU", "0").parse().unwrap_or(0);
@@ -508,6 +513,7 @@ fn main() {
     // ---- phase 5: output
     out::write_all(&outdir, &ctx, accs);
     eprintln!("done {:?} {}", t_start.elapsed(), cpu());
+    eprintln!("epoch_done {:.6}", epoch());
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();
         libc::getrusage(libc::RUSAGE_SELF, &mut ru);
