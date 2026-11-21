@@ -18,7 +18,9 @@ Re-ranked in iteration 25 against `OVERNIGHT_LOG.md` at 01:15. `main` is `62abf9
 
 Runners-up, in order: dedup with two-bit counters ([9.1](#91-two-bit-counters-instead-of-a-key-table), queued by the optimizer); one-multiply hash ([1.7](#17-one-multiply-hash)); rank sort for small groups ([19.2](#192-branch-free-rank-sort-for-small-groups)); 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)).
 
-Closed: everything for a cold page cache (1.9, 3.1); output size (20.1, 20.5, 22.4); a smaller runtime image (25.2).
+**Reopened in iteration 29, ahead of all five if the optimizer's tmpfs variant confirms it: output size.** The runner spends 0.3 s (20M) to 1.0 s (60M) after our process exits, most likely the container's overlay unmount syncing our 93 MB of Parquet ([29](#iteration-29-2026-11-21-0205-the-post-exit-time-is-most-likely-an-overlay-unmount-syncing-our-output-output-size-reopened)); delta and dictionary encodings cut the bytes to a fifth (20.3, 20.4).
+
+Closed: everything for a cold page cache (1.9, 3.1); a smaller runtime image (25.2).
 
 ## A finding to act on before trusting the TSBL toggle
 
@@ -1135,6 +1137,37 @@ Read: `origin/gate-s9-61cb613` (`parse.rs`, `main.rs`, `keys.rs`, `mem.rs`; line
 - Event type: both competitors test the length and one word; ours is a slice match (`main.rs:609-616`), entry 2.2, still open and small.
 - Record sizes: 16-byte dedup and event records in all three.
 - Scatter: same 128-byte stages for the 16-byte streams; Vibhor uses 256-bit streaming stores (top-five item 5).
+
+## Iteration 29 (2026-11-21, 02:05): the post-exit time is most likely an overlay unmount syncing our output; output size reopened
+
+The log's experiment 14 measures 0.40 s (20M) and 1.10 s (60M) between our last line and `docker run` returning, unchanged by `AREL=1` and `IOMODE=4`. This reverses the "closed" verdict of 20.6 and 22.4.
+
+### 29.1 Evidence from the bench runs (arithmetic on printed numbers, nothing new run)
+
+| Run, CPU | Build | Output at 20M | Wall minus in-process, 20M | 60M |
+|---|---|---|---|---|
+| 44875683289, EPYC 9V74 | ours `s7`/`s8`/`s9` | 93 MB | 0.50 to 0.51 s | 1.20 to 1.22 s |
+| 44876013351, EPYC 7763 | ours `0a06317` | 93 MB | 0.21 s | 0.65 s |
+| both | empty container | 0 | 0.15 to 0.19 s | |
+
+- **It scales with bytes written, not with the code**: 0.31 s above the empty container at 20M and about 1.0 s at 60M on the 9V74 runner (three times the output), identical for `s7`, `s8`, `s9` and for mapped or `pread` input and with the arena released first.
+- **It is all-or-nothing per run.** Two 60M runs in the optimizer's logs finished about 1.0 s early (`s9p1_10` min 3.865 against a median of 4.884; `s9` min 3.905 against 4.886): the whole post-exit time vanished. Memory teardown cannot do that; a flush that sometimes finds nothing left to write can.
+- **It depends on the runner's disk**: 0.02 s at 20M on the 7763 runner in my run, 0.31 s on the 9V74 one.
+- **cherylaurelia (7.6 MB of output) gains from a faster CPU where Vibhor7-7 (78 MB) and we do not**: 1.266 to 1.118 s from the 7763 run to the 9V74 run, against 1.379 to 1.372 (Vibhor7-7) and 1.729 to 1.737 (ours). Different commits of Vibhor7-7 and different days of noise, so this is supporting only.
+
+### 29.2 Mechanism, from the kernel source (corrects 20.5)
+
+- 20.5 said a filesystem is synced only when its superblock shuts down, and that a bind mount does not shut one down. True, but **the container's overlay root filesystem does shut down at teardown**, and overlayfs forwards that sync to the whole upper filesystem: `generic_shutdown_super` calls `sync_filesystem(sb)` ([fs/super.c](https://github.com/torvalds/linux/blob/master/fs/super.c), line 702 on master), and `ovl_sync_fs` with `wait == 1` calls `sync_filesystem(upper_sb)` ([fs/overlayfs/super.c](https://github.com/torvalds/linux/blob/master/fs/overlayfs/super.c), lines 255 to 287), which writes back every dirty inode on that filesystem and waits ([fs/sync.c](https://github.com/torvalds/linux/blob/master/fs/sync.c), `sync_filesystem`).
+- On the runner the overlay upper directory (`/var/lib/docker`) and the bind-mounted output (`mktemp -d` under `/tmp`) are the same ext4 (`/dev/root`), so removing the container writes our Parquet files to disk before `docker run` returns. `--read-only` does not prevent it: runc remounts the root read-only per mount, the overlay superblock stays read-write, and `sync_filesystem` only skips a read-only superblock.
+- Not verified: that Docker's `--rm` unmount is inside the timed window on the scorer, or that the scorer's `/output` shares a filesystem with its sandbox root. Competitors report `/output` on ext4 there. The scorer times start to exit of the container, so if it shares the filesystem the cost is in the score.
+
+### 29.3 What follows
+
+- **The tmpfs variant in the optimizer's run in flight (`s11tmpfs`) decides it**: with `/output` on tmpfs the post-exit time should fall to about the empty container's share.
+- **If confirmed, bytes are the only lever** (20.5: `sync_file_range` and `fadvise` do not help unless started early, and output is the last phase). Sizes from 20.3: INT32 counts 78 MB; `DELTA_BINARY_PACKED` on the four integer columns 42.5 MB; plus `DELTA_BYTE_ARRAY` on `user_id` and a dictionary on `top_category` about 18 MB. A byte-exact reference writer for these encodings, accepted by pyarrow, polars and duckdb, is described in 20.4.
+- **One cheap extra**: start writeback as soon as each file is written, with `sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE)`, and write `user_daily` before `campaign_daily` finishes so the disk works while the process is still alive. It does not wait, so it cannot lose time; it only helps if the flush is disk-bound, and it does nothing for bytes still unwritten at exit.
+- **Expected gain**: on the 9V74 runner up to 0.3 s of 1.74 s at 20M (-17%) and 0.9 s of 4.9 s at 60M if output shrinks to a fifth. On the scorer unknown; Vibhor7-7's log notes that about 0.36 s of its 0.78 s is spent where its own timer does not look.
+- **Risk to exactness**: none to the values if the readers accept the encodings; the scorer's reader is unknown, so INT32 counts and delta pages need the same reader checks as 20.4 and one submission to confirm.
 
 ## Next iteration
 
