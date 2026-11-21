@@ -386,6 +386,30 @@ Not opened: the Patwary et al. paper, absolute cycle tables in Bingmann et al., 
 - `ingest_ts` is whole seconds and usually minutes after `ts` (`user.rs` `ingest`), so both timestamps of a line usually share a date. With idea 1.4 the second lookup of a line almost always hits the entry the first one just used.
 - Nothing else in the generator supports a new specialised path; the dirt rates are per seed, as the rules say.
 
+---
+
+## Iteration 8 (2026-11-21): fixed serial work at start-up
+
+From reading `src/` against the audit and competitor commits. At a 0.6 s target every 6 ms of serial work is 1%.
+
+### 8.1 Catalog load is about 60M serial instructions before anything parallel starts
+
+- **Evidence.** The audit's callgrind run attributes about 2.5% of 2.395G instructions on the 1M set to catalog load (`read_small_csv`, `Catalog::finish`, SipHash), which is about 60M instructions. `products.csv` is always 50,000 rows and `campaigns.csv` 2,000 whatever the event count (rules, "The generator"), so this cost is fixed: roughly 15 to 20 ms, on one thread, at 20M and at 60M alike.
+- **Where it goes.** `read_small_csv` (`parse.rs:382`) allocates three vectors per row. `main.rs:349-360` clones every category name, then does a SipHash `HashMap<Vec<u8>, u16>` lookup per product. `Catalog::insert` (`keys.rs:359`) copies each id into `ids`. `Catalog::finish` (`keys.rs:380-402`) runs `canon_split` over every id twice and builds a `HashMap<Vec<u8>, (usize, u64)>` with a `to_vec` per id.
+- **Sources.** [cherylaurelia `2f45a4d`](https://github.com/cherylaurelia/builders-hackathon/commit/2f45a4d): "products/campaigns tables on a side thread while the links are built (7 ms off the serial start)", A/B ratio 0.961. [Th3r0n `81a7e86`](https://github.com/Th3r0n/shopping-sessions/commit/81a7e86): "Faster products.csv loading: no per-row allocations, pre-sized map". [explorer-skp `196faf2`](https://github.com/explorer-skp/buildathon-shopping-sessions/commit/196faf2): "Load the product and campaign tables while the pool parses link lines". Counter-evidence: micah-andelman rejected parallel small-table load, but bundled with smaller link chunks that slowed the link parse.
+- **Here.** Two independent steps:
+  1. Run the catalog block (`main.rs:348-373`) on a scoped side thread started before `Mapped::open` and `build_links`, and join it before `Ctx` is built at `:389`. `build_links` reads neither catalog. The parse threads need both, so the join stays before phase 2.
+  2. Remove the per-row allocations: split lines in place over the file buffer, map category names through a 20-entry linear scan or a small sorted array instead of SipHash, and have `finish` count prefixes without `to_vec` (in generated data there is one prefix per file).
+- **Expected gain.** 7 to 20 ms of wall, so 1 to 3% at 20M and under 1% at 60M.
+- **Risk.** Low. Step 1 changes no logic. Step 2 must keep the exact semantics that `cat_tests::dense_exact` checks: last row wins for a repeated product id (`overwrite = true`), first row wins for a repeated campaign id, and category ids follow byte-wise name order with `unknown` included, because `flush_user` breaks ties on the smaller category id (`main.rs:1016`).
+
+### 8.2 Loads that are re-read per event or per block
+
+- `p1_bits()` and `p2_bits()` are relaxed atomic loads inside the per-line closures (`main.rs:634`, `:656`, and `:735` in dedup pass 2). The compiler cannot hoist them across the opaque `BList::push` slow path. Read them into locals before `scan_lines`.
+- `flat16()` (`parse.rs:528`) is a `OnceLock` read per 64-byte block inside `scan_lines`; hoist it to the top of the function, as `ts_bl()` already is in `parse_events`.
+- **Expected gain.** Under 1%; listed because it is free while those lines are being edited for ideas 1.1 and 1.2.
+- **Risk.** None.
+
 ## Next iteration
 
 - Re-read `OVERNIGHT_LOG.md` if it exists and drop anything it marks tried.
