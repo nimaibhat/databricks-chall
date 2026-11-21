@@ -1640,6 +1640,29 @@ Not benchable on the AMD runners: Alexis-CAPON/shopping-sessions `1b0b7b7` build
 
 No public entry does something structurally different from the designs already compared (parse-time person lookup, one scatter, narrow dedup stream, per-person sessions, encoded Parquet). Nothing found skips work the rules allow, pins threads, or uses an output or exit trick beyond those in 20, 29 and 31. The 0.42 s on the board is therefore unexplained by public code; the x86 bench of the shortlist above is the remaining way to find a faster public design.
 
+## Iteration 42 (2026-11-21, 04:50): the survey's shortlist measured on x86; our pick is level with the fastest public build
+
+Run [44889522320](https://github.com/nimaibhat/databricks-chall/actions/runs/44889522320) on `bench-ext`, EPYC 9V45, 4 vCPU, median of 5 (20M) and 3 (60M), all outputs equal to ours. Ours is `origin/main` with the streamed output and PGO (`d9e7a12`).
+
+| Build | 20M | 60M |
+|---|---|---|
+| cherylaurelia `2e4261f` | 0.942 | 2.597 |
+| ours `d9e7a12` | 0.946 | 2.599 |
+| Warrior-hound `c7e9a33` | 1.114 | 3.168 |
+| Britogus7 `bf00497` | 1.122 | 3.450 |
+| himanshu-thalor `01ba5ce` | 1.213 | 3.471 |
+| zlyuan9 `cf57464` | 1.233 | 3.540 |
+| Louise-Ruza `247fdc3` | 1.264 | 3.751 |
+| JuanQuenga `5f6718c` (claims 0.88 s on the board) | 1.427 | 5.570 |
+| KennethLei1492 `7315a2a` | 1.454 | 4.205 |
+| AndrewRecinos `e276166` | 1.516 | 4.891 |
+
+- **None of the eight newly found entries is faster than cherylaurelia or than our pick.** With iteration 40 (Vibhor7-7 1.320 against cherylaurelia 1.276 on another runner), cherylaurelia and our pick are the two fastest public builds we have measured; the board's leaders (0.42 s reported) have no public code we can find.
+- **Our pick is level with cherylaurelia on this CPU** (0.946 against 0.942 at 20M, 2.599 against 2.597 at 60M), which agrees with the optimizer's same-CPU run. On the EPYC 7763 it is still about 10% behind per the optimizer's log, so the remaining difference is CPU-dependent (the smaller L2 of Zen 3; entry 40).
+- Our phases here (20M): links 0.061, parse 0.501, dedup 0.050, sessions with output 0.193; pre 0.090, post 0.045. Parse is 53% of the wall.
+- JuanQuenga's 0.88 s board claim against 1.427 s here (ours 0.946) is one more sign that a single board score is loose, or that its scored commit is not this head.
+- Nothing further to take from the shortlist: no build to copy from is ahead of us on this runner.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
