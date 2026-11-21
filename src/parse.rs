@@ -499,6 +499,7 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
     let mut ls = 0usize; // current line start
     let mut ls_rank = 0usize; // index in pos of the current line's first separator
     let qbit = |qr: &[u64; QR], p: usize| -> u64 { (qr[(p >> 6) % QR] >> (p & 63)) & 1 };
+    let flat = flat16();
     let mut seg = 0usize;
     while seg < nblocks {
         let seg_end = (seg + SEG).min(nblocks);
@@ -525,7 +526,7 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
             let o = off as u32;
             let mut x = sm;
             let mut i = 0usize;
-            if flat16() {
+            if flat {
                 // two rounds unconditionally (pos has slack): no exit mispredict
                 unsafe {
                     let d = pp.add(k);

@@ -601,6 +601,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
     let ceil = unsafe { floor.add(d.len()) };
     let unknown = ctx.cat_unknown as u32;
     let tsbl = ts_bl();
+    let sh1 = 64 - p1_bits();
     scan_lines::<7>(d, start, end, |f| {
         if f[0].is_empty() {
             return;
@@ -629,9 +630,10 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             };
             r.ts = (ts - ws) as u32;
             r.person = pack_fast(f[1], ceil);
-            r.pc = (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown);
+            // the category is read only for purchases (price > 0)
+            r.pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
         }
-        unsafe { eb.get_unchecked_mut((hk(eid) >> (64 - p1_bits())) as usize) }.push(r, bs);
+        unsafe { eb.get_unchecked_mut((hk(eid) >> sh1) as usize) }.push(r, bs);
     });
 }
 
@@ -642,6 +644,7 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
     let tsbl = ts_bl();
     let floor = d.as_ptr();
     let ceil = unsafe { floor.add(d.len()) };
+    let sh2 = 64 - p2_bits();
     scan_lines::<4>(d, start, end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -653,7 +656,7 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
         let Some(camp) = ctx.campaigns.get(f[2], floor) else { return };
         let u = pack_fast(f[1], ceil);
         let r = CRec { person: u, cid: pack_fast(f[0], ceil), ts, camp };
-        unsafe { cb.get_unchecked_mut((hk(u) >> (64 - p2_bits())) as usize) }.push(r, bs);
+        unsafe { cb.get_unchecked_mut((hk(u) >> sh2) as usize) }.push(r, bs);
     });
 }
 
