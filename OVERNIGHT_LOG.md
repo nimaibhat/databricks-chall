@@ -4,7 +4,7 @@
 
 **If you would rather not rely on dictionary-encoded Parquet with an unknown scorer reader, submit `0f7f014` instead** (PLAIN pages, INT32 counts, without tonight's last two speedups: 1.725 / 5.038 s on an EPYC 7763 run where the dictionary build took 1.699 / 4.795 s). Dictionary pages are what pyarrow, Spark, polars and duckdb write by default, so the risk is small, but it is the one change tonight that alters the file format rather than the speed of producing it.
 
-**Why the output size matters:** after the process prints its last line, `docker run` on the runner does not return until the output files have been flushed to disk. That time follows the output size and the runner's disk: at 60M it was 0.42 to 1.10 s with 273 MB, 0.39 s with 223 MB, 0.135 s with 101 MB, 0.117 s with output on tmpfs. Whether the scorer behaves the same is unknown; a smaller output can only help.
+**Why the output size matters:** after the process prints its last line, `docker run` on the runner does not return until the output files have been flushed to disk (the flush is disk-bound, about 300 MB/s on the slow-disk runners, and negligible on others or on tmpfs). With output on tmpfs the current build takes 0.927 s at 20M and 2.441 s at 60M on a runner where the fastest public build takes 0.906 / 2.458 s: in-process we are level with it. Whether the scorer's `/output` behaves like a slow disk is unknown; smaller and earlier-written output can only help.
 
 How to read the numbers: "x86" is a GitHub Actions `ubuntu-latest` runner (4 vCPU, 16 GB; CPU model varies per run, so only same-run comparisons count), timed around the whole `docker run` with the scorer's flags, variants interleaved, warm page cache. "M4" is this Mac (arm64, 10 cores), process wall. The x86 number decides.
 
@@ -65,6 +65,10 @@ From experiment 27 on, the bench drops the page cache before each dataset: with 
 | 32 | not merged | Scanner slow path fills a separate array so the fields array never escapes | 1.494 / 1.485 | 4.081 / 4.107 | parse 1.230 / 1.225 at one thread | rejected: no difference |
 | 33 | not merged yet | Profile-guided optimisation: profile from the 1M and 20M sets, generated in `rust:1.91-bookworm` on the runner, used through an optional `pgo.profdata` in the Dockerfile | 1.249 / 1.225 (9V74, n=9; ranges 1.244-1.315 / 1.215-1.240) | 3.445 / 3.392 (n=7; 3.437-3.528 / 3.370-3.397) | n/a | works (-1.9%, -1.5%); to be applied last, with a profile regenerated from the final source |
 | 34 | analysis | Sessions phase by step, Mac, one thread, 20M (thread-seconds): group 0.060, scatter 0.040, clicks 0.023, sort 0.155, sweep 0.136. Sort time by group size: under 8 events 1 ms, 8 to 31 41 ms, 32 to 127 19 ms, 128 to 2047 24 ms, 2048 and more 11 ms | | | | a coarse presort would cost about what the small sorts cost, so not built; radix for large groups built (next row) |
+| 35 | not merged | Radix sort by timestamp for groups of 2048 events and more | 0.991 / 0.988 (9V45, n=9) | 2.644 / 2.655 | sort step 0.155 / 0.138 thread-s | rejected: no wall difference on x86 |
+| 36 | control | Same build with output on tmpfs instead of the runner's disk | 0.991 / 0.927 (post-exit 0.122 -> 0.046); fastest public build 0.906 in the same run | 2.644 / 2.441 (0.276 -> 0.060); fastest public build 2.458 | | **in-process we are level with the fastest public build; what is left of the gap is the flush of our output (22 / 63 MB against its about 8 MB) after exit, on runners with a slow disk** |
+| 37 | switch only | `OUTSYNC=1` (fdatasync from the writer threads) and `OUTSYNC=2` (ask for writeback to start, at the end) on a slow-disk runner (9V45) | 1.212 / 1.185 / 1.156 | 3.218 / 3.279 / 3.251 | | the flush is disk-bound, about 300 MB/s: syncing in-process only moves the time (out 0.089 -> 0.307 s at 60M); starting writeback early helps at 20M (-4.7%) and blocks at 60M. On fast-disk runners (7763, 6975P) none of it matters (post-exit 0.04 to 0.08 s). So the flush has to overlap with computation: experiment 39 |
+| 38 | not merged yet | Parquet: 2048-row index pages; `campaign_daily` with dictionary runs and INT32 counts (output 22 -> 21 MB, 63 -> 60 MB) | 1.212 / 1.191 (9V45) ; 1.212 / 1.212 (6975P) | 3.218 / 3.192 ; 3.317 / 3.316 | | inside the range; carried as the base of #39 |
 
 ## Current phase profile (`a88caa3`)
 
@@ -97,9 +101,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Radix sort by timestamp for groups of 2048 events and more (whales, shared devices): built with a unit test, gated on both builds; x86 A/B running together with an output-on-tmpfs control for the time after exit.
-2. Profile-guided optimisation as the final step (measured -1.9% / -1.5%, experiment 33): regenerate the profile from the final source, rebuild, re-run the whole gate against the image's binary.
-3. Dedup key stream of 8 bytes (hash and index) with the full keys in a sequential per-thread log read only for suspected repeats; scanner stage C (packed offsets instead of a slice array).
+1. Experiment 39: write `user_daily` as row groups from the workers during the sessions phase (32K rows each) and have a background thread ask the kernel to start writing each group out, so the disk flush overlaps with computation instead of happening after exit. Built; passes the gate with one group, 32K-row groups and 500-row groups; multi-group files read identically with polars, pyarrow, duckdb and fastparquet. Two x86 runs in flight (the effect only shows on slow-disk runners).
+2. Profile-guided optimisation as the final step (measured -1.9% / -1.5%, experiment 33), with the profile regenerated from the final source and the gate re-run against the image's binary (fixtures, 1M / 20M / 60M equality).
+3. If time remains: a compression codec for the `user_id` dictionary page (half of the remaining output is ID strings), weighed against its CPU cost.
 
 ## Setup notes
 
