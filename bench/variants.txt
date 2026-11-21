@@ -1,3 +1,6 @@
 # label|ref|build-args|env
 main|origin/gate-main-45fa6ae||
-xl1|origin/gate-xl1-b05d310||
+xl_t1|origin/gate-xl_t1-b05d310||NCPU=1
+xl_t2|origin/gate-xl_t2-b05d310||NCPU=2
+xl_t8|origin/gate-xl_t8-b05d310||NCPU=8
+xl_t3|origin/gate-xl_t3-b05d310||NCPU=3
