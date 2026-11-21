@@ -1,5 +1,3 @@
 # label|ref|build-args|env
-main|origin/gate-main-31ef320||
-p2_10|origin/gate-p2_10-31ef320||P2BITS=10
-p10_10|origin/gate-p10_10-31ef320||P1BITS=10 P2BITS=10
-p2_11|origin/gate-p2_11-31ef320||P2BITS=11
+s42off|origin/gate-s42off-1309b13||PREFAULT=0
+s42|origin/gate-s42-1309b13||
