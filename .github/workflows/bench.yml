@@ -24,7 +24,7 @@ jobs:
           d=$(dirname $(find . -name Cargo.toml | head -1)); cd $d && cargo build --release -q
           time ./target/release/generate --seed 7 --events ${EVENTS:-20000000} --clicks ${CLICKS:-5000000} --output ~/data
           du -sh ~/data
-      - name: x86 tests (v4)
-        run: RUSTFLAGS="-C target-cpu=x86-64-v4" cargo test --release -q 2>&1 | tail -3
       - name: bench
         run: bash bench/gha_bench.sh
+      - name: perf
+        run: bash bench/perf.sh
