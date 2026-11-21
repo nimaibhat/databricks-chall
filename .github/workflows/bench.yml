@@ -1,7 +1,7 @@
 name: bench
 on:
   push:
-    branches: [bench]
+    branches: [bench-ext]
   workflow_dispatch:
 jobs:
   bench:
