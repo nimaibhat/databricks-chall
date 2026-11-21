@@ -336,6 +336,12 @@ fn popr() -> bool {
 - Two notes on reading the result. The line scans at `parse.rs:2141-2142` (`next_line_start`) already touch the first and last page of the chunk before this call, so two fault-around windows are mapped either way. And with 8 MiB chunks the call maps 2,048 pages in one go, which then sit in the page tables for the roughly 0.6 ms the thread needs to parse them; that is fine for the TLB (4 KiB entries are filled on demand) but if it loses, try it with `XL_CH=2048` before closing it.
 - **Risk to output:** none. It changes when read-only input pages get mapped, not what is read.
 
+### 8.4 The sessions stage has its own built-in profile; please log it once
+
+- Under `XL_TIMING=1` the binary prints `[v2b] prof (thread-ms): scatter=... compact=... runs=... st2b=... st2b_max_bucket=... st2b_pass1=... st2b_pass2=... st2b_sort=...` (`main.rs:437`), summed over threads from `t.prof` (`events.rs:2092-2094`, `links.rs:1659-1662`). `scatter` is the dedup pass over the records (the DRAM reads of 3.4), `compact` the 512-bit compress pass, `runs` everything after it. `st2b_*` is the click-index work that runs inside parse, and `st2b_max_bucket` is the longest single link job, which is what can leave one thread working alone at the end of parse.
+- A build with the environment variable `XL_XPROF=1` set **at compile time** (`option_env!`, `events.rs:652`) prints a per-phase table for stage 3a with instructions, cycles, cache misses and branch misses per kept event (`events.rs:763-800`), and `XL_XRU=1` the user/system time and faults of the stage. Measurement builds only.
+- With these and 8.3 every stage has a measured split, and I can stop ranking on estimates. Until they are in the log I will not add speculative items to the table.
+
 ## Next passes (in this order)
 
 1. `events.rs` `stage3a` and `core.rs`: the 35 ms stage, pass by pass.
