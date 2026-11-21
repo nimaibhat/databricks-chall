@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 mod dense;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2", target_feature = "lzcnt"))]
+mod xk;
 mod gen;
 mod keys;
 mod mem;
@@ -386,6 +388,21 @@ struct Catalogs {
     campaigns: Catalog,
     camp_names: Vec<Vec<u8>>,
     camp_channels: Vec<Vec<u8>>,
+    /// category by product number, when every product ID is `p` + a plain
+    /// decimal number; campaign index by number, when every campaign ID is
+    /// `c_` + a plain decimal number (u32::MAX = no such campaign)
+    prod_num: Option<Vec<u8>>,
+    camp_num: Option<Vec<u32>>,
+}
+
+/// The number of an ID that is `prefix` + 1 to 8 decimal digits with no
+/// leading zero.
+fn plain_number(id: &[u8], prefix: &[u8]) -> Option<usize> {
+    let d = id.strip_prefix(prefix)?;
+    if d.is_empty() || d.len() > 8 || !d.iter().all(|c| c.is_ascii_digit()) || (d[0] == b'0' && d.len() > 1) {
+        return None;
+    }
+    Some(d.iter().fold(0usize, |v, c| v * 10 + (c - b'0') as usize))
 }
 
 /// products.csv and campaigns.csv; runs beside the link build.
@@ -414,10 +431,40 @@ fn load_catalogs(data: &Path) -> Catalogs {
             camp_channels.push(r[1].clone());
         }
     }
+    // the same lookups by number (the vector parser hands out numbers);
+    // products: the last row of an ID counts, campaigns: the first
+    let prod_num = (|| {
+        let mut t: Vec<u8> = Vec::new();
+        for r in &prod_rows {
+            let n = plain_number(&r[0], b"p").filter(|&n| n < 1 << 22)?;
+            if t.len() <= n {
+                t.resize(n + 1, cat_unknown as u8);
+            }
+            t[n] = cat_index[&r[1]] as u8;
+        }
+        Some(t)
+    })();
+    let camp_num = (|| {
+        let mut t: Vec<u32> = Vec::new();
+        let mut next = 0u32;
+        let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        for r in &camp_rows {
+            if !seen.insert(&r[0]) {
+                continue;
+            }
+            let n = plain_number(&r[0], b"c_").filter(|&n| n < 1 << 22)?;
+            if t.len() <= n {
+                t.resize(n + 1, u32::MAX);
+            }
+            t[n] = next;
+            next += 1;
+        }
+        Some(t)
+    })();
     products.finish();
     campaigns.finish();
     eprintln!("catalogs {:?}", t_cat.elapsed());
-    Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels }
+    Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels, prod_num, camp_num }
 }
 
 /// True on an Intel x86-64 CPU (CPUID vendor string).
@@ -437,7 +484,31 @@ fn epoch() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
+/// On a CPU with AVX-512 the build made for it (the same program, with the
+/// vector line parser) takes over, if it sits beside this one. SS512=0
+/// keeps this build.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(target_feature = "avx512bw")))]
+fn hand_over_to_512() {
+    use std::os::unix::process::CommandExt;
+    if env("SS512", "1") == "0" {
+        return;
+    }
+    if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512cd") && is_x86_feature_detected!("avx512dq") && is_x86_feature_detected!("avx512vl")) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else { return };
+    let alt = exe.with_file_name(format!("{name}512"));
+    if alt.is_file() {
+        // exec returns only on failure: then this build simply carries on
+        let _ = std::process::Command::new(alt).args(std::env::args_os().skip(1)).exec();
+    }
+}
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(target_feature = "avx512bw"))))]
+fn hand_over_to_512() {}
+
 fn main() {
+    hand_over_to_512();
     let t_start = Instant::now();
     eprintln!("epoch_start {:.6}", epoch());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
@@ -520,7 +591,7 @@ fn main() {
         let links = build_links(&data, threads, &arena, prefault);
         (links, h.join().expect("catalogs"))
     });
-    let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels } = cats;
+    let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels, .. } = cats;
     eprintln!("phase1 done {:?} {}", t_start.elapsed(), cpu());
 
     let ctx = Ctx {
