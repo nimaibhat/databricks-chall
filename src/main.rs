@@ -1097,12 +1097,32 @@ struct Scratch {
     coff: Vec<u32>,
     cgid: Vec<u32>,
     cl: Vec<CSort>,
+    sess: SessState,
+}
+
+/// Working state of `person_sessions`, reused from person to person.
+#[derive(Default)]
+struct SessState {
     cat_rev: Vec<u64>,
     touched: Vec<u16>,
     acnt: Vec<u32>,
     apos: Vec<u32>,
     since: Vec<u32>,
     active: Vec<u32>,
+}
+
+impl SessState {
+    fn prepare(&mut self, ncat: usize, ncamp: usize) {
+        if self.cat_rev.len() != ncat {
+            self.cat_rev.clear();
+            self.cat_rev.resize(ncat, 0);
+        }
+        if self.acnt.len() < ncamp + 1 {
+            self.acnt = vec![0; ncamp + 1];
+            self.apos = vec![0; ncamp + 1];
+            self.since = vec![0; ncamp + 1];
+        }
+    }
 }
 
 #[inline(never)]
@@ -1227,23 +1247,7 @@ fn process_partition(
         }
     }
 
-    let cat_rev = &mut sc.cat_rev;
-    cat_rev.clear();
-    cat_rev.resize(ncat, 0);
-    let touched = &mut sc.touched;
-    if sc.acnt.len() < ctx.camp_names.len() + 1 {
-        sc.acnt = vec![0; ctx.camp_names.len() + 1];
-        sc.apos = vec![0; ctx.camp_names.len() + 1];
-        sc.since = vec![0; ctx.camp_names.len() + 1];
-    }
-    let acnt = &mut sc.acnt;
-    let apos = &mut sc.apos;
-    let since = &mut sc.since;
-    let active = &mut sc.active;
-    let organic = ctx.camp_names.len() as u32;
-    let ws = ctx.ws;
-    const WEEK: u64 = WEEK_MS as u64;
-
+    sc.sess.prepare(ncat, ctx.camp_names.len());
     for g in 0..ng {
         let evs = &mut ev[off[g] as usize..off[g + 1] as usize];
         if evs.len() > 1 {
@@ -1253,7 +1257,22 @@ fn process_partition(
         if cls.len() > 1 {
             cls.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
         }
-        let person = gkeys[g];
+        person_sessions(ctx, a, &mut sc.sess, gkeys[g], evs, cls);
+    }
+}
+
+/// One person's sessions, day rows and campaign counts. `evs` are the
+/// person's kept valid events as `ts << 32 | pc` words in time order (`ts`
+/// relative to the window start), `cls` their clicks ordered by time and,
+/// at equal times, by click_id (`ts` relative to window start - 7 days).
+/// `st` must have been prepared for the catalog sizes.
+#[inline(always)]
+fn person_sessions(ctx: &Ctx, a: &mut out::Acc, st: &mut SessState, person: Key, evs: &[u64], cls: &[CSort]) {
+    let SessState { cat_rev, touched, acnt, apos, since, active } = st;
+    let organic = ctx.camp_names.len() as u32;
+    let ws = ctx.ws;
+    const WEEK: u64 = WEEK_MS as u64;
+    {
         let mut cur_day: i32 = i32::MIN;
         // sessions, events, revenue of the current day so far
         let mut d_sess = 0u32;
