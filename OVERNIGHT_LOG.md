@@ -1,8 +1,8 @@
 # OVERNIGHT_LOG.md
 
-**SUBMIT THIS: `79cb1f5`** (adds INT32 counts and a dictionary-encoded `user_daily`, which cut the output from 93 to 35 MB at 20M and from 273 to 101 MB at 60M). x86 runner, full `docker run` wall, median of 7, EPYC 7763 4 vCPU, same run: 20M 1.699 s against 1.743 s for the previous pick `fe79ca9`; 60M 4.795 s against 5.178 s (-7.4%). Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); 15 unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets (duckdb), and the files read back identically with polars, pyarrow, duckdb and fastparquet. Same run: Vibhor7-7 1.401 / 3.943 s, cherylaurelia 1.295 / 3.534 s.
+**SUBMIT THIS: `a88caa3`** (adds the cache-line link table and the inlined per-line callback to the dictionary-output build). x86 runner, full `docker run` wall, median of 7 (20M) and 5 (60M), EPYC 9V45 4 vCPU, same run: 20M 1.188 s against 1.212 s for its parent; 60M 3.263 s against 3.345 s. The fastest public build (cherylaurelia) takes 0.917 / 2.516 s in that run, so we are now about 1.3 times its time (2.4 times at the start of the night, in-process). Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); 15 unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets; output files read identically with polars, pyarrow, duckdb and fastparquet.
 
-**If you would rather not rely on dictionary-encoded Parquet with an unknown scorer reader, submit `0f7f014` instead** (same pipeline, PLAIN pages, INT32 counts: 1.725 / 5.038 s in that run). Dictionary pages are what pyarrow, Spark, polars and duckdb write by default, so the risk is small, but it is the one change tonight that alters the file format rather than the speed of producing it.
+**If you would rather not rely on dictionary-encoded Parquet with an unknown scorer reader, submit `0f7f014` instead** (PLAIN pages, INT32 counts, without tonight's last two speedups: 1.725 / 5.038 s on an EPYC 7763 run where the dictionary build took 1.699 / 4.795 s). Dictionary pages are what pyarrow, Spark, polars and duckdb write by default, so the risk is small, but it is the one change tonight that alters the file format rather than the speed of producing it.
 
 **Why the output size matters:** after the process prints its last line, `docker run` on the runner does not return until the output files have been flushed to disk. That time follows the output size and the runner's disk: at 60M it was 0.42 to 1.10 s with 273 MB, 0.39 s with 223 MB, 0.135 s with 101 MB, 0.117 s with output on tmpfs. Whether the scorer behaves the same is unknown; a smaller output can only help.
 
@@ -50,16 +50,21 @@ Before/after pairs come from one x86 run each; absolute times differ between run
 | 17 | same image | `MIMALLOC_ALLOW_LARGE_OS_PAGES=1` | 1.687 / 1.692 | 4.952 / 4.994 | | no gain; rejected |
 | 18 | `38f0f08` | `IOMODE=5`: pread-only input, nothing mapped (512 and 256 KiB ranges) | 1.699 / 1.982 / 1.992 | 4.795 / 5.626 / 5.600 | 0.483 / 0.481 | rejected as default: parse +30% on x86 (0.98 -> 1.28 s), unlike `IOMODE=4` (-1%); cause being investigated (native I/O-mode comparison with rusage and strace is in the next run) |
 | 19 | `79cb1f5` | Parquet: dictionary-encoded `user_daily` (user_id runs, day, sessions, events, top_category) | 1.725 / 1.699 | 5.038 / 4.795 (post-exit 0.391 -> 0.135) | out 0.024 / 0.021 | kept (-1.5%, -4.8%) |
+| 20 | `50b8e52` | Link table: 4 keys + 4 people per cache line, vector compare, `select_unpredictable` | 1.662 / 1.663 (7763) | 4.607 / 4.554 | 0.528 / 0.505 (noisy) | neutral at 20M, -1.2% at 60M inside the range; kept only as the base of #21 |
+| 21 | `a88caa3` | Scanner: single call site so the per-line callback is inlined | 1.212 / 1.188 (9V45; ranges 1.172-1.313 / 1.155-1.194) | 3.345 / 3.263 (3.325-3.505 / 3.243-3.329) | parse 1.250 / 1.191 at one thread | kept (-2.0%, -2.5%) |
+| 22 | not committed | Scanner field ends through a small array from two 64-bit words, quote test by byte | not run | not run | parse 1.194 / 1.237 at one thread | rejected on the Mac (slower); not taken to x86 |
 
-## Current phase profile (`e75b17b`)
+## Current phase profile (`a88caa3`)
 
-x86, 4 vCPU EPYC 9V45, 20M, in-process seconds (median of 7): links 0.084, parse 0.673, dedup 0.060, sessions 0.214, output 0.035, total about 1.07; the `docker run` wall is 1.553, so about 0.49 s is container start/stop on that runner (an empty-container baseline is now part of every run). 60M: links 0.247, parse 1.948, dedup 0.196, sessions 0.648, output 0.100. The fastest public build runs 0.917 s / 2.468 s wall in the same run, about 0.43 s in-process at 20M: still 2.4 times faster than us in-process.
+x86, 4 vCPU EPYC 9V45 (a fast runner), in-process seconds, median: 20M links 0.079, parse 0.582, dedup 0.057, sessions 0.174, output 0.024, total 0.916; before `main` 0.087, after the last line 0.180; `docker run` wall 1.188. 60M: links 0.254, parse 1.674, dedup 0.143, sessions 0.571, output 0.069, total 2.71; before 0.089, after 0.456; wall 3.263. A container on a tiny dataset takes about 0.155 s in all, so roughly 0.12 s (20M) and 0.39 s (60M) of the time after exit is ours: output flush (35 / 101 MB) and address-space teardown.
 
-Parse cut off after each stage, one thread, 20M events only, EPYC 7763 (ns per event line, cumulative seconds in brackets): scan and split 34.5 (0.745), event_id pack and ingest_ts +12.6 (1.017), ts +14.8 (1.337), type, price, user pack, hash +13.0 (1.618), prefetch ring and link lookup +14.9 (1.94), event record push +9.0 (2.13), dedup-key push plus all click lines +31 (2.81). Every stage is slow in absolute terms; the per-line work is instruction-bound, and the two pushes were cache-bound before the write-combining commit.
+`perf` self time (4 threads, 20M): `parse_events` (scanner and decode, now one function) 50.3%, `process_partition` 14.5% plus sorts 4.5%, `parse_clicks` 9.3%, `dedup_partition` 5.9%, kernel page zeroing 3.3%, link build 4.2%. The line profile is flat: the largest single lines are a record store (4.4%), the scanner's field loop (6.6% over three lines) and ID packing (5.4% over three lines).
 
-`perf` self time (4 threads, 20M, before SIMD packing): parse closure 40.8%, scanner 14.4%, `process_partition` 12.0% plus sorts 5%, `parse_clicks` 10.5%, `dedup_partition` 5.4%, kernel page zeroing 2.5%.
+Cachegrind, 1M set: 1.69 G instructions (2.15 G at the start of the night), about 1,575 per event line for the whole run; the scanner body alone is still about 315 per line and the decode about 430.
 
-Memory at 60M: peak RSS 5.4 GB on the Mac; arena reservation is address space only (about 11 GB at 60M), used 3.3 GB.
+Parse cut off after each stage on an EPYC 7763 before tonight's decode work (ns per event line): scan and split 34.5, event_id and ingest_ts +12.6, ts +14.8, type/price/user/hash +13.0, link lookup +14.9, event push +9.0, dedup-key push and clicks +31.
+
+Memory at 60M: peak RSS about 5.4 GB on the Mac (3.2 GB anonymous plus mapped input).
 
 ## Research notes
 
@@ -80,9 +85,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Link table as 4 keys + 4 people per cache line with a vector compare and `select_unpredictable` (from Vibhor7-7, -1.5% and -2% there): built, passes the gate on both architectures, x86 A/B next.
-2. Why pread-only is 30% slower in parse on x86 when Vibhor7-7 and cherylaurelia read that way: compare I/O modes natively with rusage and strace, then fix or drop.
-3. Remaining Vibhor7-7 items: half-hour bins instead of the per-person sort (-2.7% there), huge pages for the large non-arena buffers (-3.7%), then the per-line instruction diet from cachegrind.
+1. Find why pread-only input costs 1.5 s of kernel time at 20M where pread of a mapped file costs 0.3 s (toggles and a kernel-side `perf` profile are in the run in flight). A working pread path also removes the mapped input from exit teardown.
+2. Scanner instruction diet from the cachegrind line table (the scanner body is about 315 instructions per line; the fast public builds report about 100).
+3. The time after exit: `revenue_cents` is half of the remaining output; delta or dictionary encoding would cut the file by another third. Then half-hour bins in the sessions phase.
 
 ## Setup notes
 
