@@ -609,18 +609,14 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
-/// Mask words per segment: 4 KiB of input, 1.6 KiB of masks, all in L1.
-const SEGW: usize = 64;
-
 /// Calls `f` with the N fields of every well-formed line in `data[start..end]`.
 /// Lines start at `start` and none crosses `end` (the last one may lack its
 /// newline). Bytes of `data` after `end` are never interpreted.
 ///
-/// Stage 1 keeps the comma, quote and newline bitmasks of a 4 KiB segment.
-/// Stage 2 handles one line at a time from a 128-bit window of those masks
-/// taken at the line start: the newline bit gives the length, the comma count
-/// the field count, and one expression decides whether every quote wraps a
-/// whole field. Lines of 128 bytes or more take the scalar `split`.
+/// One line at a time: the comma, quote and newline bitmasks of the 128
+/// bytes at the line start give the length (first newline bit), the field
+/// count (commas below it) and, in one expression, whether every quote wraps
+/// a whole field. Lines of 128 bytes or more take the scalar `split`.
 #[inline(always)]
 pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = end - start;
@@ -628,62 +624,36 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
         return;
     }
     let base = unsafe { data.as_ptr().add(start) };
-    let avail = data.len() - start; // readable bytes from `base`
-    let nblocks = len.div_ceil(64);
     let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut cm = [0u64; SEGW + 3];
-    let mut qm = [0u64; SEGW + 3];
-    let mut nm = [0u64; SEGW + 3];
-    let mut tail = [0u8; 64];
-    let mut seg0 = usize::MAX; // block held in word 0 of the masks
     let mut ls = 0usize; // current line start
     while ls < len {
-        let blk = ls >> 6;
-        if seg0 == usize::MAX || blk - seg0 >= SEGW {
-            seg0 = blk;
-            for i in 0..SEGW + 3 {
-                let b = seg0 + i;
-                let (mut c, mut q, mut n) = (0u64, 0u64, 0u64);
-                if b < nblocks {
-                    let off = b * 64;
-                    (c, q, n) = if off + 64 <= avail {
-                        unsafe { masks64(base.add(off)) }
-                    } else {
-                        let rem = avail - off;
-                        unsafe { std::ptr::copy_nonoverlapping(base.add(off), tail.as_mut_ptr(), rem) };
-                        for x in tail[rem..].iter_mut() {
-                            *x = 0;
-                        }
-                        unsafe { masks64(tail.as_ptr()) }
-                    };
-                    if off + 64 > len {
-                        // bytes at and after `end` belong to someone else
-                        let keep = (1u64 << (len - off)) - 1;
-                        c &= keep;
-                        q &= keep;
-                        n &= keep;
-                    }
-                }
-                if b == len >> 6 {
-                    n |= 1u64 << (len & 63); // the end terminates an unfinished last line
-                }
-                cm[i] = c;
-                qm[i] = q;
-                nm[i] = n;
+        let lp = unsafe { base.add(ls) };
+        // Comma, quote and newline masks of the 128 bytes at the line start;
+        // the second word only when the first holds no newline.
+        let (c0, q0, n0, c1, q1, n1);
+        if ls + 128 <= len {
+            // all 128 bytes are inside the range (no line crosses `end`)
+            (c0, q0, n0) = unsafe { masks64(lp) };
+            (c1, q1, n1) = if n0 == 0 { unsafe { masks64(lp.add(64)) } } else { (0, 0, 0) };
+        } else {
+            // close to the end of the range: a zero-padded copy, so no byte
+            // at or after `end` is looked at; the end terminates a last line
+            // that has no newline
+            let rem = len - ls;
+            let mut tail = [0u8; 128];
+            unsafe { std::ptr::copy_nonoverlapping(lp, tail.as_mut_ptr(), rem) };
+            let (a, b, c) = unsafe { masks64(tail.as_ptr()) };
+            let (d, e, g) = unsafe { masks64(tail.as_ptr().add(64)) };
+            (c0, q0, c1, q1) = (a, b, d, e);
+            if rem < 64 {
+                n0 = c | (1u64 << rem);
+                n1 = g;
+            } else {
+                n0 = c;
+                n1 = g | (1u64 << (rem - 64));
             }
         }
-        let w = blk - seg0;
-        let sh = (ls & 63) as u32;
-        // 128 mask bits starting at the line start
-        macro_rules! win {
-            ($m:ident) => {{
-                let (a, b, c) = unsafe { (*$m.get_unchecked(w), *$m.get_unchecked(w + 1), *$m.get_unchecked(w + 2)) };
-                let lo = (a >> sh) | ((b << 1) << (63 - sh));
-                let hi = (b >> sh) | ((c << 1) << (63 - sh));
-                (lo as u128) | ((hi as u128) << 64)
-            }};
-        }
-        let nw = win!(nm);
+        let nw = (n0 as u128) | ((n1 as u128) << 64);
         if nw == 0 {
             // a line of 128 bytes or more (rare): the scalar splitter, then
             // the same single call site as the fast path so `f` is inlined once
@@ -696,9 +666,8 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
         } else {
             let ll = nw.trailing_zeros(); // line length, 0..=127
             let below = (1u128 << ll) - 1;
-            let c = win!(cm) & below;
-            let q = win!(qm) & below;
-            let lp = unsafe { base.add(ls) };
+            let c = ((c0 as u128) | ((c1 as u128) << 64)) & below;
+            let q = ((q0 as u128) | ((q1 as u128) << 64)) & below;
             ls += ll as usize + 1;
             // Quotes: with `d` = delimiters (commas and the line end), a field
             // starts after each delimiter and ends before one. Every quote must
