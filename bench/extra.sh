@@ -29,7 +29,7 @@ if [ -n "${CG_REF:-}" ]; then
   for st in ${CG_STAGES:-0}; do
     rm -rf /tmp/o; mkdir /tmp/o
     STAGE=$st NCPU=1 DATA_DIR=$HOME/dev OUTPUT_DIR=/tmp/o valgrind --tool=cachegrind --branch-sim=yes --cache-sim=no --cachegrind-out-file=/tmp/cg.out ./target/release/sessions 2>&1 | grep -E "I +refs|Branches|Mispred|rror|valgrind:" | sed "s/^/CG$st /"
-    cg_annotate /tmp/cg.out --sort=Ir --show=Ir,Bcm --annotate=yes 2>/dev/null > /tmp/ann.txt
+    (cg_annotate /tmp/cg.out --show=Ir,Bcm --annotate=yes > /tmp/ann.txt 2>/tmp/ann.err || cg_annotate /tmp/cg.out > /tmp/ann.txt 2>>/tmp/ann.err); head -5 /tmp/ann.err | sed 's/^/CGE /'; wc -l /tmp/ann.txt | sed 's/^/CGE /'
     head -70 /tmp/ann.txt | cut -c1-230 | sed "s/^/CGR$st /"
     grep -nE "^-- (Auto|User)-annotated|annotated source" /tmp/ann.txt | head -8 | sed "s/^/CGR$st /"
     awk '/annotated source/{f++} f>=1 && NR%1==0' /tmp/ann.txt | grep -E "^ *[0-9,]{9,}" | sort -t'(' -k1,1 -r | head -5 | cut -c1-200 | sed "s/^/CGS$st /"
@@ -61,4 +61,15 @@ rows.sort(key=lambda r:-r[1])
 for r in rows[:25]: print(('CGB%s ir=%%10d bcm=%%8d %%-14s %%s'%st)%r)
 PY
   done
+fi
+
+# I/O mode comparison, native, N threads: phase2 line + rusage
+if [ -n "${IO_REF:-}" ]; then
+  cd "$GITHUB_WORKSPACE"; rm -rf /tmp/t3; git worktree prune; git worktree add -f /tmp/t3 "$IO_REF" 2>&1 | tail -1; cd /tmp/t3
+  RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static" cargo build --release 2>&1 | tail -1
+  for rep in 1 2; do for m in 3 4 5; do for ds in d20; do
+    rm -rf /tmp/o; mkdir /tmp/o
+    IOMODE=$m NCPU=$N DATA_DIR=$HOME/$ds OUTPUT_DIR=/tmp/o ./target/release/sessions 2>&1 | grep -E "^(phase2|rusage|done)" | tr '\n' ' ' | sed "s/^/IO mode=$m $ds : /"; echo
+  done; done; done
+  IOMODE=5 NCPU=$N DATA_DIR=$HOME/d20 OUTPUT_DIR=/tmp/o strace -f -c -o /tmp/st.txt ./target/release/sessions >/dev/null 2>&1; head -12 /tmp/st.txt | sed 's/^/IOS /'
 fi
