@@ -1,5 +1,5 @@
 # Shopping Sessions: native Rust pipeline, static binary on an empty image.
-FROM rust:1.91-bookworm AS build
+FROM rust:1.96-bookworm AS build
 WORKDIR /src
 ARG TARGETARCH
 ARG XCPU=x86-64-v3
