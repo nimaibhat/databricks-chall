@@ -1,6 +1,6 @@
 # OVERNIGHT_LOG.md
 
-**SUBMIT THIS: `e75b17b`** (one scatter by person with tombstone dedup, new line scanner, SIMD ID packing, write-combining scatter). x86 runner, full `docker run` wall, median of 7, same run as the previous pick `e7a116f`: 20M 1.553 s vs 1.654 s, 60M 4.379 s vs 4.668 s (EPYC 9V45, 4 vCPU). About 0.49 s of each figure is fixed container start/stop on that runner, so in-process time fell from 1.17 s to 1.07 s at 20M. Passed the full gate on arm64 and on the x86-64-v3 build: 36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens; unit and fuzz tests and fixtures pass on the x86 runner; outputs equal there on both datasets. Faster candidates (date table) are being measured.
+**SUBMIT THIS: `62abf9c`** (adds the known-date timestamp table to the one-scatter pipeline). x86 runner, full `docker run` wall, median of 7, one run on an Intel Xeon 6973P-C (4 vCPU): 20M 1.851 s, 60M 5.227 s, against 1.920 / 5.418 s for its parent and 2.243 / 6.339 s for `e7a116f` (two picks ago): -17.5% at both sizes. Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); unit and fuzz tests and fixtures pass on the x86 runner; outputs equal there on both datasets. The fastest public build takes 1.139 / 3.174 s in the same run, so there is still a large gap; the sessions-phase rework is next in line.
 
 How to read the numbers: "x86" is a GitHub Actions `ubuntu-latest` runner (4 vCPU, 16 GB; CPU model varies per run, so only same-run comparisons count), timed around the whole `docker run` with the scorer's flags, variants interleaved, warm page cache. "M4" is this Mac (arm64, 10 cores), process wall. The x86 number decides.
 
@@ -32,6 +32,9 @@ Before/after pairs come from one x86 run each; absolute times differ between run
 | 4 | `cc5e2bd` | SIMD ID packing (nibble tables, shift-merge) | 2.000 / 1.939 (7763) | 5.935 / 5.760 | 0.461 / 0.456 | kept (-3.0%) |
 | 5 | `e75b17b` | Write-combining scatter with non-temporal stores, 128-byte stages, one pointer of hot state per partition | 1.591 / 1.553 (9V45) | 4.473 / 4.379 | 0.465 / 0.440 | kept (-2.4%, -2.1%; medians agree on both sizes, ranges overlap) |
 | 6 | same image as #5 | `IOMODE=4` (pread into a reused buffer) with 256 KiB and 1 MiB chunks, against mmap | 1.553 / 1.570 / 1.550 | 4.379 / 4.335 / 4.319 | n/a (Linux only) | within noise at 20M, about -1% at 60M; not switched, re-test later |
+| 7 | `62abf9c` | Known-date table for F1/F2 timestamps and `ingest_ts` | 1.920 / 1.851 (Xeon 6973P-C; ranges 1.890-2.067 / 1.840-1.910) | 5.418 / 5.227 (5.305-5.612 / 5.165-5.493) | 0.442 / 0.432 | kept (-3.6%, -3.5%) |
+| 8 | same image as #7 | `IOMODE=4 CHUNKKB=1024` (pread, 1 MiB) against mmap, second measurement | 1.851 / 1.821 | 5.227 / 5.182 | n/a | -1.6% / -0.9%, same direction as #6; a pread path that never maps the input is queued |
+| 5b | `e75b17b` | whole series #2-#5 against `e7a116f` on Intel | 2.243 / 1.920 (Xeon 6973P-C) | 6.339 / 5.418 | | -14.4% / -14.5% (Zen runs showed -6%) |
 
 ## Current phase profile (`e75b17b`)
 
@@ -54,7 +57,7 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 | Line-at-a-time split from the line's own comma/quote masks; quote validity by mask arithmetic | cherylaurelia `fast_split` (ratios 0.90 to 0.95); RESEARCH_NOTES 2.1, 4.1, 10.1 | 3 to 8% | done (experiment 3) |
 | SIMD ID packing (nibble tables + multiply-add) | Muła and Lemire base64; cherylaurelia `e3bdd51`; Vibhor exp. 2 (-8.6%) | 2 to 8% | done (experiment 4): -3% |
 | Product lookup only for purchases; hoist per-line atomic loads | micah-andelman `44f244e`; RESEARCH_NOTES 1.1, 8.2 | 1 to 2% | done: -2.3% (experiment 1) |
-| Known-date table for timestamps | RESEARCH_NOTES 1.4 | 2 to 5% of parse | queued |
+| Known-date table for timestamps | RESEARCH_NOTES 1.4, 15.3 | 2 to 5% of parse | done (experiment 7): -3.6% wall |
 | `pread` into an L2-sized buffer instead of mmap | Vibhor exp. 10 (mmap +7.5% on a VM); RESEARCH_NOTES 1.5, 3.2 | -7 to +7%, must be measured | queued |
 | Sort 8-byte keys per person; 30-minute bins | RESEARCH_NOTES 7.1, 1.6 | 2 to 4% | queued |
 | INT32 counts, reserved buffers in the Parquet writer | RESEARCH_NOTES 5 | 1 to 2% | queued |
@@ -62,9 +65,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Known-date table for timestamps (built, passes the gate, -6% single-thread parse on the Mac; x86 A/B running).
+1. Sessions phase rework (8-byte event keys, 16-byte clicks, interval assists, largest partition first): built, passes the gate, sessions -13% single-thread on the Mac; x86 A/B running.
 2. Instruction diet for the scanner's per-line part (64-bit halves, packed field offsets) and the link lookup, guided by a cachegrind line profile on x86.
-3. Sessions phase: sort 8-byte keys per person, interval assists, largest partition first; then dedup with a duplicate prefilter.
+3. Dedup with a duplicate prefilter; a pread reader that never maps the input; links built inside the final table.
 
 ## Setup notes
 
