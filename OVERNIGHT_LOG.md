@@ -1,6 +1,6 @@
 # OVERNIGHT_LOG.md
 
-**SUBMIT THIS: `62abf9c`** (adds the known-date timestamp table to the one-scatter pipeline). x86 runner, full `docker run` wall, median of 7, one run on an Intel Xeon 6973P-C (4 vCPU): 20M 1.851 s, 60M 5.227 s, against 1.920 / 5.418 s for its parent and 2.243 / 6.339 s for `e7a116f` (two picks ago): -17.5% at both sizes. Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); unit and fuzz tests and fixtures pass on the x86 runner; outputs equal there on both datasets. The fastest public build takes 1.139 / 3.174 s in the same run, so there is still a large gap; the sessions-phase rework is next in line.
+**SUBMIT THIS: `0a06317`** (adds the sessions-phase rework). x86 runner, full `docker run` wall, median of 7, one run on an Intel Xeon 8573C (4 vCPU, a slow runner): 20M 2.257 s, 60M 6.342 s, against 2.306 / 6.479 s for its parent `62abf9c` and 2.401 / 6.775 s for the pick before that; ranges do not overlap with the parent at 20M. Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); unit and fuzz tests and fixtures pass on the x86 runner; outputs equal there on both datasets. The fastest public build takes 1.430 / 4.022 s in the same run.
 
 How to read the numbers: "x86" is a GitHub Actions `ubuntu-latest` runner (4 vCPU, 16 GB; CPU model varies per run, so only same-run comparisons count), timed around the whole `docker run` with the scorer's flags, variants interleaved, warm page cache. "M4" is this Mac (arm64, 10 cores), process wall. The x86 number decides.
 
@@ -35,6 +35,8 @@ Before/after pairs come from one x86 run each; absolute times differ between run
 | 7 | `62abf9c` | Known-date table for F1/F2 timestamps and `ingest_ts` | 1.920 / 1.851 (Xeon 6973P-C; ranges 1.890-2.067 / 1.840-1.910) | 5.418 / 5.227 (5.305-5.612 / 5.165-5.493) | 0.442 / 0.432 | kept (-3.6%, -3.5%) |
 | 8 | same image as #7 | `IOMODE=4 CHUNKKB=1024` (pread, 1 MiB) against mmap, second measurement | 1.851 / 1.821 | 5.227 / 5.182 | n/a | -1.6% / -0.9%, same direction as #6; a pread path that never maps the input is queued |
 | 5b | `e75b17b` | whole series #2-#5 against `e7a116f` on Intel | 2.243 / 1.920 (Xeon 6973P-C) | 6.339 / 5.418 | | -14.4% / -14.5% (Zen runs showed -6%) |
+| 9 | `0a06317` | Sessions phase: 8-byte event keys, 16-byte clicks inside a group, interval-counted assists, largest partition first, reserved user rows | 2.306 / 2.257 (Xeon 8573C; ranges 2.299-2.336 / 2.237-2.293) | 6.479 / 6.342 (6.388-6.562 / 6.247-6.503) | sessions 0.434 / 0.376 at one thread | kept (-2.1%, -2.1%) |
+| 10 | n/a | Teammate branch `origin/saran/work` (`6ff3e77`) measured in the same run for reference | 2.459 | 7.067 | | slower than main (2.257 / 6.342); nothing to take |
 
 ## Current phase profile (`e75b17b`)
 
@@ -59,15 +61,15 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 | Product lookup only for purchases; hoist per-line atomic loads | micah-andelman `44f244e`; RESEARCH_NOTES 1.1, 8.2 | 1 to 2% | done: -2.3% (experiment 1) |
 | Known-date table for timestamps | RESEARCH_NOTES 1.4, 15.3 | 2 to 5% of parse | done (experiment 7): -3.6% wall |
 | `pread` into an L2-sized buffer instead of mmap | Vibhor exp. 10 (mmap +7.5% on a VM); RESEARCH_NOTES 1.5, 3.2 | -7 to +7%, must be measured | queued |
-| Sort 8-byte keys per person; 30-minute bins | RESEARCH_NOTES 7.1, 1.6 | 2 to 4% | queued |
+| Sort 8-byte keys per person; interval assists; 30-minute bins | RESEARCH_NOTES 7.1, 17.1, 1.6 | 2 to 4% | keys and assists done (experiment 9): -2.1%; bins not tried |
 | INT32 counts, reserved buffers in the Parquet writer | RESEARCH_NOTES 5 | 1 to 2% | queued |
 | Catalog load on a side thread; links tail concurrent with parse | RESEARCH_NOTES 8.1, 1.10 | 1 to 3% | queued |
 
 ## Next three ideas queued
 
-1. Sessions phase rework (8-byte event keys, 16-byte clicks, interval assists, largest partition first): built, passes the gate, sessions -13% single-thread on the Mac; x86 A/B running.
-2. Instruction diet for the scanner's per-line part (64-bit halves, packed field offsets) and the link lookup, guided by a cachegrind line profile on x86.
-3. Dedup with a duplicate prefilter; a pread reader that never maps the input; links built inside the final table.
+1. Find the 0.3 to 0.4 s that `docker run` takes beyond our in-process time plus the empty-container baseline (0.19 s with a tiny dataset): wall-clock stamps at process start and end are in the build being measured now.
+2. Links phase (union-find root = smallest ID, no naming pass, catalogs on a side thread): built, passes the gate, x86 A/B running together with partition-count variants.
+3. Instruction diet for the per-line path from a cachegrind line profile (1.67 G instructions for the 1M set now, 2.15 G at the start of the night), then a duplicate prefilter for dedup.
 
 ## Setup notes
 
