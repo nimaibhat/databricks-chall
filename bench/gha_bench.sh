@@ -46,7 +46,7 @@ runone() { # ds label envs keep
 pip install -q polars pyarrow >/dev/null 2>&1
 for label in ${IMG_FIX:-}; do
   rm -rf /tmp/imgbin; mkdir -p /tmp/imgbin
-  cid=$(docker create "sut:$label"); docker cp $cid:/sessions /tmp/imgbin/sessions >/dev/null; docker rm $cid >/dev/null
+  cid=$(docker create "sut:$label"); (docker cp $cid:/sessions /tmp/imgbin/sessions >/dev/null 2>&1 || docker cp $cid:/pipeline /tmp/imgbin/sessions >/dev/null); docker rm $cid >/dev/null
   git worktree prune; rm -rf /tmp/fx; ref=$(grep "^$label|" bench/variants.txt | cut -d'|' -f2); git worktree add -f /tmp/fx "$ref" -q
   (cd /tmp/fx && python3 scripts/run_fixtures.py fixtures -- /tmp/imgbin/sessions 2>&1 | tail -1 | sed "s/^/IMGFIX $label /")
   git worktree remove --force /tmp/fx
