@@ -1436,6 +1436,24 @@ So judge stage A on the x86 runner at 4 threads, with the arm64 build left on to
 - **Expected gain.** About 85 instructions per line for stage A and about 155 for all three, of about 1,575 per event line for the whole run. Vibhor7-7 got -4.4% of wall for 85 of 650, so expect about -2% for stage A and -3 to -4% for all three on the runner, and about half of that on the board (25.2).
 - **Risk to exactness.** Stage A: low; acceptance is decided by the unchanged `bad` test and only boundaries of accepted lines are recomputed. Stages B and C: medium (scanner); `fuzz_scan`, `fuzz_scan_events`, `exhaustive_small` and `scan_subrange` cover them unchanged.
 
+## Iteration 35 (2026-11-21, 03:00): the fastest builds' own phase timings on the same x86 runner
+
+Run [44881605462](https://github.com/nimaibhat/databricks-chall/actions/runs/44881605462) on `bench-ext` (EPYC 9V74, 4 vCPU, median of 5 at 20M and 3 at 60M, outputs all equal). Walls: cherylaurelia 1.145 / 3.253, Vibhor7-7 1.421 / 4.022, ours (`a88caa3` code) 1.490 / 4.670, micah-andelman `2b46b02` 1.844 / 5.515, joch44 `3261746` 1.853 / 6.352. The bench now prints each build's stderr once per dataset; competitor phases below are from that one (first, slightly slow) run, ours are medians.
+
+| Phase, 20M, seconds | ours | cherylaurelia | Vibhor7-7 |
+|---|---|---|---|
+| small tables + links | 0.078 | 0.033 | 0.044 |
+| parse | 0.766 | 0.583 | 0.636 |
+| dedup | 0.069 | 0.063 | 0.070 |
+| sessions + output | 0.241 | 0.206 | 0.207 |
+| in-process total | 1.154 | 0.885 | 0.960 |
+| wall minus in-process | 0.29 (pre 0.11, post 0.18) | 0.29 | 0.46 |
+
+- **The gap to cherylaurelia is in-process only, and two thirds of it is parse**: parse 0.18 s, links 0.045 s, sessions and output 0.035 s, dedup nothing. Time outside the process is now equal to cherylaurelia's, so the output shrink has closed that part; Vibhor7-7 (78 MB of PLAIN output) loses 0.17 s there and is slower than us at the wall on some runs for that reason alone.
+- **Links is the cheapest remaining 4%.** Ours prints `parse 24.5, intern 46.9, xlate 69.7, union 90.3, total 106 ms` on the first run (0.078 median) plus `catalogs 21 ms`; Vibhor7-7 prints `catalog done at 8.4 ms; link parse 8.8, join 16.2, name 16.7 ms` (0.044 s for the phase), cherylaurelia 0.033 s for catalogs and links together. At 60M Vibhor7-7's links are 0.131 s against our 0.273 s. Entry 36 looks at why.
+- **Dedup and sessions are at parity**; half-hour bins (rank 3) can gain at most the 0.035 s difference unless it beats both competitors.
+- At 60M: cherylaurelia in-process 4.151 s on its first run (0.885 s of it before parse, a cold start), Vibhor7-7 3.113 s (links 0.131, parse 2.079, dedup 0.168, people 0.731); ours 4.05 s (0.273, 2.791, 0.202, 0.694 + 0.085).
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
