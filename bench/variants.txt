@@ -1,5 +1,4 @@
 # label|ref|build-args|env
-s45|origin/gate-s45-26e5993||
-s45pf2|origin/gate-s45pf2-26e5993||PREFAULT=2
-s45pf1|origin/gate-s45pf1-26e5993||PREFAULT=1
-s45pf0|origin/gate-s45pf0-26e5993||PREFAULT=0
+main|origin/gate-main-8780fbb||
+cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+vibhor|ext:Vibhor7-7/shopping-sessions||
