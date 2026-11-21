@@ -1,2 +1,7 @@
 # label|ref|build-args|env
-s15b|origin/gate-s15b-eddebd8||
+s15|origin/gate-s15-214dcb1||
+s17|origin/gate-s17-a4d7175||
+s17io5|origin/gate-s17io5-a4d7175||IOMODE=5
+s17io5c256|origin/gate-s17io5c256-a4d7175||IOMODE=5 CHUNKKB=256
+s17io5c1m|origin/gate-s17io5c1m-a4d7175||IOMODE=5 CHUNKKB=1024
+cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
