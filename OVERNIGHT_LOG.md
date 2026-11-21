@@ -39,6 +39,17 @@ So the second hyperthread takes parse from 194.6 to 159.2 (18% less time, 1.22x)
 
 Note on the VM: it was stopped at 13:50 and restarted at 14:05 (new host). Since then the same binary reads about 1.5 ms higher at the median and the maximum of a set is 215 to 217 where it was 209 to 211. Minimums are unchanged. Anything under 2 ms cannot be told from noise on this host at 15 rounds.
 
+Experiment 14 (research row 1, 14.1): which part of experiment 9 costs time on larger inputs. Binaries: `base` 941879e; `cand` 801982c (all three); `safe` = bucket 2^15 with the 64 MiB chunk and 512 B prefetch kept (branch `safe-constants`, commit 06ddf5389663c4b36f8dafb8e74e70600113a3ce, gate clean: 36/36, dev and seed 20 match); single parts built on `base`. Wall min / med, then parse and ev3a minimums.
+
+| Events | base | cand (all three) | safe (chunk + prefetch) | bucket 2^14 only | chunk only | prefetch only |
+|---|---|---|---|---|---|---|
+| 20M seed 20, 15 rounds | 212.1 / 216.9 | 208.1 / 215.4 | 210.2 / 215.7 | | | |
+| 20M seed 7, 15 rounds | 215.6 / 220.1 | 212.2 / 217.2 | 213.7 / 217.8 | | | |
+| 30M seed 6, 11 rounds | 314.7 / 322.3 (parse 239.5, ev3a 54.2) | 319.3 / 322.9 (248.2, 48.7) | 313.5 / 319.0 (238.7, 53.7) | | | |
+| 40M seed 5, 9 rounds | 419.1 / 426.0 (324.0, 69.7) | 434.9 / 440.7 (344.7, 63.6) | 422.1 / 426.3 (326.0, 69.9) | 436.3 / 441.9 (345.5, 63.6) | 424.3 / 426.3 | 420.8 / 425.4 |
+
+Result: the research reading is right, it is the bucket size alone. Bucket 2^14 saves about 3.5 ms of ev3a at 20M and costs nothing in parse there; at 30M it costs parse 9 and saves ev3a 5.5 (net +4.6 at the minimum, level at the median); at 40M parse +21, ev3a -6 (net +15). The crossover is near 25M events. Chunk and prefetch are neutral to slightly good at every size. Main stays on 801982c (best at 20M, the reported size); `safe-constants` is the pick if the hidden set is thought to be 30M or more. The host is noisy today (maxima to 254), so the 20M minimums carry the comparison.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
