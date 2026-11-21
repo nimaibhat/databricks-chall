@@ -88,6 +88,7 @@ From experiment 27 on, the bench drops the page cache before each dataset: with 
 | 54 | not merged | Sessions without the per-person sort: counting pass by half-hour bin, stable counting pass by person, sessions from bin runs (differential test against sorted sessions passes) | 1.343 / 1.349 (7763; sessions 0.284 -> 0.292); 1.300 / 1.282 (Xeon 8573C; 0.263 -> 0.260) | 3.638 / 3.662 (0.868 -> 0.885) ; 3.374 / 3.386 | sessions 0.447 / 0.422 at one thread | rejected: the extra pass costs what the sort saved (slower on Zen 3, level on the Xeon) |
 | 55 | not committed | Link build around one concurrent ID table (no shard lists, no interning pass) | not run | not run | ID translation 57 ms against 13 ms for intern + translate at 20M; 185 against 41 ms at 60M | rejected on the Mac: a table larger than the cache loses to the per-shard maps |
 | 56 | not merged | SIMD ID packing in the link parser, measured on x86 this time | 1.467 / 1.460 and 1.446 / 1.442 (Xeon 8573C, two runs) | 3.884 / 3.886 and 3.850 / 3.852 | | rejected: no difference (link parse at 60M stays 95 to 107 ms on that Xeon) |
+| 57 | not merged | Link build's pair and key lists in arena blocks (huge pages, write-combined), 128 interning shards | 1.511 / 1.508 (Xeon 8573C); 1.095 / 1.118 (9V74, a noisy run) | 3.996 / 3.971 (links 0.370 -> 0.347); 3.147 / 3.299 (ranges 2.993-3.797 / 3.034-3.337) | links 148 / 136 ms at 60M | rejected: -0.6% at 60M on the Xeon is inside the range, nothing on Zen 4 |
 
 ## Current phase profile (`dc58e98`)
 
