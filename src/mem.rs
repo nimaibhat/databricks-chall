@@ -4,7 +4,7 @@
 //! phase become the output buffers of the next without touching fresh pages.
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const BLK: usize = 8 * 1024;
+pub const BLK: usize = 16 * 1024;
 
 pub struct Arena {
     base: *mut u8,
