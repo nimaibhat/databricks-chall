@@ -101,6 +101,10 @@ Experiment 18, on 9363748 (`v21p`). All rejected; main unchanged.
 
 Stages at 20M seed 20: write 7.2 to 5.3, ev3a 34.0 to 36.0, parse level. On this VM the two cancel: -2 to +1 ms, inside the noise. Not kept on main. `j3s` is on branch `upstream-c7d4aa4` (d3e8178) so it can be tried on the scorer, where the output directory may cost differently from this VM's disk.
 
+Experiment 19: build-time constants on 9363748, one at a time, seed 20, 6 rounds, wall min / med (control 196.9 / 199.2). `XL_UB` 11: 196.2 / 197.6, 13: 200.1 / 201.1. `XL_SLABROWS` 12: 197.0 / 199.4, 14: 197.3 / 199.8. `XL_XRC` 2: 198.4 / 199.7, 8: 196.8 / 199.9. `XL_SPIN_DEF` 100: 196.2 / 199.7, 1500: 195.4 / 199.2. `XL_HEAVY_DIV` 2: 195.9 / 197.9, 8: 198.7 / 200.1. `XL_DONATE_DEF` 8: 197.9 / 199.0, 32: 198.9 / 200.1. `XL_SHCH=1`: 221.3 / 228.2 (parse +25). `XL_CKPF` 0: 196.9 / 200.0, 2: 199.3 / 200.2. `XL_R12NULL=1`: 199.6 / 200.6. `XL_DEC2=0`: 198.1 / 200.6 (ev3a +1.4). `XL_RELK_DEF` 4: 198.1 / 200.7, 16: 199.1 / 200.5. `XL_SPLIT_PER` 4: 199.4 / 200.1, 8: 197.5 / 199.3. `XL_LSD_MIN` 1024: 198.0 / 200.0, 4096: 195.7 / 199.1. `XL_CXRDIV` 32: 198.4 / 200.2, 128: 198.7 / 199.8.
+
+The four best re-run at 15 rounds: seed 20 control 195.7 / 199.8, UB=11 195.0 / 197.9, HEAVY_DIV=2 196.2 / 200.0, LSD_MIN=4096 196.9 / 199.5, SPIN_DEF=1500 196.5 / 199.8; seed 7 control 198.9 / 202.8, UB=11 198.6 / 202.4, HEAVY_DIV=2 201.0 / 203.6, LSD_MIN=4096 200.2 / 203.4, SPIN_DEF=1500 201.0 / 202.9. Nothing reaches 1 ms on both seeds. All rejected; the defaults stay.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
