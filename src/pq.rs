@@ -1,20 +1,95 @@
-//! Minimal Parquet writer: one row group, one PLAIN uncompressed v1 data page
-//! per column, Thrift compact metadata. Supports required BYTE_ARRAY (UTF8),
-//! optional BYTE_ARRAY (UTF8), required INT32 (DATE) and required INT64.
+//! Minimal Parquet writer: one row group, uncompressed, v1 data pages, Thrift
+//! compact metadata, no statistics. A column is either PLAIN, or dictionary
+//! encoded (a PLAIN dictionary page followed by data pages of RLE /
+//! bit-packed dictionary indices), which is what every Parquet writer emits
+//! by default and so what every reader handles.
 use std::io::Write;
 
-pub enum Data {
-    /// strings as concatenated bytes + end offsets; `def` = Some(levels) for optional
-    Str { bytes: Vec<u8>, ends: Vec<u32>, def: Option<Vec<bool>> },
-    Date(Vec<i32>),
+/// PLAIN-encodable values.
+pub enum Values {
+    /// strings as concatenated bytes + end offsets
+    Str { bytes: Vec<u8>, ends: Vec<u32> },
     I32(Vec<i32>),
     I64(Vec<i64>),
 }
 
+impl Values {
+    fn len(&self) -> usize {
+        match self {
+            Values::Str { ends, .. } => ends.len(),
+            Values::I32(v) => v.len(),
+            Values::I64(v) => v.len(),
+        }
+    }
+    fn plain_size(&self) -> usize {
+        match self {
+            Values::Str { bytes, ends } => bytes.len() + ends.len() * 4,
+            Values::I32(v) => v.len() * 4,
+            Values::I64(v) => v.len() * 8,
+        }
+    }
+    fn write_plain(&self, out: &mut Vec<u8>) {
+        match self {
+            Values::Str { bytes, ends } => {
+                let mut s = 0usize;
+                for &e in ends {
+                    let e = e as usize;
+                    out.extend_from_slice(&((e - s) as u32).to_le_bytes());
+                    out.extend_from_slice(&bytes[s..e]);
+                    s = e;
+                }
+            }
+            Values::I32(v) => {
+                for x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            Values::I64(v) => {
+                for x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }
+    }
+    fn ptype(&self) -> i32 {
+        match self {
+            Values::Str { .. } => TYPE_BYTE_ARRAY,
+            Values::I32(_) => TYPE_INT32,
+            Values::I64(_) => TYPE_INT64,
+        }
+    }
+}
+
+/// Dictionary indices of the non-null values, in row order.
+pub enum Idx {
+    /// (index, repeat count) runs; written as RLE runs in one page
+    Runs(Vec<(u32, u32)>),
+    /// one index per value; written bit-packed, in pages of PAGE_ROWS values
+    /// so that a few large indices do not widen every value
+    Each(Vec<u32>),
+}
+
+pub enum Enc {
+    Plain(Values),
+    Dict { dict: Values, idx: Idx },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Logical {
+    None,
+    Utf8,
+    Date,
+}
+
 pub struct Column {
     pub name: &'static str,
-    pub data: Data,
+    pub logical: Logical,
+    /// Some(present flags) for an optional column; values cover present rows only
+    pub def: Option<Vec<bool>>,
+    pub enc: Enc,
 }
+
+const PAGE_ROWS: usize = 16384;
 
 // ---- thrift compact protocol
 struct T {
@@ -91,18 +166,48 @@ impl T {
 const TYPE_INT32: i32 = 1;
 const TYPE_INT64: i32 = 2;
 const TYPE_BYTE_ARRAY: i32 = 6;
+const ENC_PLAIN: i32 = 0;
+const ENC_PLAIN_DICTIONARY: i32 = 2;
+const ENC_RLE: i32 = 3;
 
-fn rle_levels(def: &[bool], out: &mut Vec<u8>) {
-    // RLE/bit-packed hybrid, bit width 1, as bit-packed groups of 8 values.
-    let groups = def.len().div_ceil(8);
-    let mut body = Vec::with_capacity(groups + 8);
-    // header: (number of groups << 1) | 1, varint
-    let mut h = ((groups as u64) << 1) | 1;
-    while h >= 0x80 {
-        body.push((h as u8) | 0x80);
-        h >>= 7;
+fn varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
     }
-    body.push(h as u8);
+    out.push(v as u8);
+}
+
+/// Bits needed for values up to `max` (at least 1).
+fn width(max: u32) -> u32 {
+    (32 - max.leading_zeros()).max(1)
+}
+
+/// RLE / bit-packed hybrid: `vals` as bit-packed groups of 8, width `w`.
+fn bit_packed(vals: &[u32], w: u32, out: &mut Vec<u8>) {
+    let groups = vals.len().div_ceil(8);
+    varint(out, ((groups as u64) << 1) | 1);
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
+    for i in 0..groups * 8 {
+        let v = if i < vals.len() { vals[i] as u64 } else { 0 };
+        acc |= v << nbits;
+        nbits += w;
+        while nbits >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            nbits -= 8;
+        }
+    }
+    debug_assert!(nbits == 0); // 8 values of w bits are a whole number of bytes
+}
+
+/// Definition levels (bit width 1) with their 4-byte length prefix.
+fn def_levels(def: &[bool], out: &mut Vec<u8>) {
+    let at = out.len();
+    out.extend_from_slice(&[0; 4]);
+    let groups = def.len().div_ceil(8);
+    varint(out, ((groups as u64) << 1) | 1);
     for g in 0..groups {
         let mut byte = 0u8;
         for i in 0..8 {
@@ -111,78 +216,129 @@ fn rle_levels(def: &[bool], out: &mut Vec<u8>) {
                 byte |= 1 << i;
             }
         }
-        body.push(byte);
+        out.push(byte);
     }
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&body);
+    let n = (out.len() - at - 4) as u32;
+    out[at..at + 4].copy_from_slice(&n.to_le_bytes());
+}
+
+fn data_page_header(size: usize, rows: usize, encoding: i32) -> Vec<u8> {
+    let mut h = T::new();
+    h.i32(1, 0); // DATA_PAGE
+    h.i32(2, size as i32);
+    h.i32(3, size as i32);
+    h.begin(5);
+    h.i32(1, rows as i32);
+    h.i32(2, encoding);
+    h.i32(3, ENC_RLE);
+    h.i32(4, ENC_RLE);
+    h.end();
+    h.b.push(0);
+    h.b
 }
 
 pub fn write(path: &std::path::Path, cols: &[Column], rows: usize) -> std::io::Result<()> {
-    // everything is built in one buffer of known size and written once
+    // everything is built in one buffer and written once
     let est: usize = cols
         .iter()
-        .map(|c| match &c.data {
-            Data::Str { bytes, ends, .. } => bytes.len() + ends.len() * 4 + ends.len() / 8 + 64,
-            Data::Date(v) | Data::I32(v) => v.len() * 4 + 64,
-            Data::I64(v) => v.len() * 8 + 64,
+        .map(|c| {
+            (match &c.enc {
+                Enc::Plain(v) => v.plain_size(),
+                Enc::Dict { dict, idx } => {
+                    dict.plain_size()
+                        + match idx {
+                            Idx::Runs(r) => r.len() * 6,
+                            Idx::Each(v) => v.len() * 4,
+                        }
+                }
+            }) + rows / 8
+                + 4096
         })
         .sum();
     let mut file: Vec<u8> = Vec::with_capacity(est + 4096);
     file.extend_from_slice(b"PAR1");
     struct Meta {
-        offset: i64,
+        offset: i64, // first page of the chunk
+        data_offset: i64,
+        dict_offset: Option<i64>,
         size: i64,
         ty: i32,
     }
     let mut metas = Vec::new();
+    let mut page: Vec<u8> = Vec::new();
     for c in cols {
-        let mut page: Vec<u8> = Vec::new();
-        let ty = match &c.data {
-            Data::Str { bytes, ends, def } => {
-                if let Some(d) = def {
-                    rle_levels(d, &mut page);
+        let offset = file.len() as i64;
+        let (ty, data_offset, dict_offset) = match &c.enc {
+            Enc::Plain(v) => {
+                page.clear();
+                if let Some(d) = &c.def {
+                    def_levels(d, &mut page);
                 }
-                page.reserve(bytes.len() + ends.len() * 4);
-                let mut s = 0usize;
-                for &e in ends {
-                    let e = e as usize;
-                    page.extend_from_slice(&((e - s) as u32).to_le_bytes());
-                    page.extend_from_slice(&bytes[s..e]);
-                    s = e;
-                }
-                TYPE_BYTE_ARRAY
+                v.write_plain(&mut page);
+                file.extend_from_slice(&data_page_header(page.len(), rows, ENC_PLAIN));
+                file.extend_from_slice(&page);
+                (v.ptype(), offset, None)
             }
-            Data::Date(v) | Data::I32(v) => {
-                page.reserve(v.len() * 4);
-                for x in v {
-                    page.extend_from_slice(&x.to_le_bytes());
+            Enc::Dict { dict, idx } => {
+                // dictionary page
+                let mut h = T::new();
+                h.i32(1, 2); // DICTIONARY_PAGE
+                h.i32(2, dict.plain_size() as i32);
+                h.i32(3, dict.plain_size() as i32);
+                h.begin(7);
+                h.i32(1, dict.len() as i32);
+                h.i32(2, ENC_PLAIN_DICTIONARY);
+                h.end();
+                h.b.push(0);
+                file.extend_from_slice(&h.b);
+                dict.write_plain(&mut file);
+                let data_offset = file.len() as i64;
+                match idx {
+                    Idx::Runs(runs) => {
+                        page.clear();
+                        if let Some(d) = &c.def {
+                            def_levels(d, &mut page);
+                        }
+                        let w = width(runs.iter().map(|r| r.0).max().unwrap_or(0));
+                        let nb = w.div_ceil(8) as usize;
+                        page.push(w as u8);
+                        for &(v, n) in runs {
+                            varint(&mut page, (n as u64) << 1);
+                            page.extend_from_slice(&v.to_le_bytes()[..nb]);
+                        }
+                        file.extend_from_slice(&data_page_header(page.len(), rows, ENC_PLAIN_DICTIONARY));
+                        file.extend_from_slice(&page);
+                    }
+                    Idx::Each(v) => {
+                        if c.def.is_some() || v.is_empty() {
+                            // one page: the levels cover all rows
+                            page.clear();
+                            if let Some(d) = &c.def {
+                                def_levels(d, &mut page);
+                            }
+                            let w = width(v.iter().copied().max().unwrap_or(0));
+                            page.push(w as u8);
+                            if !v.is_empty() {
+                                bit_packed(v, w, &mut page);
+                            }
+                            file.extend_from_slice(&data_page_header(page.len(), rows, ENC_PLAIN_DICTIONARY));
+                            file.extend_from_slice(&page);
+                        } else {
+                            for part in v.chunks(PAGE_ROWS) {
+                                page.clear();
+                                let w = width(part.iter().copied().max().unwrap_or(0));
+                                page.push(w as u8);
+                                bit_packed(part, w, &mut page);
+                                file.extend_from_slice(&data_page_header(page.len(), part.len(), ENC_PLAIN_DICTIONARY));
+                                file.extend_from_slice(&page);
+                            }
+                        }
+                    }
                 }
-                TYPE_INT32
-            }
-            Data::I64(v) => {
-                page.reserve(v.len() * 8);
-                for x in v {
-                    page.extend_from_slice(&x.to_le_bytes());
-                }
-                TYPE_INT64
+                (dict.ptype(), data_offset, Some(offset))
             }
         };
-        // page header
-        let mut h = T::new();
-        h.i32(1, 0); // DATA_PAGE
-        h.i32(2, page.len() as i32);
-        h.i32(3, page.len() as i32);
-        h.begin(5);
-        h.i32(1, rows as i32);
-        h.i32(2, 0); // PLAIN
-        h.i32(3, 3); // RLE
-        h.i32(4, 3); // RLE
-        h.end();
-        h.b.push(0);
-        let offset = file.len() as i64;
-        file.extend_from_slice(&h.b);
-        file.extend_from_slice(&page);
-        metas.push(Meta { offset, size: (h.b.len() + page.len()) as i64, ty });
+        metas.push(Meta { offset, data_offset, dict_offset, size: file.len() as i64 - offset, ty });
     }
     // file metadata
     let mut t = T::new();
@@ -192,25 +348,27 @@ pub fn write(path: &std::path::Path, cols: &[Column], rows: usize) -> std::io::R
     t.str(4, "schema");
     t.i32(5, cols.len() as i32);
     t.end();
-    for c in cols {
+    for (c, m) in cols.iter().zip(metas.iter()) {
         t.begin_elem();
-        let (ty, rep, conv, logical) = match &c.data {
-            Data::Str { def, .. } => (TYPE_BYTE_ARRAY, if def.is_some() { 1 } else { 0 }, Some(0), Some(1)),
-            Data::Date(_) => (TYPE_INT32, 0, Some(6), Some(6)),
-            Data::I32(_) => (TYPE_INT32, 0, None, None),
-            Data::I64(_) => (TYPE_INT64, 0, None, None),
-        };
-        t.i32(1, ty);
-        t.i32(3, rep);
+        t.i32(1, m.ty);
+        t.i32(3, if c.def.is_some() { 1 } else { 0 });
         t.str(4, c.name);
-        if let Some(cv) = conv {
-            t.i32(6, cv);
-        }
-        if let Some(lt) = logical {
-            t.begin(10);
-            t.begin(lt); // StringType (1) / DateType (6): empty structs
-            t.end();
-            t.end();
+        match c.logical {
+            Logical::Utf8 => {
+                t.i32(6, 0);
+                t.begin(10);
+                t.begin(1); // StringType: empty struct
+                t.end();
+                t.end();
+            }
+            Logical::Date => {
+                t.i32(6, 6);
+                t.begin(10);
+                t.begin(6); // DateType: empty struct
+                t.end();
+                t.end();
+            }
+            Logical::None => {}
         }
         t.end();
     }
@@ -224,9 +382,16 @@ pub fn write(path: &std::path::Path, cols: &[Column], rows: usize) -> std::io::R
         t.i64(2, m.offset);
         t.begin(3);
         t.i32(1, m.ty);
-        t.list(2, CT_I32, 2);
-        t.zz(0); // PLAIN
-        t.zz(3); // RLE
+        if m.dict_offset.is_some() {
+            t.list(2, CT_I32, 3);
+            t.zz(ENC_PLAIN as i64);
+            t.zz(ENC_RLE as i64);
+            t.zz(ENC_PLAIN_DICTIONARY as i64);
+        } else {
+            t.list(2, CT_I32, 2);
+            t.zz(ENC_PLAIN as i64);
+            t.zz(ENC_RLE as i64);
+        }
         t.list(3, CT_BIN, 1);
         t.varint(c.name.len() as u64);
         t.b.extend_from_slice(c.name.as_bytes());
@@ -234,7 +399,10 @@ pub fn write(path: &std::path::Path, cols: &[Column], rows: usize) -> std::io::R
         t.i64(5, rows as i64);
         t.i64(6, m.size);
         t.i64(7, m.size);
-        t.i64(9, m.offset);
+        t.i64(9, m.data_offset);
+        if let Some(d) = m.dict_offset {
+            t.i64(11, d);
+        }
         t.end();
         t.end();
     }
