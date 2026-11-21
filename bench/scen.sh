@@ -9,20 +9,22 @@ RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 rm -rf /tmp/o; mkdir /tmp/o
 NCPU=1 DATA_DIR=$HOME/dev OUTPUT_DIR=/tmp/o valgrind --tool=cachegrind --branch-sim=yes --cache-sim=no --cachegrind-out-file=/tmp/cg.out ./target/release/sessions 2>&1 | grep -E "I +refs|Branches|Mispred" | sed 's/^/CG /'
 cg_annotate /tmp/cg.out --sort=Ir --show=Ir,Bcm --annotate=yes 2>/dev/null > /tmp/ann.txt
+grep -n "annotated source" /tmp/ann.txt | head -5 | sed 's/^/CG hdr /'
 python3 - <<'PY'
 import re
 cur=''
 rows=[]
 for l in open('/tmp/ann.txt',errors='replace'):
-    m=re.match(r'-- Auto-annotated source: (.*)',l)
-    if m: cur=m.group(1).split('/')[-1]; continue
-    m=re.match(r'\s*([\d,]+) \(\s*[\d.]+%\)\s+([\d,]+|\.)( \(\s*[\d.]+%\))?\s\s(.*)',l)
-    if m and cur:
-        ir=int(m.group(1).replace(',','')); b=m.group(2); b=0 if b=='.' else int(b.replace(',',''))
-        rows.append((ir,b,cur,m.group(4).strip()[:120]))
+    if 'annotated source' in l: cur=l.strip().split('/')[-1][:12]; continue
+    m=re.match(r'\s*([\d,]+)(?: \(\s*[\d.]+%\))?\s+([\d,]+|\.)?(?: \(\s*[\d.]+%\))?\s*(.*)',l)
+    if m and cur and m.group(1):
+        try: ir=int(m.group(1).replace(',',''))
+        except: continue
+        b=m.group(2); b=0 if b in (None,'.') else int(b.replace(',',''))
+        if ir>=1500000 or b>=40000: rows.append((ir,b,cur,m.group(3).strip()[:120]))
 rows.sort(reverse=True)
-for r in rows[:110]: print('CG ir=%10d bcm=%8d %-10s %s'%r)
+for r in rows[:120]: print('CG ir=%10d bcm=%8d %-12s %s'%r)
 print('CG ==== by bcm')
 rows.sort(key=lambda r:-r[1])
-for r in rows[:40]: print('CG ir=%10d bcm=%8d %-10s %s'%r)
+for r in rows[:40]: print('CG ir=%10d bcm=%8d %-12s %s'%r)
 PY
