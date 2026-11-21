@@ -81,6 +81,8 @@ From experiment 27 on, the bench drops the page cache before each dataset: with 
 | 47 | `ee47af4` | Partition counts by input size: 1024/1024 at 60M (512/512 stays at 20M); measured first as `P1BITS`/`P2BITS` variants | 1.359 / 1.357 and 1.368 / 1.361 (7763, two runs) | 3.762 / 3.696 and 3.788 / 3.697 (dedup 0.240 -> 0.200, sessions 0.950 -> 0.892) | | kept for large inputs (-1.8% / -2.4% at 60M); `P2BITS=11` no better (3.712 / 3.747) |
 | 48 | `dc58e98` | Arena pre-fault on the idle threads during the serial union-find (`MADV_POPULATE_WRITE`), default on for Intel CPUs only | on / off in one image: 1.129 / 1.165 (Xeon 6975P-C), 1.442 / 1.463 (Xeon 8370C), 1.108 / 1.097 (EPYC 9V74) | 3.061 / 3.198, 3.934 / 3.978, 3.029 / 2.994 | n/a (Linux) | kept on Intel (-1.4% to -4.3%), off on AMD (+1%) |
 | 49 | `dc58e98` | #47 + #48 with a regenerated profile against the previous pick (final check, image gates) | 1.461 / 1.442 (Xeon 8370C); 1.353 / 1.364 (7763; same code path measured 1.352 in that run) | 4.122 / 3.934 ; 3.709 / 3.663 | | kept (-1.3% / -4.6% on Ice Lake, -1.2% at 60M on Zen 3) |
+| 50 | not merged | `PREFAULT=2`: finish the arena pre-fault on all threads right before the parse (after the union-find window) | 1.496 / 1.479 (Xeon 8573C, n=7; ranges 1.491-1.615 / 1.472-1.530); 1.094 / 1.097 (9V74) | 3.981 / 3.960 ; 2.952 / 2.991 | n/a | rejected: inside the range on Intel, nothing on AMD. Same run, pre-fault as merged against off on the Xeon 8573C: 1.521 -> 1.496 s and 4.058 -> 3.981 s (third Intel model with a gain) |
+| 51 | not committed | SIMD ID packing in the link parser instead of the scalar packer | not run | not run | link parse 11.5-13 ms both ways | rejected on the Mac: no difference (the link parse is bound by its list pushes, not by packing) |
 
 ## Current phase profile (`dc58e98`)
 
@@ -113,7 +115,7 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Pre-fault more than the union-find window allows on Intel: finish the estimated arena in parallel right before the parse (the bulk zeroing costs far less than the same zeroing at first touch inside the parse loop, experiment 48), as a `PREFAULT=2` variant.
+1. Sessions phase on small-L2 CPUs (0.30 s at 20M and 0.91 s at 60M on Ice Lake, a quarter of in-process time): the per-thread campaign-day array is 900 KB of 32-byte cells hit once or twice per session; 16- or 20-byte cells would keep it in L2.
 2. The link build on Ice Lake is 0.12 s at 20M and 0.37 s at 60M (0.08 / 0.25 s on Zen 3): the serial union-find and the shard interning are the candidates; union-find on the table's own slots (RESEARCH_NOTES 36).
 3. Remaining parse items from RESEARCH_NOTES 38/39 (fourth 32-byte mask block only when needed, fewer hash evaluations in dedup). Every source change needs a regenerated profile (`PGO_REF`) and the image-binary gate before it can replace the pick.
 
