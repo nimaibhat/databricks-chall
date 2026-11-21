@@ -39,6 +39,8 @@ jobs:
           python3 scripts/run_fixtures.py fixtures -- ./target/release/sessions 2>&1 | tail -1 | sed 's/^/X86FIX /'
       - name: bench
         run: bash bench/gha_bench.sh
+      - name: user and system time
+        run: bash bench/sys.sh
       - name: perf
         run: bash bench/perf.sh
       - name: extra

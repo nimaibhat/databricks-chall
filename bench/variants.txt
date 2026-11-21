@@ -1,11 +1,4 @@
 # label|ref|build-args|env
 ours|origin/main||
 cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
-juan|ext:JuanQuenga/buildathon-shopping-sessions@5f6718c||
-zlyuan|ext:zlyuan9/shopping-sessions@cf57464||
-recinos|ext:AndrewRecinos/shopping-sessions@e276166||
-brito|ext:Britogus7/Shopping-Sessions@bf00497||
-ruza|ext:Louise-Ruza/shopping-sessions@247fdc3||
-thalor|ext:himanshu-thalor/shopping-sessions@01ba5ce||
-warrior|ext:Warrior-hound/shopping-sessions@c7e9a33||
-kenneth|ext:KennethLei1492/Databricks---Shopping-Sessions@7315a2a||
+vibhor|ext:Vibhor7-7/shopping-sessions@765c6e2||
