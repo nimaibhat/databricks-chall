@@ -1,6 +1,5 @@
 # label|ref|build-args|env
-main|origin/gate-main-31ef320||
-s44p|origin/gate-s44p-b5ad931||
-s44p_pf1|origin/gate-s44p_pf1-b5ad931||PREFAULT=1
-s44p_pf0|origin/gate-s44p_pf0-b5ad931||PREFAULT=0
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+s45|origin/gate-s45-26e5993||
+s45pf2|origin/gate-s45pf2-26e5993||PREFAULT=2
+s45pf1|origin/gate-s45pf1-26e5993||PREFAULT=1
+s45pf0|origin/gate-s45pf0-26e5993||PREFAULT=0
