@@ -23,5 +23,5 @@ rm -rf /tmp/t2; git -C $W worktree prune; git -C $W worktree add -f /tmp/t2 orig
 one ours /tmp/t2 sessions
 rm -rf /tmp/c1; git clone -q https://github.com/cherylaurelia/builders-hackathon /tmp/c1 && git -C /tmp/c1 checkout -q 2e4261f
 one cheryl /tmp/c1 sessions
-rm -rf /tmp/c2; git clone -q https://github.com/Vibhor7-7/shopping-sessions /tmp/c2 && git -C /tmp/c2 checkout -q bee0cbf
+rm -rf /tmp/c2; git clone -q https://github.com/Vibhor7-7/shopping-sessions /tmp/c2 && git -C /tmp/c2 checkout -q 765c6e2
 one vibhor /tmp/c2 pipeline --bin pipeline
