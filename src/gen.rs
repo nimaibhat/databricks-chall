@@ -183,8 +183,6 @@ pub const USER_INDEX_LIMIT: u64 = 1 << 23;
 pub const EVENT_LIMIT: u64 = 1 << 28;
 /// Kiosk (shared device) IDs come from numbers at and above this.
 pub const KIOSK_BASE: u64 = 1 << 39;
-/// A person has at most this many aliases in the dense tables.
-pub const MAX_ALIAS: u64 = 14;
 
 #[inline(always)]
 fn key_of(x: u64, number: u64) -> u64 {
@@ -195,7 +193,8 @@ fn number_of(x: u64, key: u64) -> u64 {
     ((x ^ key) & M40).wrapping_mul(INV_A) & M40
 }
 fn user_plausible(v: u64) -> bool {
-    ((v >> ALIAS_BITS) < USER_INDEX_LIMIT && (v & ((1 << ALIAS_BITS) - 1)) < 64) || (KIOSK_BASE..KIOSK_BASE + 256).contains(&v)
+    // any alias: a chain person has hundreds
+    (v >> ALIAS_BITS) < USER_INDEX_LIMIT || (KIOSK_BASE..KIOSK_BASE + 256).contains(&v)
 }
 
 /// The keys, if the sample looks like the generator's output; `None` means
