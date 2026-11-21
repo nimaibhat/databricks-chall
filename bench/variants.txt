@@ -1,2 +1,7 @@
 # label|ref|build-args|env
-s22c|origin/gate-s22c-82942b4||
+s22|origin/gate-s22-07eeb0c||
+s23|origin/gate-s23-3bc664d||
+s23p88|origin/gate-s23p88-3bc664d||P1BITS=8 P2BITS=8
+s23p89|origin/gate-s23p89-3bc664d||P1BITS=8 P2BITS=9
+s23p98|origin/gate-s23p98-3bc664d||P1BITS=9 P2BITS=8
+cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
