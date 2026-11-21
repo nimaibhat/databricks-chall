@@ -1081,6 +1081,61 @@ Run [44876013351](https://github.com/nimaibhat/databricks-chall/actions/runs/448
 - Our phases in this run (20M): links 0.111, parse 0.983, dedup 0.097, sessions 0.278, output 0.050. Parse is 57% of the wall and remains the gap.
 - Vibhor7-7 experiments 23 to 25 (pulled this cycle) are already covered by entries 22.3 and 22's list; nothing new to rank.
 
+## Iteration 28 (2026-11-21, ~02:00): our per-line path read next to Vibhor7-7 `daa3682` and cherylaurelia `2e4261f`
+
+Read: `origin/gate-s9-61cb613` (`parse.rs`, `main.rs`, `keys.rs`, `mem.rs`; line numbers below are that branch), Vibhor7-7 `parse.rs`, `reader.rs`, `key.rs`, `links.rs`, `pool.rs`, `sys.rs`, and cherylaurelia `scan_lines`, `fast_split`, `fast_event`, `fast_click`. Nothing was built or run. Instruction counts in this entry are my estimates from counting source operations, not measurements.
+
+**Result first.** Stage by stage there is no large difference that is not already ranked. The scan and split (entry 24.2), the link lookup (18.1, 24.4), the partition prefetch (22.3) and the hash (1.7) account for most of the gap, and the optimizer has the first two queued. The entries below are the smaller differences that were not logged, plus one refinement that makes 1.7 a one-function change. The top five is unchanged.
+
+**Where the gap to Vibhor7-7 is, in run 44876013351.** In-process (wall minus the 0.19 s empty container) we take about 1.54 s and they take about 1.19 s at 20M. Our phases: parse 0.983, sessions 0.278, links 0.111, dedup 0.097, output 0.050. Their phases were not captured (`bench/gha_bench.sh` only greps our phase names from stderr). Applying the sample shares of their own profile after experiment 25 (BENCH.md: parse 45% + scan 9% + kernel 10%, people about 20%, dedup 6%, links 4%) gives roughly parse 0.74, people 0.25, dedup 0.07, links 0.05. So about 0.24 s of the 0.35 s gap is parse, 0.06 s links (the `gate-s9` rework targets it), and 0.03 s each dedup and sessions. This split is an estimate.
+
+### 28.1 Take the masks at the line start; drop the stored mask streams and the 128-bit windows
+
+- **Idea.** Compute the comma, quote and newline masks from an unaligned load at the line's first byte, so bit 0 is the line start and no window has to be assembled.
+- **Source.** [cherylaurelia `scan_lines`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L1259-L1293): `masks64(line)`; if the first word has a newline the line is under 64 bytes and the second word is zero, else `masks64(line.add(64))`; `fast_split` then works on two `u64` pairs. The buffer guarantees `line[..144]` readable ([`fast_event` comment](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L2099-L2102)), so there is no per-line edge case.
+- **Here.** `scan_lines` (`parse.rs:471-577`) first writes three mask streams for 67 blocks (`parse.rs:493-521`, four edge branches per block), then per line does nine loads and about 27 shift/or operations in three `win!` expansions (`parse.rs:523-531`) to get `u128` windows. Entry 2.1 proposed the line-start load and entry 14.1 replaced it with the window form; this entry prices the difference. Measured on the first 200,000 lines of the local 20M set: event lines average 76.9 bytes and 99.9% are longer than 64; click lines average 46.9 bytes and none is longer than 64. So for events compute both words unconditionally (4 loads, 12 compares, 12 movemasks, no branch), and for clicks one word is enough and `scan_lines::<4>` can run entirely on `u64` (quote test, popcount and field loop at half the width).
+- **Expected gain.** About 30 instructions per event line and about 60 per click line of roughly 1,285, so 2 to 3% of parse instructions; it also removes 1.6 KB of stack arrays from L1. It combines with 24.2 (the field loop on 64-bit halves) and should be done in the same rewrite.
+- **Risk.** Medium (scanner). Needs 128 readable bytes after every line start: keep the existing 64-byte `tail` copy idea by sending any line that starts within 128 bytes of the mapping end to the scalar `split`. The existing scanner fuzz tests (`fuzz_scan`, `exhaustive_small`, `scan_subrange`) cover it unchanged.
+
+### 28.2 A folded-multiply hash is a drop-in for `hk` (refines 1.7)
+
+- **Idea.** Hash with one 64x64 to 128-bit multiply and fold the halves: `let p = (k ^ C1) as u128 * C2; (p as u64) ^ ((p >> 64) as u64)`.
+- **Source.** [Vibhor7-7 `sys::mix`](https://github.com/Vibhor7-7/shopping-sessions/blob/daa3682/src/sys.rs#L256-L261), used for the link table home, both partition numbers and the people-phase tables. Their key format is the same as ours (6-bit codes from the top, low nibble for the kind).
+- **Here.** `hk` (`keys.rs:184-191`) is murmur's fmix64: two multiplies, three shifts, three xors. An event line runs it three times (`main.rs:623` user, `:558` person when linked, `:563` event ID), a click line twice, and `dedup_partition` and the sessions maps once more per record (`keys.rs:339`, `:363`). Entry 1.7 proposed a plain multiply and warned that `KMap` takes its slot from the low bits (`keys.rs:381`), which a plain multiply leaves weak. The folded product mixes both halves, so every call site keeps working and the change is the body of one function.
+- **Expected gain.** About 5 instructions fewer and a shorter dependency chain per call; 15 to 20 instructions per line in parse plus the per-record calls later. About 1 to 1.5%.
+- **Risk.** None to exactness (the same function is used to build and to probe every table). A weak hash shows as partition skew or long probes, so compare the largest partition size and the `LinkTab` probe count against `hk` on the 20M set before keeping it.
+
+### 28.3 One path through the ring for every copy, valid or not
+
+- **Idea.** An invalid copy also goes through the ring with `user = 0` meaning "no event record", so there is one place that pushes the dedup record and its partition can be prefetched like the person's.
+- **Source.** [Vibhor7-7 `parse.rs`](https://github.com/Vibhor7-7/shopping-sessions/blob/daa3682/src/parse.rs#L287-L307) and `settle_event` ([lines 156 to 165](https://github.com/Vibhor7-7/shopping-sessions/blob/daa3682/src/parse.rs#L156-L165)).
+- **Here.** `parse_events` pushes the dedup record in two places: `emit_event` (`main.rs:563`) for valid copies and directly at `main.rs:649` for invalid ones, and `Scatter::push` is `inline(always)`, so its body (stage write, flush loop, block refill call) appears three times in the closure plus again in the drain. One site makes the hot loop smaller and is the precondition for prefetching the dedup stage of every line (entry 22.3; Vibhor experiment 24).
+- **Expected gain.** Under 1% alone; it is what makes 22.3 apply to both pushes.
+- **Risk.** None. Order inside a dedup partition does not matter: the rules say copies with equal `ingest_ts` are identical, and today's code already reorders (an invalid copy is pushed at once, a valid one 16 lines later).
+
+### 28.4 One readable-room check per line instead of one per field
+
+- **Idea.** Decide once per line that every vector over-read is in bounds, then use unchecked field readers.
+- **Source.** cherylaurelia guarantees 144 readable bytes at each line once per buffer ([`fast_event`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L2099-L2130) has no bounds test); Vibhor7-7's reader keeps front and back padding in its own buffer ([`key_of_padded`](https://github.com/Vibhor7-7/shopping-sessions/blob/daa3682/src/key.rs#L190-L199): "16 readable bytes at `id`").
+- **Here.** Each field reader tests the mapping edge itself: `pack_fast` (`keys.rs:134`, twice per event line), `parse_ingest_s` (`parse.rs:932`), `parse_ts_fast` (`parse.rs:982`, `:990`, `:1003` with `floor`), and `Catalog::get` through `raw7`. That is about six predicted compare-and-branch pairs per line. With 28.1's rule (lines near the mapping end take the scalar path) all of them are implied.
+- **Expected gain.** About 15 instructions per line, 1%.
+- **Risk.** Low, but it is memory safety: the guard must cover the largest over-read (16 bytes past a field start, 16 bytes before a field end for the F3 timestamp path, which reads backwards and so also needs room at the file start; the header line provides it).
+
+### 28.5 A 24-byte click record in the scatter
+
+- **Source.** [Vibhor7-7 `Click`](https://github.com/Vibhor7-7/shopping-sessions/blob/daa3682/src/parse.rs#L46-L53): person, click ID, `ts` as `u32` from the click-window start, campaign; written through `Combine<Click, 8>` (192-byte stages, three cache lines).
+- **Here.** `CRec` (`main.rs:105-110`) holds `ts` as `i64` and pads to 32 bytes. Clicks are already range-checked to the window before the push (`main.rs:694`), so `(ts - cws) as u32` is exact (the window plus 7 days is far below 2^32 ms). `Scatter` requires `STG % size == 0`, so clicks need a 192-byte stage.
+- **Expected gain.** 40 MB fewer bytes written and read back at 20M (of about 800 MB scattered); under 0.5%. Entry 13.2 already shrinks the click inside a group; this is the scatter-side half.
+- **Risk.** None if the `u32` is taken after the range check.
+
+### 28.6 Checked and not different
+
+- ID packing: `pack_fast` (`keys.rs:130-144`) and Vibhor's `pack_padded` are the same nibble-table algorithm at about the same cost. cherylaurelia packs both IDs in one 256-bit operation (entry 14.3, about 2% there).
+- Timestamps: all three keep a per-thread table of validated dates and check the time of day with word compares. Vibhor's branchy `ingest_ts` check (experiment 23, -1.3 to -1.7%) is in entry 22.5.
+- Event type: both competitors test the length and one word; ours is a slice match (`main.rs:609-616`), entry 2.2, still open and small.
+- Record sizes: 16-byte dedup and event records in all three.
+- Scatter: same 128-byte stages for the 16-byte streams; Vibhor uses 256-bit streaming stores (top-five item 5).
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
