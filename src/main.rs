@@ -200,7 +200,16 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
     par_for(pairs.len(), threads, |t, i| {
         let out = unsafe { ipairs.get(t) };
         out.reserve(pairs[i].len());
-        for &(a, b) in &pairs[i] {
+        // the shard maps are far larger than the cache: fetch the lines of
+        // the pair a few steps ahead while translating this one
+        const AHEAD: usize = 8;
+        let ps = &pairs[i];
+        for (j, &(a, b)) in ps.iter().enumerate() {
+            if let Some(&(pa, pb)) = ps.get(j + AHEAD) {
+                let (ha, hb) = (hk(pa), hk(pb));
+                prefetch(maps[(ha >> shift) as usize].slot_ptr(ha));
+                prefetch(maps[(hb >> shift) as usize].slot_ptr(hb));
+            }
             out.push((gidx(a), gidx(b)));
         }
     });
@@ -227,7 +236,15 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
     }
     let mut nmoved = 0usize; // IDs that are not a root = unions made
     for v in &ipairs {
-        for &(a, b) in v {
+        for (j, &(a, b)) in v.iter().enumerate() {
+            // serial and cache-bound: fetch the next pairs' entries early
+            // (most IDs are still their own root, so their keys too)
+            if let Some(&(pa, pb)) = v.get(j + 12) {
+                prefetch(unsafe { parent.as_ptr().add(pa as usize) });
+                prefetch(unsafe { parent.as_ptr().add(pb as usize) });
+                prefetch(unsafe { all_keys.as_ptr().add(pa as usize) });
+                prefetch(unsafe { all_keys.as_ptr().add(pb as usize) });
+            }
             let ra = find(&mut parent, a);
             let rb = find(&mut parent, b);
             if ra != rb {
