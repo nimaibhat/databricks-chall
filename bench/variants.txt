@@ -1,7 +1,8 @@
 # label|ref|build-args|env
-s6|origin/gate-s6-b4afd85||
-s7|origin/gate-s7-9c1a5ee||
+s7|origin/gate-s7-91d75a0||
 s8|origin/gate-s8-9df4591||
-s8io4m|origin/gate-s8io4m-9df4591||IOMODE=4 CHUNKKB=1024
-saran|origin/gate-saran-6ff3e77||
+s9|origin/gate-s9-61cb613||
+s9nora|origin/gate-s9nora-61cb613||RA=0
+s9p1_10|origin/gate-s9p1_10-61cb613||P1BITS=10
+s9p11|origin/gate-s9p11-61cb613||P1BITS=11 P2BITS=10
 cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
