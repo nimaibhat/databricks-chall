@@ -57,23 +57,39 @@ pub fn unscramble(y: u64, key: u64) -> u64 {
 #[inline(always)]
 pub fn dec36(s: &[u8]) -> Option<u64> {
     let n = s.len();
-    if n == 0 || n > 8 || (s[0] == b'0' && n > 1) {
+    if n == 0 || n > 8 {
         return None;
     }
+    // no branch on the character class: digits and letters alternate at
+    // random, which a branch per character would mispredict all the time
     let mut v: u64 = 0;
+    let mut bad: u8 = 0;
     for &c in s {
-        let d = match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'z' => c - b'a' + 10,
-            _ => return None,
-        };
-        v = v * 36 + d as u64;
+        let d = D36[c as usize];
+        bad |= d;
+        v = v * 36 + (d & 63) as u64;
     }
-    if v > M40 {
+    if bad & 0x80 != 0 || (s[0] == b'0' && n > 1) || v > M40 {
         return None;
     }
     Some(v)
 }
+
+/// Digit value of a base-36 character, 0xFF for any other byte.
+static D36: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 26 {
+        t[b'a' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    t
+};
 
 /// Appends the base-36 form of `v` (the generator's `base36`).
 pub fn enc36(v: u64, out: &mut Vec<u8>) {
