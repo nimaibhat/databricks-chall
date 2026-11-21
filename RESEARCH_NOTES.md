@@ -16,7 +16,7 @@ Re-ranked in iteration 14 against the x86 profile in `OVERNIGHT_LOG.md` (parse 1
 | 4 | Product category only for purchase rows; sort 8-byte keys per person | `main.rs:632`; `process_partition` | Measured by a competitor at -2.3% and -2.8% | None | [1.1](#11-product-lookup-only-for-purchases), [7.1](#71-sort-8-byte-keys-per-person), [11.3](#113-measured-numbers-for-ideas-already-in-this-file) |
 | 5 | Known-date table for timestamps | `civil_swar`, `parse_ingest_s` | Timestamps and price are 230 instructions per line; a hit replaces digit checks, range checks and `days_from_civil` for both timestamps. Estimate 3 to 5% of parse | Low | [1.4](#14-known-date-table-for-timestamps) |
 
-Runners-up, in order: `pread` in 512 KB units ([1.5](#15-pread-in-l2-sized-blocks), [11.2](#112-what-the-scorer-facts-change); needs an x86 A/B, sign unknown); write-combining ([1.2](#12-write-combining-buffers-with-non-temporal-stores); `BList::push` is only 3.1% of self time on the EPYC runner and results elsewhere are mixed, see 11.3); catalog load off the serial path ([8.1](#81-catalog-load-is-about-60m-serial-instructions-before-anything-parallel-starts)); 16-byte click records ([13.2](#132-16-byte-click-records-inside-a-person-group)); link shards without self-named IDs ([13.1](#131-leave-self-named-ids-out-of-the-link-shards)); 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)); smaller Parquet ([1.8](#18-smaller-parquet-output)).
+Runners-up, in order: write-combining for event records ([1.2](#12-write-combining-buffers-with-non-temporal-stores), [16.2](#162-non-temporal-stores-gained-7-on-the-ice-lake-mirror-after-all): -7% and -12% on Ice Lake for two teams, no gain on an EPYC, nothing known on Cascade Lake); profile-guided optimisation as the last step ([16.4](#164-profile-guided-optimisation-a-measured-3-to-4-reopening-a-rejected-item): a measured 3 to 4%); `pread` in 512 KB units ([1.5](#15-pread-in-l2-sized-blocks), [11.2](#112-what-the-scorer-facts-change); needs an x86 A/B, sign unknown); catalog load off the serial path ([8.1](#81-catalog-load-is-about-60m-serial-instructions-before-anything-parallel-starts)); 16-byte click records ([13.2](#132-16-byte-click-records-inside-a-person-group)); link shards without self-named IDs ([13.1](#131-leave-self-named-ids-out-of-the-link-shards)); 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)); smaller Parquet ([1.8](#18-smaller-parquet-output)).
 
 Closed: everything for a cold page cache (1.9, 3.1), because `/data` on the scorer is reported to be tmpfs.
 
@@ -671,6 +671,50 @@ Source: [cherylaurelia `src/main.rs`](https://github.com/cherylaurelia/builders-
 - **Idea.** Load 16 bytes at the field start as a `u128`, shift left by `8 * (16 - len)` so the digits are right-aligned, OR in ASCII zeros below, validate both halves with 15.1's test and convert with two 8-digit SWAR steps.
 - **Here.** `parse_ts_fast` handles 9 to 16 digits by loading the 16 bytes that end at the field end, which needs the `floor` guard and leaves 1 to 8 digits to the scalar loop (`parse.rs:942-953`). Generated F3 values are 13 digits, so this matters only for uniformity: one path, one guard (`p + 16 <= ceil`).
 - **Expected gain.** None on generated data. Listed so the F3 branch is not rewritten twice if `parse_ts_fast` is restructured for 15.3.
+
+---
+
+## Iteration 16 (2026-11-21, about 00:55): new competitor measurements since the first pass
+
+Sources: commits pushed after iteration 2 to joch44 (`e71539c`), Vibhor7-7 (`7a5ddaf`), Th3r0n (`6034d47`) and TejasviniChawla (`6925b5e`), pulled into the scratch clones. joch44's numbers are medians on an Ice Lake 8370C VM with 4 cores and 8 hyperthreads, interleaved, which is the closest public stand-in for the scorer; its v20 scored 1.60 s on the board against 1.73 s there.
+
+### 16.1 Mask-based line split, measured in isolation
+
+- [joch44 `e71539c`](https://github.com/joch44/shopping-sessions/commit/e71539c) (v25): "`split_masked` decides the quote rule per line in registers with BMI2 PEXT: per-field start/end quote bits must match, a lone `\"` field is rejected, and no quote may sit elsewhere ... Mirror split-only: 0.217 to 0.078 s." That is the three-test rule of entry 4.1, and a 2.8x reduction of the split stage on Ice Lake.
+- [Vibhor7-7 `7a5ddaf`](https://github.com/Vibhor7-7/shopping-sessions/commit/7a5ddaf) (experiment 22, not yet measured in its log): keeps a delimiter index like this repo's `pos`, but takes the four bytes around each of a line's eight delimiters, compares them all with a quote at once, and gets every field's start and length "in a dozen vector instructions; before, it was seven rounds of two loads and three compares, about 145 instructions a line". This is a second route to the same end that keeps the index. AbhirajTiwari12 tried a gather-based split and went back to scalar (entry 2.1), so treat it as unproven.
+- **Consequence.** Entry 14.1 (top of the table) now has a direct measurement behind its central step. If the full rewrite is too much for one night, the smaller change is to keep `pos` and replace only `parse.rs:602-638` with the mask rule on the line's two words.
+
+### 16.2 Non-temporal stores gained 7% on the Ice Lake mirror after all
+
+- [joch44 `319a2e6`](https://github.com/joch44/shopping-sessions/commit/319a2e6) (v21): "non-temporal stores for 64-byte scatter records (EventCopy is one cache line)", `sfence` per chunk. Parse events 0.77 to 0.655 s; full A/B 1.79 to 1.66 s at 20M and 4.83 to 4.49 s at 60M. This reverses the "no gain on Ice Lake" line quoted in entry 11.3, which came from an earlier design of theirs.
+- The same log rejects padding clicks to 64 bytes for streaming (0.131 to 0.134 s: "clicks are not RFO-bound") and chunk sizes of 16, 4 or 1 MiB (under 5 ms difference).
+- **Here.** Their record is exactly one cache line, so each push is one streamed line with no staging. `ERec` is 32 bytes, so this repo needs the stage of entry 6.1 (or, after 14.2, 16-byte records in stages of 4 to 8). Stream events only; leave `CRec` on ordinary stores.
+- **Standing.** With Vibhor7-7's -12% this is two measurements on Ice Lake 8370C in favour, against one "no gain" on an EPYC (arnabxero). Still nothing on Cascade Lake. It moves back up to sixth, ahead of `pread`.
+
+### 16.3 SIMD timestamps were worth 8% there
+
+- [joch44 `e9c3e64`](https://github.com/joch44/shopping-sessions/commit/e9c3e64) (v22): "SIMD timestamp parser + ingest_ts fast path (relies on the rules' F1 guarantee)": parse events 0.63 to 0.53 s, total 1.65 to 1.52 s at 20M and 4.56 to 4.17 s at 60M.
+- **Here.** This repo already has SWAR timestamps and an unchecked ingest path, so the same 8% is not available; what remains is entry 15's table and cheaper validation. It does show that timestamp work converts to wall time at this stage of optimisation.
+
+### 16.4 Profile-guided optimisation: a measured 3 to 4%, reopening a rejected item
+
+- [joch44 `f05eae2`](https://github.com/joch44/shopping-sessions/commit/f05eae2) (v24): PGO with `-Cprofile-use` and a profile committed to the repo. Interleaved on the mirror: 1.50 to 1.46 s at 20M (-2.7%) and 4.16 to 3.99 s at 60M (-4.1%); on a Zen 5 VM "parse events -8%, clicks -11%, wall -3.6%". arnabxero lists PGO under "tried and dropped (no gain)".
+- `speedups.md` set PGO aside on a 1% figure for rustc itself. For a parser whose cost is instruction count and branch layout, one team now measures 3 to 4%.
+- **Here.** Mechanics in their repo: instrument with the Dockerfile's exact flags, train on datasets that are never timed, merge with the toolchain's own `llvm-profdata`, commit `merged.profdata`, add `-Cprofile-use=...` to `RUSTFLAGS` in the Dockerfile ([Dockerfile](https://github.com/joch44/shopping-sessions/blob/e71539c/Dockerfile), `tools/pgo.sh`).
+- **Expected gain.** 2 to 4% of wall.
+- **Risk.** None to exactness: it changes layout and inlining only. The risk is the build: the profile must come from the same rustc version the Dockerfile pins (`rust:1.91-bookworm` here), since a profile from another LLVM version can fail to load, and a failed build is a rejected submission. A stale profile after source changes still builds but helps less. Do it last, after the source stops changing, and rebuild the image from a clean clone before submitting.
+
+### 16.5 Serial sections another team found once its parse got fast
+
+- [joch44 `EXPERIMENTS.md`](https://github.com/joch44/shopping-sessions/blob/e71539c/EXPERIMENTS.md), "no idle core" list for its v22: start-up on one thread about 23 ms (manifest, catalogs, per-file mmap); links on one thread about 0.25 s of CPU; a barrier and thread respawn after the events pool; a serial weighting and sort of person partitions; a serial merge of 8 dense campaign-counter arrays; and "exit teardown in the kernel (about 0.11 s, at the container floor)". Making links parallel was a tie at their current speed (1.507 against 1.514 s) but turns 0.25 s of serial work into 0.08 s parallel.
+- **Here, the same places.** Catalog load (entry 8.1); the serial union-find and naming in `build_links` (`main.rs:218-257`, entry 7.3) which runs before parse instead of beside it (queued); the `transpose` calls between phases (`main.rs:432-433`, `:446`, `:464-469`), each building 512 small vectors on one thread; the campaign merge at `out.rs:76-83` (2,001 campaigns by 14 days by 4 counters by 8 threads, about 0.9 MB of adds: negligible); and exit.
+- **Exit teardown at 0.11 s is new information.** The audit measured 17 to 24 ms at 20M in a 2-vCPU sandbox; the log says teardown "is inside the 0.2 s container overhead and not yet split out". Two other teams release memory in parallel before exiting (TejasviniChawla `cd1ddca`, jklein07 `1a2371f`), and `AREL=1` / `DROP=1` exist here but were judged on that sandbox. Worth re-measuring on the x86 runner: time from the "done" line to container exit, with and without `AREL=1`.
+
+### 16.6 Smaller items
+
+- [Th3r0n `17f3282`](https://github.com/Th3r0n/shopping-sessions/commit/17f3282): "Dedup table: generation-stamped slots instead of clearing per partition". `KMap::reset` (`keys.rs:175-186`) rewrites every slot key of a 2 to 4 MB table for each of 512 partitions, about 1.5 GB of stores at 20M. Entry 9.1 makes the table 8 to 16 times smaller, which removes most of this; a generation stamp removes the rest but costs a compare per probe.
+- [Th3r0n `6034d47`](https://github.com/Th3r0n/shopping-sessions/commit/6034d47): "software-pipelined union-find, prefetched final passes", the same direction as entry 7.3. No number given.
+- [TejasviniChawla `6925b5e`](https://github.com/TejasviniChawla/shopping-sessions/commit/6925b5e) added Snappy page compression to its Parquet writer and a CI experiment on tmpfs against bind-mounted output; no result is recorded yet. The scorer's `/output` is reported as ext4 (entry 11.1).
 
 ## Next iteration
 
