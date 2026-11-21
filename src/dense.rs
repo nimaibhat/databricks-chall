@@ -80,8 +80,15 @@ impl Dense {
     /// for the bytes the generator wrote).
     #[inline]
     fn user_key(&self, i: u64, a: u64) -> Key {
-        let y = gen::scramble((i << gen::ALIAS_BITS) | a, self.keys.user);
-        let mut buf = [0u8; 10];
+        num_key(b'u', gen::scramble((i << gen::ALIAS_BITS) | a, self.keys.user))
+    }
+}
+
+/// The packed key of the ID `prefix` + base 36 of `y`.
+#[inline]
+pub fn num_key(prefix: u8, y: u64) -> Key {
+    {
+        let mut buf = [0u8; 14];
         let mut at = buf.len();
         let mut rest = y;
         loop {
@@ -93,9 +100,12 @@ impl Dense {
             }
         }
         at -= 1;
-        buf[at] = b'u';
+        buf[at] = prefix;
         pack(&buf[at..])
     }
+}
+
+impl Dense {
     /// The name of the linked set of a simple index: its smallest ID.
     #[inline]
     fn main_name(&self, i: u64, mask: u16) -> Key {
@@ -649,7 +659,8 @@ pub fn run(dn: Dense, data: &Path, outdir: &Path, threads: usize, arena: &Arena,
         let links = build_links(&dn, data, threads);
         (links, h.join().expect("catalogs"))
     });
-    let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels } = cats;
+    let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels, prod_num, camp_num } = cats;
+    let _ = (&prod_num, &camp_num);
     if camp_names.len() >= 1 << 16 {
         start_over("too many campaigns");
     }
@@ -676,11 +687,57 @@ pub fn run(dn: Dense, data: &Path, outdir: &Path, threads: usize, arena: &Arena,
     let odd = PerThread::new(threads, Vec::<Key>::new);
     let iobufs = PerThread::new(threads, Vec::<u8>::new);
     let rdbufs = PerThread::new(threads, IoBuf::new);
+    // The vector parser reads a little before and after the lines it is
+    // given: only on a read buffer (which has that room), and only when the
+    // catalogs can be looked up by number.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2", target_feature = "lzcnt"))]
+    let vtabs = if io5 && env("VPARSE", "1") != "0" { prod_num.as_deref().zip(camp_num.as_deref()) } else { None };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2", target_feature = "lzcnt"))]
+    let vbatches = PerThread::new(threads, || (crate::xk::iface::EvBatch::new(), crate::xk::iface::CkBatch::new()));
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2", target_feature = "lzcnt"))]
+    eprintln!("dense: vector parser {}", if vtabs.is_some() { "on" } else { "off" });
     par_for(chunks.len(), threads, |t, i| {
         let c = chunks[i];
         let buf = unsafe { iobufs.get(t) };
         let rb = unsafe { rdbufs.get(t) };
         let bs = unsafe { blocks.get(t) };
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2", target_feature = "lzcnt"))]
+        if let Some((ptab, ctab)) = vtabs {
+            use crate::xk::iface::Kernel;
+            let (d, s, e) = if c.kind == 0 { ev_in.read(&c, rb) } else { cl_in.read(&c, rb) };
+            if s >= 64 && e > s {
+                let vb = unsafe { vbatches.get(t) };
+                if c.kind == 0 {
+                    let mut sink = vk::KEv {
+                        b: &mut vb.0,
+                        buf: &d[s..e],
+                        dn: &dn,
+                        ctx: &ctx,
+                        ptab,
+                        eb: unsafe { ebl.get(t) },
+                        gd: unsafe { gdl.get(t) },
+                        gs: unsafe { gsl.get(t) },
+                        bs,
+                        abase,
+                        tid: t as u64,
+                        odd: unsafe { odd.get(t) },
+                        ws,
+                        we,
+                        ws_s: ws.div_euclid(1000),
+                        unknown: ctx.cat_unknown as u32,
+                        sh1,
+                        sh2,
+                    };
+                    crate::xk::k_free::Free::events(&d[s..e], &mut sink);
+                    Scatter::<SRec>::fence();
+                } else {
+                    let mut sink = vk::KCk { b: &mut vb.1, buf: &d[s..e], dn: &dn, ctx: &ctx, ctab, cb: unsafe { cbl.get(t) }, gc: unsafe { gcl.get(t) }, bs, cws: ws - WEEK_MS, we, sh2 };
+                    crate::xk::k_free::Free::clicks(&d[s..e], &mut sink);
+                    Scatter::<CRec>::fence();
+                }
+                return;
+            }
+        }
         if c.kind == 0 {
             let (d, s, e) = if io5 { ev_in.read(&c, rb) } else { chunk_data(ev_m, c.file as usize, c.start, c.end, buf) };
             let floor = d.as_ptr();
@@ -925,4 +982,220 @@ pub fn run(dn: Dense, data: &Path, outdir: &Path, threads: usize, arena: &Arena,
     eprintln!("done {:?} {}", t_start.elapsed(), cpu());
     eprintln!("epoch_done {:.6}", epoch());
     std::process::exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// The vector parser's batches into the same records
+// ---------------------------------------------------------------------------
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2", target_feature = "lzcnt"))]
+mod vk {
+    use super::*;
+    use crate::xk::iface::*;
+
+    /// The bytes of an ID the parser could not turn into a number: a token
+    /// says where they are in the buffer it was given (lengths from 255 on
+    /// are open-ended: the ID runs to the next delimiter).
+    fn odd_bytes(buf: &[u8], id: u64) -> &[u8] {
+        let off = odd_offset(id);
+        let mut len = odd_len(id);
+        if len >= 255 {
+            while off + len < buf.len() && !matches!(buf[off + len], b',' | b'"' | b'\n') {
+                len += 1;
+            }
+        }
+        &buf[off..off + len]
+    }
+    /// The packed key of an ID as the parser reports it.
+    fn key_of(buf: &[u8], id: u64, prefix: u8) -> Key {
+        if id & ID_ODD != 0 {
+            pack(odd_bytes(buf, id))
+        } else {
+            num_key(prefix, id)
+        }
+    }
+
+    pub struct KEv<'x, 'b> {
+        pub b: &'x mut EvBatch,
+        pub buf: &'x [u8],
+        pub dn: &'x Dense,
+        pub ctx: &'x Ctx,
+        pub ptab: &'x [u8],
+        pub eb: &'x mut Scatter<[u64; 2]>,
+        pub gd: &'x mut Scatter<DRec>,
+        pub gs: &'x mut Scatter<SRec>,
+        pub bs: &'x mut Blocks<'b>,
+        pub abase: usize,
+        pub tid: u64,
+        pub odd: &'x mut Vec<Key>,
+        pub ws: i64,
+        pub we: i64,
+        pub ws_s: i64,
+        pub unknown: u32,
+        pub sh1: u32,
+        pub sh2: u32,
+    }
+
+    impl KEv<'_, '_> {
+        /// One parsed line; the same decisions as `EvSink::line`.
+        #[inline(always)]
+        fn one(&mut self, eid: u64, uid: u64, ts: i64, ing: i64, pp: u64) {
+            let dn = self.dn;
+            if eid == ID_EMPTY {
+                return;
+            }
+            // ingest_ts is whole seconds in the one form the parser takes;
+            // anything else is for the general path to judge
+            if ing == TS_BAD || ing == TS_HUGE {
+                dn.abandon.store(true, Ordering::Relaxed);
+                return;
+            }
+            let ing_s = ing.div_euclid(1000);
+            let ingest = (ing_s - self.ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            let valid = if uid != ID_EMPTY && pp & PP_INVALID == 0 && ts >= self.ws && ts < self.we && (ingest as i64 + self.ws_s) * 1000 - ts <= DAY_MS {
+                let pc = if (pp >> 56) as u8 & 3 == KIND_PURCHASE {
+                    let price = (pp >> 32) as u32 & 0xFF_FFFF;
+                    let product = pp as u32;
+                    let cat = if product >= PROD_ODD { self.unknown } else { self.ptab.get(product as usize).map_or(self.unknown, |&c| c as u32) };
+                    (price << 8) | cat
+                } else {
+                    0
+                };
+                Some(((ts - self.ws) as u32, pc))
+            } else {
+                None
+            };
+            let user_norm = |uid: u64| -> Option<(u64, u64)> {
+                if uid & ID_ODD != 0 || uid > gen::M40 {
+                    return None;
+                }
+                let n = gen::unscramble(uid, dn.keys.user);
+                let (i, a) = (n >> gen::ALIAS_BITS, n & ((1 << gen::ALIAS_BITS) - 1));
+                (i < dn.ucap && a < NALIAS).then_some((i, a))
+            };
+            let number = if eid & ID_ODD == 0 && eid <= gen::M40 { Some(gen::unscramble(eid, dn.keys.event)).filter(|&n| n < dn.ecap) } else { None };
+            if let Some(n) = number {
+                let ing = if ingest == i32::MAX {
+                    ING_NONE
+                } else {
+                    let v = ingest as i64 + 86_400;
+                    if v < 0 || v >= ING_NONE as i64 {
+                        dn.abandon.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    v as u64
+                };
+                let (w0, user) = match valid {
+                    None => (u64::MAX, 0),
+                    Some((ts, pc)) => {
+                        let u = match user_norm(uid) {
+                            Some((i, a)) => (i << 4) | a,
+                            None => {
+                                let idx = self.odd.len() as u64;
+                                if idx >= 1 << 23 {
+                                    dn.abandon.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                                self.odd.push(key_of(self.buf, uid, b'u'));
+                                ODD | (self.tid << 23) | idx
+                            }
+                        };
+                        (((ts as u64) << 32) | pc as u64, u)
+                    }
+                };
+                self.eb.push((n >> SLOT_BITS) as usize, [w0, (n & SLOT_MASK) | (ing << SLOT_BITS) | (user << USER_SHIFT)], self.bs);
+                return;
+            }
+            let ekey = key_of(self.buf, eid, b'e');
+            let loc = match valid {
+                None => 0,
+                Some((ts, pc)) => {
+                    let person = match user_norm(uid) {
+                        Some((i, a)) => {
+                            let w = dn.utab[i as usize].fetch_or(CXO, Ordering::Relaxed);
+                            dn.general_person(&self.ctx.links, i, a, w)
+                        }
+                        None => {
+                            let k = key_of(self.buf, uid, b'u');
+                            self.ctx.links.person(k, hk(k))
+                        }
+                    };
+                    let at = self.gs.push((fx(person) >> self.sh2) as usize, SRec { person, ts, pc }, self.bs);
+                    ((at as usize - self.abase) / 16) as u32 + 1
+                }
+            };
+            self.gd.push((hk(ekey) >> self.sh1) as usize, DRec { eid: ekey, ingest, loc }, self.bs);
+        }
+    }
+
+    impl crate::xk::iface::EventSink for KEv<'_, '_> {
+        #[inline(always)]
+        fn ev(&mut self) -> *mut EvBatch {
+            self.b
+        }
+        #[inline(never)]
+        fn ev_flush(&mut self) {
+            let n = self.b.n;
+            for i in 0..n {
+                let (eid, uid, ts, ing, pp) = (self.b.eid[i], self.b.uid[i], self.b.ts[i], self.b.ing[i], self.b.pp[i]);
+                self.one(eid, uid, ts, ing, pp);
+            }
+            self.b.n = 0;
+        }
+    }
+
+    pub struct KCk<'x, 'b> {
+        pub b: &'x mut CkBatch,
+        pub buf: &'x [u8],
+        pub dn: &'x Dense,
+        pub ctx: &'x Ctx,
+        pub ctab: &'x [u32],
+        pub cb: &'x mut Scatter<[u64; 2]>,
+        pub gc: &'x mut Scatter<CRec>,
+        pub bs: &'x mut Blocks<'b>,
+        pub cws: i64,
+        pub we: i64,
+        pub sh2: u32,
+    }
+
+    impl crate::xk::iface::ClickSink for KCk<'_, '_> {
+        #[inline(always)]
+        fn ck(&mut self) -> *mut CkBatch {
+            self.b
+        }
+        #[inline(never)]
+        fn ck_flush(&mut self) {
+            let n = self.b.n;
+            let dn = self.dn;
+            for i in 0..n {
+                let (cid, uid, ts, camp) = (self.b.cid[i], self.b.uid[i], self.b.ts[i], self.b.camp[i] as u32);
+                if cid == ID_EMPTY || uid == ID_EMPTY || ts < self.cws || ts >= self.we || camp >= CAMP_ODD {
+                    continue;
+                }
+                let camp = match self.ctab.get(camp as usize) {
+                    Some(&c) if c != u32::MAX => c,
+                    _ => continue,
+                };
+                let ckey = key_of(self.buf, cid, b'k');
+                let norm = if uid & ID_ODD != 0 || uid > gen::M40 {
+                    None
+                } else {
+                    let n = gen::unscramble(uid, dn.keys.user);
+                    let (i, a) = (n >> gen::ALIAS_BITS, n & ((1 << gen::ALIAS_BITS) - 1));
+                    (i < dn.ucap && a < NALIAS).then_some((i, a))
+                };
+                match norm {
+                    Some((i, a)) => {
+                        let w1 = (((ts - self.cws) as u64) << 32) | ((camp as u64) << 16) | (a << UB) | (i & UMASK);
+                        self.cb.push((i >> UB) as usize, [ckey, w1], self.bs);
+                    }
+                    None => {
+                        let k = key_of(self.buf, uid, b'u');
+                        let person = self.ctx.links.person(k, hk(k));
+                        self.gc.push((fx(person) >> self.sh2) as usize, CRec { person, cid: ckey, ts, camp }, self.bs);
+                    }
+                }
+            }
+            self.b.n = 0;
+        }
+    }
 }
