@@ -39,7 +39,7 @@ runone() { # ds label envs keep
   es=$(grep -oE '^epoch_start [0-9.]+' $out.err | awk '{print $2}'); ed=$(grep -oE '^epoch_done [0-9.]+' $out.err | awk '{print $2}')
   pre=""; post=""; [ -n "$es" ] && pre=$(echo "$es - $t0" | bc); [ -n "$ed" ] && post=$(echo "$t1 - $ed" | bc)
   echo "$ds $label rc=$rc wall=$w pre=$pre post=$post | $ph" >> /tmp/results.txt
-  if [ -n "$keep" ]; then sudo chmod -R a+rwX $out; rm -rf /tmp/out_${ds}_$label; mv $out /tmp/out_${ds}_$label; else sudo rm -rf $out; fi
+  if [ -n "$keep" ]; then grep -vE "^(epoch|rusage)" $out.err | tail -${ERRLINES:-0} | cut -c1-220 | sed "s/^/ERRLOG $ds $label /"; sudo chmod -R a+rwX $out; rm -rf /tmp/out_${ds}_$label; mv $out /tmp/out_${ds}_$label; else sudo rm -rf $out; fi
   sudo rm -rf $scr $out.err
 }
 # fixtures against the binary inside each image named in IMG_FIX
