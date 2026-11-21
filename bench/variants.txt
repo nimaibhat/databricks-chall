@@ -1,4 +1,2 @@
 # label|ref|build-args|env
-s14|origin/gate-s14-7500d79||
-s15|origin/gate-s15-3cf0cc9||
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+s15b|origin/gate-s15b-eddebd8||
