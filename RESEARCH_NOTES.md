@@ -20,7 +20,7 @@ Runners-up, in order: write-combining for event records ([1.2](#12-write-combini
 
 Closed: everything for a cold page cache (1.9, 3.1), because `/data` on the scorer is reported to be tmpfs.
 
-**Measure before ranking:** whether output size costs time after the process exits ([20.1](#201-output-bytes-may-be-paid-for-after-the-process-exits)). One team measured +0.15 s for 14 MB more output on a bind mount; this build writes about 96 MB at 20M. If that holds on the x86 runner, shrinking the output outranks everything except item 1.
+**Measure before ranking:** whether output size costs time after the process exits ([20.1](#201-output-bytes-may-be-paid-for-after-the-process-exits)). One team measured +0.15 s for 14 MB more output on a bind mount; this build writes about 96 MB at 20M. Kernel and runc sources give no generic reason for it on an ext4 bind mount with an empty directory ([20.5](#205-why-output-bytes-could-cost-time-after-exit-what-the-kernel-and-runc-sources-say)), so treat it as unproven; if a runner measurement shows it anyway, the delta encodings in [20.4](#204-a-reference-byte-layout-for-the-delta-encodings-accepted-by-three-readers) cut the output to a fifth. Benchmarks must start from an empty output directory, or ext4 charges a byte-proportional flush at close that the scorer never sees.
 
 ## A finding to act on before trusting the TSBL toggle
 
@@ -843,6 +843,21 @@ What this says:
   - Page header and column metadata only change in the encoding id (`PageHeader.data_page_header.encoding`, and the `encodings` list `[RLE, 5]` and so on); the definition levels of the optional column stay as they are, in front of the values.
 - **Where it goes.** `pq.rs:130-159` (the three `match` arms that build `page`) and `:216-218` (the encodings list). `out.rs:48-50` would pass `sessions` and `events` as 32-bit.
 - **Not checked.** Spark's reader (the notes in 5.1 say 4.0.1 supports these); pages larger than about 10 MB with these encodings.
+
+### 20.5 Why output bytes could cost time after exit: what the kernel and runc sources say
+
+Opened by a research agent (kernel `master`, not the 7.0 tag the scorer is reported to run; no moby or containerd source was opened).
+
+- **Nothing generic waits on dirty pages.** Removing a memory cgroup does not reclaim or write back: `mem_cgroup_css_offline` only detaches writeback structures and defers cleanup ([mm/memcontrol.c](https://raw.githubusercontent.com/torvalds/linux/master/mm/memcontrol.c), [mm/backing-dev.c](https://raw.githubusercontent.com/torvalds/linux/master/mm/backing-dev.c)); runc's destroy is an `rmdir` with retries that depend on processes still exiting, not on bytes ([opencontainers/cgroups](https://raw.githubusercontent.com/opencontainers/cgroups/main/utils.go)). A filesystem is synced only when its superblock shuts down ([fs/super.c](https://raw.githubusercontent.com/torvalds/linux/master/fs/super.c)); detaching a bind mount of a host directory does not do that.
+- **Three conditional mechanisms do scale with bytes:**
+  1. **ext4 flush on close after truncate or rename-over.** `ext4_release_file` allocates all delayed blocks and submits the I/O at close when the file was truncated to zero while it had data, and `ext4_rename` does the same when the target exists ([fs/ext4/file.c](https://raw.githubusercontent.com/torvalds/linux/master/fs/ext4/file.c)). It does not wait for the I/O, but the allocation and submission are CPU time proportional to bytes, paid in `close` or, if the file is still open, at `_exit`. A new file in an empty directory triggers nothing.
+  2. **FUSE or virtiofs mounts.** `fuse_flush` writes the inode synchronously on every close ([fs/fuse/file.c](https://raw.githubusercontent.com/torvalds/linux/master/fs/fuse/file.c)). Docker Desktop bind mounts are of this kind, which may be what TejasviniChawla measured; that team's environment is not stated.
+  3. **A per-run filesystem for `/output`** (loop device or volume) that the harness unmounts would be synced in full at unmount. Whether the scorer does this is unknown.
+- **The writer is not throttled.** Dirty throttling starts near 15% of the cgroup's available memory, about 2 GB even with 10 GB of anonymous memory in use under the 24 GB limit ([mm/page-writeback.c](https://raw.githubusercontent.com/torvalds/linux/master/mm/page-writeback.c), [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)).
+- **Here.** `pq::write` uses `File::create` (`pq.rs:238`), which truncates. On the scorer `/output` starts empty, so mechanism 1 does not apply there. It does apply to any local or runner benchmark that reuses an output directory with files from the previous run, which would inflate both sides of an A/B by a byte-proportional amount and make output size look more expensive than it is on the scorer. Benchmarks should start from an empty output directory, as the scorer does.
+- **How to attribute a gap, from inside the container without root.** Print `/proc/self/mountinfo`'s line for the output directory (filesystem type and options); time each `close` explicitly before exit; read `file_dirty` and `file_writeback` from the cgroup's `memory.stat` just before exit; and, once, time an `fsync` of the files as an upper bound on what any sync at teardown would cost ([proc docs](https://docs.kernel.org/filesystems/proc.html)).
+- **Mitigations other than fewer bytes do not help.** Background writeback will not start by itself within a run of a few seconds (30 s expiry, 5 s flusher interval); `sync_file_range` only pays if something later waits; `posix_fadvise(DONTNEED)` does not drop dirty pages ([sync_file_range(2)](https://man7.org/linux/man-pages/man2/sync_file_range.2.html), [posix_fadvise(2)](https://man7.org/linux/man-pages/man2/posix_fadvise.2.html)).
+- **Net.** On an ext4 bind mount with an empty directory, the sources give no reason for output bytes to cost time after exit, which fits Vibhor7-7's 35 ms for 222 MB. TejasviniChawla's +0.15 s is most likely one of the three conditional cases. The measurement in 20.1 is still the way to know for the runner; for the scorer only a submission can tell.
 
 ### 20.2 Other new commits
 
