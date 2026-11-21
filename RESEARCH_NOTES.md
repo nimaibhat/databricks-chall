@@ -6,7 +6,7 @@ The notes for the old codebase are at `git show 3a5f601:RESEARCH_NOTES.md`. What
 
 ## Top five untried (ranked by expected gain per unit of risk to exact output)
 
-Re-ranked in iteration 2. PGO is being built by the coding agent (uncommitted `scripts/pgo.sh`, `pgo.profdata`), so it moves to "in progress" below the table. Every item here leaves the output bytes unchanged.
+Re-ranked in iteration 3 after the first entry in `OVERNIGHT_LOG.md`. Every item here leaves the output bytes unchanged.
 
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
@@ -14,9 +14,9 @@ Re-ranked in iteration 2. PGO is being built by the coding agent (uncommitted `s
 | 2 | Fault the arena's first blocks on the workers that sit idle during setup | `setup.rs:826-833`, `:968-969`, `parse.rs:180` `new_chunk` | **My estimate** 1 to 2 ms (0.5 to 1%); needs the `tl` idle figure for job 0 to size it | Quoted: old experiments 47/48, arena pre-fault on idle threads -1.4 to -4.3% on Intel (old code) | None | 1.3 |
 | 3 | Find out which AVX frequency licence the cores hold during parse (one probe); if L1, move the 256-bit multiplies in the event path to the 128-bit forms the click path already uses | probe: `parse.rs:2181`; multiplies: `parse.rs:259-315`, `:642`; `k_free.rs:875` `ids2j`, `:1349` `ev_d` | Probe: none. If L1 is held: **my estimate** net 0 to 6% of parse; lower if parse turns out memory-bound (2.2) | Quoted: Lemire 2018 (256-bit integer multiplies are "heavy", L1); Downs 2020 (L0 3.2 GHz, L1 2.8 GHz on a W-2104). Not measured here | Probe: none. Rewrite: low, existing differential tests pin the results | 1.2, 2.3 |
 | 4 | Start writeback of each output file when it is complete (`sync_file_range`, no wait) | `pqw.rs:1087`, `:1111` | 0 on a fast disk; old experiment 39 measured post-exit 0.13 to 0.04 s at 20M (old code, another runner) | Quoted: old log experiment 39, old notes 29.4 | None | 1.5 |
-| 5 | Give the PGO profile a second and third seed before the final pick | `scripts/pgo.sh` | Small; protects the PGO gain on a hidden set whose dirt rates differ | Rules: dirt rates are drawn per seed | None | 1.1 |
+| 5 | Only if `XL_CH=32768` in row 1 shows a gain: release parsed input with one batched call per thread instead of one `madvise` per chunk | `parse.rs:2158-2163` | Bounded by row 1's result; **my estimate** under 1% | Quoted: SeongJae Park's series "mm/madvise: batch tlb flushes for MADV_DONTNEED and MADV_FREE" reports 6.9% to 40% less time for batched `process_madvise` ranges. I could not confirm which kernel release it landed in | None | 2.1, 3.3 |
 
-**In progress (coding agent):** PGO. The working tree's version already handles the three traps of 1.1: `__llvm_profile_write_file()` before `_exit` under a `pgogen` feature, the image pinned to `rust:1.100.0-alpine`, and `--config 'build.rustflags=[...]'` (cargo joins arrays from `--config` with the file's, unlike the `RUSTFLAGS` variable, and the build would have stopped at `k_free.rs:11` otherwise). Two things left to check: `pgo.profdata` must be committed (the Dockerfile copies it; `.dockerignore` and `.gitignore` do not exclude it), and the plain build stays the fallback if the same-run A/B is not faster on both sizes.
+**Closed by measurement:** PGO (log experiment 1: 197.5 / 198.5 against 197.8 / 198.6 ms, parse 146.1 against 146.3). Consistent with 1.1's caution that the hot paths are already laid out by hand. Do not re-propose.
 
 Not in the table because they are not code changes: the board-noise note (1.6) and the bench-fidelity checklist (1.7). Read both before trusting any A/B.
 
@@ -146,7 +146,7 @@ Read: `k_free.rs:1126-1415` (`ev_masks`, `ev_s`, `ev_d`, `ev_fast`), `:1720-1804
 **(b) Each per-chunk release is a TLB shootdown.** After each chunk `stage1` calls `madvise(MADV_DONTNEED)` on its pages (`parse.rs:2158-2163`). Removing PTEs from an address space that 8 running threads share makes the kernel interrupt the other 7 CPUs, and for a range above 33 pages (`tlb_single_page_flush_ceiling`) each of them drops its whole TLB for this process. Chunk sizes are `rem / (4 * nt)` clamped to 256 KiB..8 MiB (`parse.rs:1961`), which for 2.3 GB is about 400 chunks, so about 400 shootdown rounds and 2,800 interrupts during parse.
 - **My estimate:** 3 µs per interrupted CPU (interrupt in a VM plus refilling 30 to 60 TLB entries) and 5 to 20 µs for the caller to wait for the acknowledgements: 10 to 16 thread-ms, about 1% of parse thread time. On bare metal less; on a VM without IPI virtualisation (Cascade Lake has none) more.
 - **Variants, all existing knobs:** `XL_CH=32768` (32 MiB chunks: a quarter of the calls for the bulk of the input; the tail still shrinks to 256 KiB so balance at the end is unchanged); `XL_REL=0` (no per-chunk release; the single `munmap` in the write stage, `out.rs:541-546`, then has 560,000 PTEs to remove on one thread, **my estimate** 30 to 45 ms, which is longer than the write stage, so I expect this one to lose, but it bounds the effect).
-- **Not proposed yet:** one `process_madvise` call per thread for many ranges. Kernel 6.15 batches the TLB flush across the ranges of one `process_madvise` call (the "batch tlb flushes for MADV_DONTNEED" series), which would cut 400 rounds to a handful, but it needs a pidfd and is only worth writing if `XL_CH=32768` shows the effect is real.
+- **Not proposed yet:** one `process_madvise` call per thread for many ranges. A 2025 kernel series batches the TLB flush across the ranges of one `process_madvise` call ("batch tlb flushes for MADV_DONTNEED and MADV_FREE"; merge release not confirmed by me), which would cut 400 rounds to a handful, but it needs a pidfd and is only worth writing if `XL_CH=32768` shows the effect is real.
 
 **How to read the result.** Run the four builds interleaved on tmpfs input (1.7): default, `XL_CH=32768`, populate-read, both. If none moves parse by more than noise, close 1.4 and 2.1 together.
 
@@ -170,6 +170,35 @@ Against `FOR_NIMAI.md`'s 160 ms for parse (machine not stated): 51 ns per line p
 - **The purchase test** (`k_free.rs:1388`): reads one byte of the `pp` word stored a few instructions earlier; a byte inside a just-stored quadword forwards from the store buffer, so no stall. 3% taken, well predicted.
 - **Batch size 64** (`iface.rs:36`): the five batch columns are 2.5 KB and `Out` about 2 KB, both L1-resident. Nothing to gain from another size that the authors' `XL_*` build knobs would not already have shown.
 - **Record scatter** (`parse.rs:94-159`): about 830 buckets at 20M (`ecap >> 15`), one 64-byte staging line each (53 KB per thread, in L2), full lines leave with two 32-byte non-temporal stores into 4 KiB chunks cut from 2 MiB blocks. The active chunks of a thread span a few huge pages, so the TLB is not a factor.
+
+## Iteration 3 (2026-11-21): first log entry, and the sessions stage
+
+Read: `OVERNIGHT_LOG.md` (experiment 1), `events.rs:234-262` (`scatter_chunk`), `:1736-2124` (`stage3a`), `:2126-2325` (`stage3b`, `stage3`), `sys.rs:188` (`release_part`).
+
+### 3.1 What the log's baseline says (quoted from the log; arithmetic is mine)
+
+- Test machine: `m5zn.2xlarge`, Xeon 8252C, Cascade Lake, 4 cores / 8 threads. Wall median 198.6 ms; parse 146.3, ev3a 35.5, write 9.4; noise ±1 ms.
+- The three stages add to 191.2 ms, so **7.4 ms (3.7%) is in laps the log does not list**: `setup`, `st2sort`, `stitch`, `ev3b`, `complex`, and the time before `main` and inside `_exit`. That is as large as any idea in the table. Please log the full `XL_TIMING=1` line once so these can be ranked; the lap names are in `main.rs:384-405` and `events.rs:2292-2314`.
+- Parse: 146.3 ms for 1.8 GB and 25M lines is 47 ns per line per hardware thread. The 8252C runs well above the 2.8 GHz reported for the scorer, so at this machine's clock that is more than 170 cycles for about 160 instructions (2.2): under one instruction per cycle per thread. This strengthens 2.2's reading that parse is waiting, not computing.
+- ev3a: 35.5 ms x 8 threads / 20M events is 14 ns per event.
+
+### 3.2 Two things about the bench that can hide or invent a result
+
+- **The timing runs the binary directly, with the page cache warm.** If the generated set is on the VM's disk filesystem and not on tmpfs, the input pages are ext4 page cache. Both map as 4 KiB pages with fault-around, so the default path should behave alike, but the scorer's kernel (7.0, reported) and Ubuntu 24.04's differ in the fault path, and `fault_around_check` (`parse.rs:1805`) decides map against `pread` at run time. Please log which path it took (`[v2b]` prints it under `XL_TIMING=1` if the `rd` knob line is on; otherwise one `strace -c` run: `pread64` count near zero means mapped) and run the row 1 A/B with the set copied to `/dev/shm`.
+- **Outside the container, exit is cheap.** Row 4's gain, if any, only shows as time between the process's last output and `docker run` returning, with `/output` a bind mount on the VM's disk. The direct-binary timing cannot see it either way.
+
+### 3.3 The sessions stage uses 512-bit vectors: a free positive control for the licence probe
+
+- `stage3a` is written with `zmm` throughout (`events.rs:1770-1832`, `:1854-1899`, `:2049-2075`; 178 uses in the file; `core.rs:405-441`, `ckix.rs` likewise), parse with `ymm` only (the `zmm` in `k_free.rs` are clobber lists; `parse.rs:266-268` splits a 512-bit value into halves).
+- On Cascade Lake any 512-bit instruction puts the core in L1 at least (Downs: "512-bit light" ran at 2.8 against 3.2 GHz on the W-2104). So the probe of 1.2 should be taken at three points on each worker: before any vector code, at the end of `stage1`, and at the end of `stage3a`. The third must read slower than the first on this machine; if it does not, the probe is broken (or the hypervisor hides the effect) and a "1.00" after parse means nothing. If the third reads slower and the second reads 1.00, parse is at L0 and 1.2 is closed for good.
+- I am not proposing to rewrite `stage3a` in 256-bit form: it is 35 ms, the compress-store kernels would double in instruction count, and it is the part of the code with the most ways to change a row.
+
+### 3.4 Checked in `stage3a`/`stage3b` and left alone
+
+- **`scatter_chunk`** (`events.rs:234`): the dedup table is `BSIZE * 16` = 512 KiB per thread, inside the 1 MiB L2 of this CPU; the next record chunk is prefetched (`PF_CHUNK`). The records themselves were written with non-temporal stores in parse, so every one is a DRAM read here: 320 MB in 35 ms is 9 GB/s over 8 threads, well under what the machine can stream. Not memory-bound.
+- **Three `Instant::now()` per bucket** (`:1779`, `:1801`, `:1842`, `:2090`): about 830 buckets, 25 ns each through the vDSO: 0.1 ms of thread time in total. Not worth touching.
+- **`release_part`** (`sys.rs:188`, called once per thread from `stage3b`): frees the event arena in 2 MiB units, about 160 huge pages in 8 calls. Cheap, and it is what keeps `_exit` short.
+- **Serial stitch** (`events.rs:2293-2313`): a loop over about 830 buckets and one sort of at most twice that many entries. Microseconds.
 
 ## Next passes (in this order)
 
