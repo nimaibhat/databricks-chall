@@ -399,6 +399,9 @@ struct EvSink<'x, 'b> {
     sh1: u32,
     sh2: u32,
     memo: DateMemo,
+    /// measurement only (DSTAGE): stop each line after this much work
+    stage: u32,
+    acc: u64,
 }
 
 impl<'a, 'x, 'b> LineSink<'a> for EvSink<'x, 'b> {
@@ -409,11 +412,19 @@ impl<'a, 'x, 'b> LineSink<'a> for EvSink<'x, 'b> {
         if f0.is_empty() {
             return;
         }
+        if self.stage == 1 {
+            self.acc = self.acc.wrapping_add(f.get(6).len() as u64);
+            return;
+        }
         let ingest = match parse_ingest_s(f.get(3), ceil, &mut self.memo, F::ROOMY) {
             Some(v) => (v - self.ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
         };
         let f1 = f.get(1);
+        if self.stage == 2 {
+            self.acc = self.acc.wrapping_add(ingest as u64);
+            return;
+        }
         // the same validity rules as the general parser (main.rs)
         let valid: Option<(u32, u32)> = 'v: {
             let f5 = f.get(5);
@@ -442,8 +453,16 @@ impl<'a, 'x, 'b> LineSink<'a> for EvSink<'x, 'b> {
             let pc = if price != 0 { (price << 8) | self.ctx.products.get(f5, floor, F::ROOMY).unwrap_or(self.unknown) } else { 0 };
             Some(((ts - self.ws) as u32, pc))
         };
+        if self.stage == 3 {
+            self.acc = self.acc.wrapping_add(valid.map_or(1, |v| v.0 as u64 + v.1 as u64));
+            return;
+        }
         let dn = self.dn;
         let number = gen::id_value_fast(f0, b'e', F::ROOMY).map(|y| gen::unscramble(y, dn.keys.event)).filter(|&n| n < dn.ecap);
+        if self.stage == 4 {
+            self.acc = self.acc.wrapping_add(number.unwrap_or(7)).wrapping_add(dn.user_norm_r(f1, F::ROOMY).map_or(3, |u| u.0));
+            return;
+        }
         if let Some(n) = number {
             let ing = if ingest == i32::MAX {
                 ING_NONE
@@ -667,6 +686,7 @@ pub fn run(dn: Dense, data: &Path, outdir: &Path, threads: usize, arena: &Arena,
         chunks_of(1, cl_m, chunk_kb << 10, &mut chunks);
     }
     let (sh1, sh2) = (64 - p1_bits(), 64 - p2_bits());
+    let dstage: u32 = env("DSTAGE", "0").parse().unwrap_or(0);
     let blocks = PerThread::new(threads, || Blocks::new(arena));
     let ebl = PerThread::new(threads, || Scatter::<[u64; 2]>::new(dn.nb, arena));
     let cbl = PerThread::new(threads, || Scatter::<[u64; 2]>::new(dn.nub, arena));
@@ -703,8 +723,11 @@ pub fn run(dn: Dense, data: &Path, outdir: &Path, threads: usize, arena: &Arena,
                 sh1,
                 sh2,
                 memo: DateMemo::new(),
+                stage: dstage,
+                acc: 0,
             };
             scan_lines::<7, _>(d, s, e, &mut sink);
+            std::hint::black_box(sink.acc);
             Scatter::<SRec>::fence();
             if !io5 {
                 chunk_done(ev_m, c.file as usize, c.start, c.end);
@@ -729,6 +752,9 @@ pub fn run(dn: Dense, data: &Path, outdir: &Path, threads: usize, arena: &Arena,
     let cparts = transpose(cbl.into_inner().into_iter().map(|s| s.finish()).collect(), dn.nub);
     let odd = odd.into_inner();
     eprintln!("phase2 parse {:?} {}", t_start.elapsed(), cpu());
+    if dstage != 0 {
+        std::process::exit(0);
+    }
 
     // ---- clicks grouped by user; the clicks of complex indexes handed over
     let cws = ws - WEEK_MS;
