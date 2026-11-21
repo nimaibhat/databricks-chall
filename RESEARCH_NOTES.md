@@ -10,11 +10,11 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
-| 1 | Fresh numbers for the new pipeline (no code): lap line, `prof` thread-ms, faults, user/system time, `perf report` top 15, `perf annotate` of `ev_loop`; plus two new counters: a histogram of event-line shapes (21.2) and the TLB row of `/proc/interrupts` before and after a run (21.4) | n/a | Directs everything else | All ranking figures predate the new pipeline | None | 18.1, 21 |
-| 2 | Map each input file at a 2 MiB-congruent address, so a tmpfs with huge folios is mapped by 2 MiB entries | `setup.rs` (where files are mapped into the region; `io_advise` is called there) | Nothing if the scorer's tmpfs has 4 KiB folios (the default); if it has huge folios, most of the input fault and unmap work goes, which was about 20% of parse thread time on the old build (log). **My guess at the odds: 5 to 10%** | Kernel source and docs (quoted in 21.1): large folios are mapped whole when the mapping is congruent; default mount policy is `never` | None: only addresses change | 21.1 |
-| 3 | Frequency-licence probe at three points | end of `stage1`, end of `stage3a` | Diagnostic; ceiling is the L0 to L1 gap, 12.5% on the one Skylake-X part with published figures (quoted, 21.3) | Literature: sustained 256-bit integer multiplies request L1, and the drop applies to both hyperthreads of the core | None | 14.2, 21.3 |
-| 4 | Dominant-shape fast path in the event scanner, **only if** the histogram of row 1 shows one or two shapes covering most lines | `k_free.rs` `ev_loop` | Unknown until the histogram exists; published gains for this trick are 15 to 25% of scan time in other parsers (quoted, different programs) | 1BRC write-ups (21.2) | Low if the fast path falls back to the existing code on any mismatch; it is new scanner code, so full gate | 21.2 |
-| 5 | Stage 3 dedup table with 12-byte slots (the arena record copied as is, widened in the compaction) | `events.rs:262` (`scatter_chunk12`) and the compaction after it | **My estimate** 1 to 2 ms, by proportion from the 3.5 ms measured for halving the table | Experiments 9 and 15; literature agrees the stage is L2-capacity-bound (21.5) | Row-sensitive: this code decides which duplicate survives. Ranked last for that reason | 20, 21.5 |
+| 1 | **Frequency probe, now the top item.** Find out whether parse runs at reduced clock because of 256-bit integer multiplies in the scanner and batch kernel | probe at worker start, at each thread's end of `stage1`, at end of `stage3a`; code in 22.1 | If parse is in the reduced state: up to the L0/L1 gap on all of parse, 10 to 13% on published parts, 15 to 19 ms here. If not: nothing, and the question is closed for good | Quoted: sustained 256-bit integer multiplies request the lower state and take the sibling hyperthread with them (Lemire 2018, Downs 2020). Checked in the source: the scanner and kernels use `ymm` multiplies (`vpmaddubsw`, `vpmaddwd`, `vpmuludq`, `vpmullq`) on every line; no `zmm` is used in parse | None (measurement). The remedy, if needed, is 128-bit forms of the same multiplies: same arithmetic, full gate | 22.1 |
+| 2 | Map each input file at a 2 MiB-congruent address | `setup.rs:257-267` and `:855-867` (files are placed at running offsets in one reserved region) | Nothing with the default tmpfs policy; most input fault and unmap work if the scorer's tmpfs has huge folios. **My guess at the odds: 5 to 10%** | Kernel source and docs (21.1) | None: only addresses change | 21.1 |
+| 3 | Two counters (no code): TLB row of `/proc/interrupts` before and after a run; `ev_loop` annotate | n/a | Directs 21.4 and any scanner work | | None | 21.4 |
+| 4 | Stage 3 dedup table with 12-byte slots | `events.rs:262` (`scatter_chunk12`) and the compaction after it | **My estimate** 1 to 2 ms | Experiments 9 and 15; literature (21.5) | Row-sensitive; ranked last for that | 20, 21.5 |
+| 5 | (withdrawn: dominant-shape fast path. The rules give three timestamp forms at 58/32/10% and three event types, so no one line shape dominates) | | | | | 22.2 |
 
 **Staging lead (19) closed by measurement:** the fresh 10M run gives the same parse time per event as 20M (7.0 against 7.2), so staging costs nothing at 20M; my extrapolation to zero buckets was wrong. Fresh profile of the shipped build (log): `ev_loop` 29.8%, `ev_batch` 12.2%, stage 3 closure 8.9%, page zeroing 7.8%, `links::bucket` 5.0%, `cl_loop` 4.4%; kernel 16.5% of samples in all; 29,462 faults. Still wanted from row 1: the shape histogram, the TLB interrupt count, and the `ev_loop` annotate.
 
@@ -653,6 +653,40 @@ Every `MADV_DONTNEED` over more than 33 pages is a full TLB flush sent to every 
 ### 21.6 What this means for a target of 0.27
 
 The searches found no technique worth tens of milliseconds. The candidates above are each a few ms at best, except row 2, which is large but depends on a mount option we cannot see. If the board keeps the best of several noisy draws, repeated submission of the same build is the largest remaining lever.
+
+## Iteration 22 (2026-11-21): where 15% could still come from
+
+**Accounting, from the fresh profile (log).** 1,560 thread-ms in a 198 ms run on 8 threads is 98.5% utilisation: nothing is waiting, so wall time falls only if cycles fall or the clock rises. User code is 83.5%. Kernel is 16.5%: page zeroing 7.8% (about 435 MB of first-touch memory, which only smaller records would cut, and the records are already 12 bytes), the rest mostly per-page mapping of the input, which only huge tmpfs folios would cut (row 2). I looked for a semantic shortcut in the rules (a field that need not be parsed, a pass that need not run) and found none: every event field feeds dedup, validation or the outputs.
+
+That leaves the clock.
+
+### 22.1 Row 1: the frequency probe, with code
+
+- **Why it is now first.** It is the only candidate with a two-digit ceiling, it has been in this file since iteration 14 without being run, and it costs 20 lines. Intel cores drop to a lower frequency state when they run "heavy" vector instructions at 256 bits or wider; integer multiplies count as heavy (Lemire, quoted in 21.3). I checked the source: parse uses no 512-bit registers, but the scanner and both batch kernels multiply in `ymm` on every line. Whether that density is enough to hold the lower state on Cascade Lake is not published anywhere I could find.
+- **Probe:** a chain of dependent 64-bit multiplies, timed with the TSC. The TSC ticks at a fixed rate; the chain takes a fixed number of core cycles (3 per multiply) and is one micro-operation per 3 cycles, so a busy sibling hyperthread barely disturbs it. Ticks per iteration is therefore proportional to 1 / core frequency.
+
+```rust
+#[inline(never)]
+pub fn freq_probe() -> u64 {
+    use std::arch::x86_64::_rdtsc;
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let t0 = unsafe { _rdtsc() };
+    for _ in 0..60_000 {
+        x = std::hint::black_box(x).wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1;
+    }
+    std::hint::black_box(x);
+    unsafe { _rdtsc() - t0 }
+}
+```
+
+  About 50 microseconds per call. Take the minimum of three calls at each point (an interrupt only lengthens a sample). Points: (a) each worker's first instruction; (b) each worker immediately after its last parse chunk, while other threads are still parsing; (c) each worker at the end of `stage3a` (512-bit code has just run, so this shows what the lower state looks like); (d) in a throwaway build, thread 0 after sleeping 2 ms at start, as the clean reference. Print all values under `XL_TIMING`.
+- **Reading it.** If (b) equals (a)/(d): parse runs at full clock; close this. If (b) is higher by 5% or more and near (c): parse is in a reduced state.
+- **Remedy if reduced.** Rewrite the `ymm` multiplies as `xmm` (128-bit multiplies do not request the lower state). In `ev_vec` (`parse.rs`, `mul4`/`mul4m`) that is two `vpmullq xmm` per group of four rows in place of one `ymm`; in the scanner the digit multiplies (`vpmaddubsw`/`vpmaddwd`) are per line and several are already narrow. The arithmetic is unchanged, so the output risk is that of any scanner edit: full gate, all seeds. Then re-probe: the gain appears only when the last `ymm` multiply in the parse path is gone.
+- **Caveat on transfer.** The VM's CPU (8252C) and the scorer's (reported as 2.8 GHz Cascade Lake) have different frequency tables. A null result on the VM does not prove a null on the scorer, but the mechanism is the same family, so a positive on the VM is strong evidence.
+
+### 22.2 Withdrawn: dominant-shape fast path
+
+The rules fix the mix of timestamp forms at about 58% / 32% / 10% and there are three event types of different lengths, plus variable price and product widths. The commonest full-line shape cannot be much above a third of lines, so a single-shape path cannot pay. The histogram request is dropped.
 
 ## Next passes
 
