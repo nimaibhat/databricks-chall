@@ -2,7 +2,7 @@
 use std::path::Path;
 
 use crate::keys::{key_bytes, Key};
-use crate::pq::{self, Column, Data};
+use crate::pq::{self, Column, Enc, Idx, Logical, Values};
 use crate::Ctx;
 
 pub struct URow {
@@ -30,39 +30,71 @@ impl Acc {
     }
 }
 
+/// Largest count that still gets the identity dictionary (value = index).
+const DICT_MAX: u32 = 1 << 20;
+
+/// A count column: dictionary 0..=max with the value as its own index when
+/// the values are small (the indices are then bit-packed per page), PLAIN
+/// otherwise.
+fn count_column(name: &'static str, vals: Vec<u32>) -> Column {
+    let max = vals.iter().copied().max().unwrap_or(0);
+    let enc = if max <= DICT_MAX {
+        Enc::Dict { dict: Values::I32((0..=max as i32).collect()), idx: Idx::Each(vals) }
+    } else {
+        Enc::Plain(Values::I32(vals.into_iter().map(|v| v as i32).collect()))
+    };
+    Column { name, logical: Logical::None, def: None, enc }
+}
+
 fn write_users(path: &Path, rows: &[URow], cats: &[Vec<u8>]) {
     let n = rows.len();
-    let mut ub = Vec::with_capacity(n * 10);
-    let mut ue = Vec::with_capacity(n);
-    let mut cb = Vec::with_capacity(n * 4);
-    let mut ce = Vec::with_capacity(n);
-    let mut def = Vec::with_capacity(n);
+    // user_id: one dictionary entry per run of rows of the same person
+    let mut ub = Vec::with_capacity(n * 4);
+    let mut ue = Vec::with_capacity(n / 2);
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(n / 2);
+    let mut prev: Option<Key> = None;
+    // day: dictionary of the days between the smallest and largest present
+    let dmin = rows.iter().map(|r| r.day).min().unwrap_or(0);
+    let dmax = rows.iter().map(|r| r.day).max().unwrap_or(0);
     let mut days = Vec::with_capacity(n);
     let mut se = Vec::with_capacity(n);
     let mut ev = Vec::with_capacity(n);
     let mut rv = Vec::with_capacity(n);
+    let mut def = Vec::with_capacity(n);
+    let mut ci = Vec::new();
     for r in rows {
-        key_bytes(r.person, &mut ub);
-        ue.push(ub.len() as u32);
-        days.push(r.day);
-        se.push(r.sessions as i32);
-        ev.push(r.events as i32);
+        if prev == Some(r.person) {
+            runs.last_mut().unwrap().1 += 1;
+        } else {
+            key_bytes(r.person, &mut ub);
+            ue.push(ub.len() as u32);
+            runs.push((ue.len() as u32 - 1, 1));
+            prev = Some(r.person);
+        }
+        days.push((r.day - dmin) as u32);
+        se.push(r.sessions);
+        ev.push(r.events);
         rv.push(r.revenue as i64);
         if r.top == u16::MAX {
             def.push(false);
         } else {
             def.push(true);
-            cb.extend_from_slice(&cats[r.top as usize]);
-            ce.push(cb.len() as u32);
+            ci.push(r.top as u32);
         }
     }
+    let mut cb = Vec::new();
+    let mut ce = Vec::new();
+    for c in cats {
+        cb.extend_from_slice(c);
+        ce.push(cb.len() as u32);
+    }
     let cols = [
-        Column { name: "user_id", data: Data::Str { bytes: ub, ends: ue, def: None } },
-        Column { name: "day", data: Data::Date(days) },
-        Column { name: "sessions", data: Data::I32(se) },
-        Column { name: "events", data: Data::I32(ev) },
-        Column { name: "revenue_cents", data: Data::I64(rv) },
-        Column { name: "top_category", data: Data::Str { bytes: cb, ends: ce, def: Some(def) } },
+        Column { name: "user_id", logical: Logical::Utf8, def: None, enc: Enc::Dict { dict: Values::Str { bytes: ub, ends: ue }, idx: Idx::Runs(runs) } },
+        Column { name: "day", logical: Logical::Date, def: None, enc: Enc::Dict { dict: Values::I32((dmin..=dmax).collect()), idx: Idx::Each(days) } },
+        count_column("sessions", se),
+        count_column("events", ev),
+        Column { name: "revenue_cents", logical: Logical::None, def: None, enc: Enc::Plain(Values::I64(rv)) },
+        Column { name: "top_category", logical: Logical::Utf8, def: Some(def), enc: Enc::Dict { dict: Values::Str { bytes: cb, ends: ce }, idx: Idx::Each(ci) } },
     ];
     pq::write(path, &cols, n).expect("write user_daily");
 }
@@ -113,14 +145,15 @@ pub fn write_all(outdir: &Path, ctx: &Ctx, mut accs: Vec<Acc>) {
                 }
             }
             let n = days.len();
+            let plain = |name: &'static str, logical: Logical, v: Values| Column { name, logical, def: None, enc: Enc::Plain(v) };
             let cols = [
-                Column { name: "campaign_id", data: Data::Str { bytes: ib, ends: ie, def: None } },
-                Column { name: "channel", data: Data::Str { bytes: chb, ends: che, def: None } },
-                Column { name: "day", data: Data::Date(days) },
-                Column { name: "sessions", data: Data::I64(c0) },
-                Column { name: "purchasing_sessions", data: Data::I64(c1) },
-                Column { name: "revenue_cents", data: Data::I64(c2) },
-                Column { name: "assisted_sessions", data: Data::I64(c3) },
+                plain("campaign_id", Logical::Utf8, Values::Str { bytes: ib, ends: ie }),
+                plain("channel", Logical::Utf8, Values::Str { bytes: chb, ends: che }),
+                plain("day", Logical::Date, Values::I32(days)),
+                plain("sessions", Logical::None, Values::I64(c0)),
+                plain("purchasing_sessions", Logical::None, Values::I64(c1)),
+                plain("revenue_cents", Logical::None, Values::I64(c2)),
+                plain("assisted_sessions", Logical::None, Values::I64(c3)),
             ];
             pq::write(&cd.join("part-0.parquet"), &cols, n).expect("write campaign_daily");
         });
