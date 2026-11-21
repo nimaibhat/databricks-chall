@@ -1,7 +1,7 @@
 use crate::pqw::*;
 use crate::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn die(what: &str) -> ! {
     eprintln!("[v2b] write error: {what}");
@@ -44,9 +44,150 @@ fn write_piece(g: &G, t: usize, a: usize, b: usize, path: &Path, cats_off: &[u32
     write_rows(&view(&g.t(t).core), a, b, path, cats_off, cats_data, kbuf)
 }
 
+#[derive(Default)]
+struct Split {
+    k: Vec<u32>,
+    d: Vec<i32>,
+    s: Vec<i32>,
+    e: Vec<i32>,
+    r: Vec<i32>,
+    c: Vec<u8>,
+    b: Vec<u8>,
+}
+thread_local! {
+    static SPLIT: std::cell::RefCell<Split> = std::cell::RefCell::new(Split::default());
+    static UFILE: std::cell::RefCell<Option<UserFile>> = const { std::cell::RefCell::new(None) };
+}
+
+fn end_user_file() {
+    if let Some(f) = UFILE.with(|f| f.borrow_mut().take()) {
+        if f.finish().is_err() {
+            die("user_daily");
+        }
+    }
+}
+
+const SPLIT_ROWS: bool = crate::env_u32(option_env!("XL_SPLIT_DEF"), 1) != 0;
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn split_rows(keys: *mut u32, day: *mut i32, ses: *mut i32, evs: *mut i32, rev: *mut i32, cat: *mut u8, n: usize, tk: *mut u32, td: *mut i32, ts: *mut i32, te: *mut i32, tr: *mut i32, tc: *mut u8) -> (usize, usize) {
+    use std::arch::x86_64::*;
+    let (mut iz, mut ip, mut i) = (0usize, 0usize, 0usize);
+    let zero = _mm256_setzero_si256();
+    let ff = _mm_set1_epi8(-1);
+    type V = __m256i;
+    while i + 8 <= n {
+        let k = _mm256_loadu_si256(keys.add(i) as *const V);
+        let d = _mm256_loadu_si256(day.add(i) as *const V);
+        let s = _mm256_loadu_si256(ses.add(i) as *const V);
+        let e = _mm256_loadu_si256(evs.add(i) as *const V);
+        let r = _mm256_loadu_si256(rev.add(i) as *const V);
+        let c = _mm_loadl_epi64(cat.add(i) as *const __m128i);
+        let z: u8 = _mm256_cmpeq_epi32_mask(r, zero) & (_mm_cmpeq_epi8_mask(c, ff) as u8);
+        let p: u8 = !z;
+        _mm256_storeu_si256(keys.add(iz) as *mut V, _mm256_maskz_compress_epi32(z, k));
+        _mm256_storeu_si256(day.add(iz) as *mut V, _mm256_maskz_compress_epi32(z, d));
+        _mm256_storeu_si256(ses.add(iz) as *mut V, _mm256_maskz_compress_epi32(z, s));
+        _mm256_storeu_si256(evs.add(iz) as *mut V, _mm256_maskz_compress_epi32(z, e));
+        _mm256_storeu_si256(tk.add(ip) as *mut V, _mm256_maskz_compress_epi32(p, k));
+        _mm256_storeu_si256(td.add(ip) as *mut V, _mm256_maskz_compress_epi32(p, d));
+        _mm256_storeu_si256(ts.add(ip) as *mut V, _mm256_maskz_compress_epi32(p, s));
+        _mm256_storeu_si256(te.add(ip) as *mut V, _mm256_maskz_compress_epi32(p, e));
+        _mm256_storeu_si256(tr.add(ip) as *mut V, _mm256_maskz_compress_epi32(p, r));
+        let c32 = _mm256_maskz_compress_epi32(p, _mm256_cvtepu8_epi32(c));
+        _mm_storel_epi64(tc.add(ip) as *mut __m128i, _mm256_cvtepi32_epi8(c32));
+        iz += z.count_ones() as usize;
+        ip += p.count_ones() as usize;
+        i += 8;
+    }
+    while i < n {
+        let (k, d, se, e, r, c) = (*keys.add(i), *day.add(i), *ses.add(i), *evs.add(i), *rev.add(i), *cat.add(i));
+        let z = (r == 0 && c == u8::MAX) as usize;
+        *keys.add(iz) = k;
+        *day.add(iz) = d;
+        *ses.add(iz) = se;
+        *evs.add(iz) = e;
+        *tk.add(ip) = k;
+        *td.add(ip) = d;
+        *ts.add(ip) = se;
+        *te.add(ip) = e;
+        *tr.add(ip) = r;
+        *tc.add(ip) = c;
+        iz += z;
+        ip += 1 - z;
+        i += 1;
+    }
+    (iz, ip)
+}
+
+fn write_split(v: &View, a: usize, b: usize, path: &Path, cats_off: &[u32], cats_data: &[u8]) {
+    let mut x = a;
+    while x < b {
+        let y = if b - x > SUB_ROWS + SUB_ROWS / 2 { x + SUB_ROWS } else { b };
+        write_split_group(v, x, y, path, cats_off, cats_data);
+        x = y;
+    }
+}
+
+const SUB_ROWS: usize = crate::env_u32(option_env!("XL_SUB_DEF"), 4096) as usize;
+
+fn write_split_group(v: &View, a: usize, b: usize, path: &Path, cats_off: &[u32], cats_data: &[u8]) {
+    use std::slice::from_raw_parts as sl;
+    let n = b - a;
+    SPLIT.with(|s| {
+        let s = &mut *s.borrow_mut();
+        macro_rules! fit {
+            ($($f:ident)*) => { $( s.$f.clear(); s.$f.reserve(n + 16); )* };
+        }
+        fit!(k d s e r c);
+        let head = unsafe {
+            let (keys, day, ses, evs, rev, cat) = (v.keys.add(a) as *mut u32, v.day.add(a) as *mut i32, v.ses.add(a) as *mut i32, v.evs.add(a) as *mut i32, v.rev.add(a) as *mut i32, v.cat.add(a) as *mut u8);
+            let (iz, ip) = split_rows(keys, day, ses, evs, rev, cat, n, s.k.as_mut_ptr(), s.d.as_mut_ptr(), s.s.as_mut_ptr(), s.e.as_mut_ptr(), s.r.as_mut_ptr(), s.c.as_mut_ptr());
+            debug_assert_eq!(iz + ip, n);
+            std::ptr::write_bytes(rev, 0, iz);
+            std::ptr::write_bytes(cat, u8::MAX, iz);
+            std::ptr::copy_nonoverlapping(s.k.as_ptr(), keys.add(iz), ip);
+            std::ptr::copy_nonoverlapping(s.d.as_ptr(), day.add(iz), ip);
+            std::ptr::copy_nonoverlapping(s.s.as_ptr(), ses.add(iz), ip);
+            std::ptr::copy_nonoverlapping(s.e.as_ptr(), evs.add(iz), ip);
+            std::ptr::copy_nonoverlapping(s.r.as_ptr(), rev.add(iz), ip);
+            std::ptr::copy_nonoverlapping(s.c.as_ptr(), cat.add(iz), ip);
+            iz
+        };
+    let u = unsafe {
+        UserCols {
+            names: StrCol { offsets: sl(v.noff, v.nnoff), data: sl(v.names, v.nnames) },
+            keys: sl(v.keys.add(a), n),
+            day: sl(v.day.add(a), n),
+            ses: sl(v.ses.add(a), n),
+            evs: sl(v.evs.add(a), n),
+            rev: sl(v.rev.add(a), n),
+            cat: sl(v.cat.add(a), n),
+            cats: StrCol { offsets: cats_off, data: cats_data },
+            head,
+        }
+    };
+    UFILE.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.is_none() {
+            match UserFile::create(path, 1 << 20) {
+                Ok(x) => *f = Some(x),
+                Err(_) => die("user_daily"),
+            }
+        }
+        if f.as_mut().unwrap().add(&u, &mut s.b).is_err() {
+            die("user_daily");
+        }
+    });
+    });
+}
+
 fn write_rows(v: &View, a: usize, b: usize, path: &Path, cats_off: &[u32], cats_data: &[u8], kbuf: &mut Vec<u32>) {
     use std::slice::from_raw_parts as sl;
     let n = b - a;
+    if SPLIT_ROWS && n > 0 && RPG == 0 {
+        return write_split(v, a, b, path, cats_off, cats_data);
+    }
     let keys = unsafe { sl(v.keys.add(a), n) };
     let _ = &kbuf;
     let (names, noff) = unsafe { (sl(v.names, v.nnames), sl(v.noff, v.nnoff)) };
@@ -232,12 +373,24 @@ fn write_campaign_part(g: &G, path: &Path, lo: usize, hi: usize) -> [i64; 4] {
     [v[0].iter().sum(), v[2].iter().sum(), v[3].iter().sum(), organic]
 }
 
+fn clear_stale(dir: &Path) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_name().as_encoded_bytes().ends_with(b".parquet") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 pub fn stage5(g: &mut G, outdir: &str) {
     let ud = Path::new(outdir).join("user_daily");
     let cd = Path::new(outdir).join("campaign_daily");
     if std::fs::create_dir_all(&ud).is_err() || std::fs::create_dir_all(&cd).is_err() {
         die("cannot create the output folders");
     }
+    clear_stale(&ud);
+    clear_stale(&cd);
     let mut cats_off = vec![0u32];
     let mut cats_data = Vec::new();
     for c in &g.cats {
@@ -280,6 +433,7 @@ pub fn stage5(g: &mut G, outdir: &str) {
                 break;
             }
         }
+        end_user_file();
     });
 }
 
@@ -328,6 +482,8 @@ fn cut_guided(rows: &[(usize, usize)], nt: usize) -> Vec<(usize, usize, usize)> 
     v
 }
 
+pub static REGION_UNMAP: AtomicBool = AtomicBool::new(true);
+
 pub fn stage45(g: &mut G, outdir: &str) {
     crate::complex::stage4_pre(g);
     let ud = Path::new(outdir).join("user_daily");
@@ -335,6 +491,8 @@ pub fn stage45(g: &mut G, outdir: &str) {
     if std::fs::create_dir_all(&ud).is_err() || std::fs::create_dir_all(&cd).is_err() {
         die("cannot create the output folders");
     }
+    clear_stale(&ud);
+    clear_stale(&cd);
     let mut cats_off = vec![0u32];
     let mut cats_data = Vec::new();
     for c in &g.cats {
@@ -353,6 +511,8 @@ pub fn stage45(g: &mut G, outdir: &str) {
     let nf = 2 * nt;
     let csum: Vec<std::sync::Mutex<[i64; 4]>> = (0..nt).map(|_| std::sync::Mutex::new([0; 4])).collect();
     let ncp = gr_nc_plus1(g);
+    let rg_len = gr.files.last().map_or(0, |f| f.off + f.len);
+    let rg_todo = AtomicBool::new(REGION_UNMAP.load(Ordering::Relaxed) && rg_len > 0 && !gr.region.is_null());
     run_par(nt, |tid| {
         crate::complex::clicks_a(gr, tid);
         ca_done.fetch_add(1, Ordering::AcqRel);
@@ -378,6 +538,13 @@ pub fn stage45(g: &mut G, outdir: &str) {
             }
             let shards_done = ca_done.load(Ordering::Acquire) == nt && sh_done.load(Ordering::Acquire) == ns;
             if !shards_done || fq.load(Ordering::Relaxed) >= nf {
+                if rg_todo.load(Ordering::Relaxed) && rg_todo.swap(false, Ordering::AcqRel) {
+                    extern "C" {
+                        fn munmap(p: *mut u8, n: usize) -> i32;
+                    }
+                    unsafe { munmap(gr.region as *mut u8, rg_len) };
+                    continue;
+                }
                 if pq.load(Ordering::Relaxed) < np {
                     let i = pq.fetch_add(1, Ordering::Relaxed);
                     if i < np {
@@ -422,6 +589,7 @@ pub fn stage45(g: &mut G, outdir: &str) {
                 }
             }
         }
+        end_user_file();
     });
     if gr.check {
         let (mut us, mut ur) = (0i64, 0i64);

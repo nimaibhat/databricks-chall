@@ -29,13 +29,14 @@ pub enum Keys<'a> {
     U8(&'a [u8]),
     U16(&'a [u16]),
     U32(&'a [u32]),
+    U32Off(&'a [u32], u32),
 }
 impl<'a> Keys<'a> {
     pub fn len(&self) -> usize {
-        match self { Keys::U8(k) => k.len(), Keys::U16(k) => k.len(), Keys::U32(k) => k.len() }
+        match self { Keys::U8(k) => k.len(), Keys::U16(k) => k.len(), Keys::U32(k) => k.len(), Keys::U32Off(k, _) => k.len() }
     }
     fn slice(&self, a: usize, b: usize) -> Keys<'a> {
-        match self { Keys::U8(k) => Keys::U8(&k[a..b]), Keys::U16(k) => Keys::U16(&k[a..b]), Keys::U32(k) => Keys::U32(&k[a..b]) }
+        match self { Keys::U8(k) => Keys::U8(&k[a..b]), Keys::U16(k) => Keys::U16(&k[a..b]), Keys::U32(k) => Keys::U32(&k[a..b]), Keys::U32Off(k, o) => Keys::U32Off(&k[a..b], *o) }
     }
 }
 
@@ -87,7 +88,11 @@ impl Out {
     fn flush(&mut self) -> io::Result<()> {
         if let Some(f) = self.file.as_mut() {
             if !self.buf.is_empty() {
+                #[cfg(feature = "tl")]
+                let t0 = crate::sys::tl::now();
                 f.write_all(&self.buf)?;
+                #[cfg(feature = "tl")]
+                crate::sys::tl::WR_IO.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
                 self.flushed += self.buf.len() as u64;
                 self.buf.clear();
             }
@@ -401,6 +406,10 @@ fn plan(d: &Data) -> Plan {
             Keys::U8(k) => plan_dict_t(&dict, k, nullable, plain),
             Keys::U16(k) => plan_dict_t(&dict, k, nullable, plain),
             Keys::U32(k) => plan_dict_t(&dict, k, nullable, plain),
+            Keys::U32Off(k, _) => {
+                assert!(!nullable && !plain, "U32Off keys are required dictionary keys");
+                Plan::Dict { m: k.len(), vbytes: 0, w: bits_for(dict.len().saturating_sub(1) as u64) }
+            }
         },
     }
 }
@@ -416,6 +425,21 @@ fn slice_data<'a>(d: &Data<'a>, a: usize, b: usize) -> Data<'a> {
         Data::Str(s) => Data::Str(s.slice(a, b)),
         Data::Dict { dict, keys, nullable, plain } => Data::Dict { dict, keys: keys.slice(a, b), nullable, plain },
     }
+}
+fn narrow<'a>(d: Data<'a>) -> Data<'a> {
+    if let Data::Dict { dict, keys: Keys::U32Off(k, base), nullable, plain } = d {
+        if k.is_empty() {
+            return Data::Dict { dict: StrCol { offsets: &[], data: dict.data }, keys: Keys::U32Off(k, base), nullable, plain };
+        }
+        let (mut lo, mut hi) = (u32::MAX, 0u32);
+        for &x in k {
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+        let (l, h) = ((lo - base) as usize, (hi - base) as usize);
+        return Data::Dict { dict: StrCol { offsets: &dict.offsets[l..h + 2], data: dict.data }, keys: Keys::U32Off(k, lo), nullable, plain };
+    }
+    d
 }
 fn ptype(d: &Data) -> i32 {
     match d { Data::I32(..) | Data::Date(..) => T_INT32, Data::I64(..) => T_INT64, _ => T_BYTE_ARRAY }
@@ -501,9 +525,14 @@ unsafe fn valid_mask64(k: *const u8, cnt: usize) -> u64 {
 }
 
 unsafe fn emit_dict_u8_opt(o: &mut Out, dict: &StrCol, keys: &[u8], m: usize, w: u32) -> io::Result<u64> {
-    let n = keys.len();
     emit_dict_page_strs(o, dict)?;
     let data_off = o.pos();
+    emit_u8_opt_page(o, keys, m, w)?;
+    Ok(data_off)
+}
+
+unsafe fn emit_u8_opt_page(o: &mut Out, keys: &[u8], m: usize, w: u32) -> io::Result<()> {
+    let n = keys.len();
     let def = hybrid_len(n, 1);
     let vals = 1 + hybrid_len(m, w);
     let total = 4 + def + vals;
@@ -541,7 +570,7 @@ unsafe fn emit_dict_u8_opt(o: &mut Out, dict: &StrCol, keys: &[u8], m: usize, w:
     pk.finish((m + 7) / 8 * w as usize);
     o.commit(total);
     o.check()?;
-    Ok(data_off)
+    Ok(())
 }
 
 unsafe fn emit_dict_t<K: Key + PartialEq>(o: &mut Out, dict: &StrCol, keys: &[K], nullable: bool, plain: bool, m: usize, vbytes: usize, w: u32) -> io::Result<Option<u64>> {
@@ -549,14 +578,23 @@ unsafe fn emit_dict_t<K: Key + PartialEq>(o: &mut Out, dict: &StrCol, keys: &[K]
     let use_dict = !plain && m > 0;
     if use_dict { emit_dict_page_strs(o, dict)?; }
     let data_off = o.pos();
-    let def = if nullable { 4 + hybrid_len(n, 1) } else { 0 };
+    let mut dv = Vec::new();
+    if nullable && m == 0 && n > 0 {
+        put_varint(&mut dv, (n as u64) << 1);
+        dv.push(0);
+    }
+    let def = if nullable { 4 + if dv.is_empty() { hybrid_len(n, 1) } else { dv.len() } } else { 0 };
     let vals = if use_dict { 1 + hybrid_len(m, w) } else { vbytes };
     let mut h = Vec::with_capacity(32);
     page_header(&mut h, P_DATA, def + vals, n, if use_dict { E_RLE_DICT } else { E_PLAIN });
     o.put(&h);
     if nullable {
         o.put(&((def - 4) as u32).to_le_bytes());
-        emit_packed(o, n, 1, |i| (*keys.get_unchecked(i) != K::NUL) as u32)?;
+        if dv.is_empty() {
+            emit_packed(o, n, 1, |i| (*keys.get_unchecked(i) != K::NUL) as u32)?;
+        } else {
+            o.put(&dv);
+        }
     }
     if use_dict {
         o.put(&[w as u8]);
@@ -591,6 +629,78 @@ unsafe fn emit_dict_t<K: Key + PartialEq>(o: &mut Out, dict: &StrCol, keys: &[K]
         o.check()?;
     }
     Ok(if use_dict { Some(data_off) } else { None })
+}
+
+fn rle_len(keys: &[u32], w: u32) -> usize {
+    let vb = ((w + 7) / 8) as usize;
+    let n = keys.len();
+    let (mut total, mut i) = (0usize, 0usize);
+    while i < n {
+        let v = keys[i];
+        let mut j = i + 1;
+        while j < n && keys[j] == v { j += 1; }
+        total += varint_len(((j - i) as u64) << 1) + vb;
+        i = j;
+    }
+    total
+}
+
+unsafe fn emit_rle(o: &mut Out, keys: &[u32], base: u32, w: u32) -> io::Result<()> {
+    const RUNS: usize = 4096;
+    let vb = ((w + 7) / 8) as usize;
+    let n = keys.len();
+    let mut i = 0;
+    while i < n {
+        let p0 = o.tail(RUNS * 16);
+        let mut p = p0;
+        let mut runs = 0;
+        while i < n && runs < RUNS {
+            let v = *keys.get_unchecked(i);
+            let mut j = i + 1;
+            while j < n && *keys.get_unchecked(j) == v { j += 1; }
+            let mut h = ((j - i) as u64) << 1;
+            while h >= 0x80 { *p = h as u8 | 0x80; p = p.add(1); h >>= 7; }
+            *p = h as u8;
+            p = p.add(1);
+            let x = v.wrapping_sub(base).to_le_bytes();
+            std::ptr::copy_nonoverlapping(x.as_ptr(), p, vb);
+            p = p.add(vb);
+            i = j;
+            runs += 1;
+        }
+        o.commit(p.offset_from(p0) as usize);
+        o.check()?;
+    }
+    Ok(())
+}
+
+const RLE_KEYS: bool = crate::env_u32(option_env!("XL_RLEK_DEF"), 1) != 0;
+
+unsafe fn emit_dict_off(o: &mut Out, dict: &StrCol, keys: &[u32], base: u32, m: usize, w: u32) -> io::Result<Option<u64>> {
+    let n = keys.len();
+    if m == 0 {
+        let data_off = o.pos();
+        let mut h = Vec::with_capacity(32);
+        page_header(&mut h, P_DATA, 0, n, E_PLAIN);
+        o.put(&h);
+        let _ = data_off;
+        return Ok(None);
+    }
+    emit_dict_page_strs(o, dict)?;
+    let data_off = o.pos();
+    let packed = hybrid_len(m, w);
+    let rle = if RLE_KEYS { rle_len(keys, w) } else { usize::MAX };
+    let vals = 1 + packed.min(rle);
+    let mut h = Vec::with_capacity(32);
+    page_header(&mut h, P_DATA, vals, n, E_RLE_DICT);
+    o.put(&h);
+    o.put(&[w as u8]);
+    if rle < packed {
+        emit_rle(o, keys, base, w)?;
+    } else {
+        emit_packed(o, n, w, |i| keys.get_unchecked(i).wrapping_sub(base))?;
+    }
+    Ok(Some(data_off))
 }
 
 fn int_dict_page(o: &mut Out, es: usize, card: usize, val: impl Fn(usize) -> i64) {
@@ -632,6 +742,7 @@ fn emit_chunk(o: &mut Out, d: &Data, p: &Plan) -> io::Result<Meta> {
                     Keys::U8(k) => emit_dict_t(o, dict, k, *nullable, *plain, *m, *vbytes, *w)?,
                     Keys::U16(k) => emit_dict_t(o, dict, k, *nullable, *plain, *m, *vbytes, *w)?,
                     Keys::U32(k) => emit_dict_t(o, dict, k, *nullable, *plain, *m, *vbytes, *w)?,
+                    Keys::U32Off(k, b) => emit_dict_off(o, dict, k, *b, *m, *w)?,
                 };
                 if let Some(off) = r { meta.dict = true; meta.dict_off = start; meta.data_off = off; }
             }
@@ -646,9 +757,19 @@ fn emit_chunk(o: &mut Out, d: &Data, p: &Plan) -> io::Result<Meta> {
                 let min = *min;
                 int_dict_page(o, v.esize(), *card, |k| min + k as i64);
                 meta.dict = true; meta.dict_off = start; meta.data_off = o.pos();
+                if *card == 1 {
+                    let mut hv = Vec::with_capacity(12);
+                    put_varint(&mut hv, (n as u64) << 1);
+                    hv.push(0);
+                    page_header(&mut h, P_DATA, 1 + hv.len(), n, E_RLE_DICT);
+                    o.put(&h);
+                    o.put(&[*w as u8]);
+                    o.put(&hv);
+                } else {
                 match v {
                     Ints::A(a) => emit_int_keys(o, n, *w, |i| (*a.get_unchecked(i) as i64 - min) as u32)?,
                     Ints::B(b) => emit_int_keys(o, n, *w, |i| (*b.get_unchecked(i) - min) as u32)?,
+                }
                 }
             }
             (_, Plan::Hash { dict, keys, w }) => {
@@ -736,14 +857,24 @@ fn encode_into(o: &mut Out, cols: &[Column], opts: &Opts) -> io::Result<()> {
     let mut a = 0;
     while a < n {
         let b = if n - a > rpg { a + rpg } else { n };
-        let ds: Vec<Data> = cols.iter().map(|c| slice_data(&c.data, a, b)).collect();
+        let ds: Vec<Data> = cols.iter().map(|c| narrow(slice_data(&c.data, a, b))).collect();
+        #[cfg(feature = "tl")]
+        let tp = crate::sys::tl::now();
         let plans: Vec<Plan> = ds.iter().map(plan).collect();
+        #[cfg(feature = "tl")]
+        crate::sys::tl::WR_COL[7].fetch_add(crate::sys::tl::now() - tp, std::sync::atomic::Ordering::Relaxed);
         if o.file.is_none() {
             let bound: usize = ds.iter().zip(&plans).map(|(d, p)| chunk_bound(d, p)).sum();
             o.buf.reserve(bound + 512 + 160 * cols.len());
         }
         let mut metas = Vec::with_capacity(cols.len());
-        for (d, p) in ds.iter().zip(&plans) { metas.push(emit_chunk(o, d, p)?); }
+        for (_j, (d, p)) in ds.iter().zip(&plans).enumerate() {
+            #[cfg(feature = "tl")]
+            let tp = crate::sys::tl::now();
+            metas.push(emit_chunk(o, d, p)?);
+            #[cfg(feature = "tl")]
+            crate::sys::tl::WR_COL[_j.min(6)].fetch_add(crate::sys::tl::now() - tp, std::sync::atomic::Ordering::Relaxed);
+        }
         groups.push((b - a, metas));
         a = b;
     }
@@ -752,6 +883,217 @@ fn encode_into(o: &mut Out, cols: &[Column], opts: &Opts) -> io::Result<()> {
     o.put(&(f.len() as u32).to_le_bytes());
     o.put(b"PAR1");
     o.flush()
+}
+
+pub struct UserCols<'a> {
+    pub names: StrCol<'a>,
+    pub keys: &'a [u32],
+    pub day: &'a [i32],
+    pub ses: &'a [i32],
+    pub evs: &'a [i32],
+    pub rev: &'a [i32],
+    pub cat: &'a [u8],
+    pub cats: StrCol<'a>,
+    pub head: usize,
+}
+
+fn run_count(keys: &[u32]) -> usize {
+    if keys.is_empty() {
+        return 0;
+    }
+    let mut c = 1usize;
+    for i in 1..keys.len() {
+        c += (keys[i] != keys[i - 1]) as usize;
+    }
+    c
+}
+
+unsafe fn rle_into(out: &mut Vec<u8>, keys: &[u32], base: u32, vb: usize) {
+    let n = keys.len();
+    if n == 0 {
+        return;
+    }
+    out.reserve(n * (1 + vb) + 16);
+    let p0 = out.as_mut_ptr().add(out.len());
+    let mut p = p0;
+    let mut len = 0u64;
+    let kp = keys.as_ptr();
+    for i in 0..n - 1 {
+        let k = *kp.add(i);
+        let nx = *kp.add(i + 1);
+        len += 1;
+        (p as *mut u64).write_unaligned((len << 1) | ((k.wrapping_sub(base) as u64) << 8));
+        let end = (k != nx) | (len == 63);
+        p = p.add(if end { 1 + vb } else { 0 });
+        len = if end { 0 } else { len };
+    }
+    let k = *kp.add(n - 1);
+    len += 1;
+    (p as *mut u64).write_unaligned((len << 1) | ((k.wrapping_sub(base) as u64) << 8));
+    p = p.add(1 + vb);
+    let add = p.offset_from(p0) as usize;
+    out.set_len(out.len() + add);
+}
+
+unsafe fn emit_user_ids(o: &mut Out, d: &Data, head: usize, scratch: &mut Vec<u8>) -> io::Result<Meta> {
+    let (dict, keys, base) = match d {
+        Data::Dict { dict, keys: Keys::U32Off(k, b), .. } => (dict, *k, *b),
+        _ => unreachable!(),
+    };
+    let n = keys.len();
+    let start = o.pos();
+    let w = bits_for(dict.len().saturating_sub(1) as u64);
+    emit_dict_page_strs(o, dict)?;
+    let data_off = o.pos();
+    let vb = ((w + 7) / 8) as usize;
+    let (kz, kp) = keys.split_at(head);
+    let (ez, ep) = (run_count(kz) * (1 + vb), run_count(kp) * (1 + vb));
+    let (pp, packed) = (hybrid_len(kp.len(), w), hybrid_len(n, w));
+    let mut h = Vec::with_capacity(32);
+    if RLE_KEYS && ez + ep.min(pp) < packed {
+        scratch.clear();
+        rle_into(scratch, kz, base, vb);
+        let rle_tail = ep <= pp;
+        if rle_tail {
+            rle_into(scratch, kp, base, vb);
+        }
+        page_header(&mut h, P_DATA, 1 + scratch.len() + if rle_tail { 0 } else { pp }, n, E_RLE_DICT);
+        o.put(&h);
+        o.put(&[w as u8]);
+        o.raw(scratch)?;
+        if !rle_tail {
+            emit_packed(o, kp.len(), w, |i| kp.get_unchecked(i).wrapping_sub(base))?;
+        }
+    } else {
+        page_header(&mut h, P_DATA, 1 + packed, n, E_RLE_DICT);
+        o.put(&h);
+        o.put(&[w as u8]);
+        emit_packed(o, n, w, |i| keys.get_unchecked(i).wrapping_sub(base))?;
+    }
+    Ok(Meta { ptype: T_BYTE_ARRAY, dict: true, size: o.pos() - start, data_off, dict_off: start, nv: n })
+}
+
+unsafe fn emit_zero_head(o: &mut Out, rev: &[i32], head: usize) -> io::Result<Meta> {
+    let n = rev.len();
+    let start = o.pos();
+    let mut meta = Meta { ptype: T_INT32, dict: false, size: 0, data_off: start, dict_off: 0, nv: n };
+    let mut h = Vec::with_capacity(32);
+    if head > 0 {
+        int_dict_page(o, 4, 1, |_| 0);
+        meta.dict = true;
+        meta.dict_off = start;
+        meta.data_off = o.pos();
+        let mut hv = Vec::with_capacity(12);
+        put_varint(&mut hv, (head as u64) << 1);
+        hv.push(0);
+        page_header(&mut h, P_DATA, 1 + hv.len(), head, E_RLE_DICT);
+        o.put(&h);
+        o.put(&[1u8]);
+        o.put(&hv);
+    }
+    if head < n {
+        let tail = &rev[head..];
+        let bytes = std::slice::from_raw_parts(tail.as_ptr() as *const u8, tail.len() * 4);
+        h.clear();
+        page_header(&mut h, P_DATA, bytes.len(), tail.len(), E_PLAIN);
+        o.put(&h);
+        o.raw(bytes)?;
+    }
+    meta.size = o.pos() - start;
+    Ok(meta)
+}
+
+fn null_page(o: &mut Out, n: usize) {
+    let mut dv = Vec::with_capacity(12);
+    put_varint(&mut dv, (n as u64) << 1);
+    dv.push(0);
+    let mut h = Vec::with_capacity(32);
+    page_header(&mut h, P_DATA, 4 + dv.len(), n, E_PLAIN);
+    o.put(&h);
+    o.put(&(dv.len() as u32).to_le_bytes());
+    o.put(&dv);
+}
+
+unsafe fn emit_null_head(o: &mut Out, cats: &StrCol, cat: &[u8], head: usize) -> io::Result<Meta> {
+    let n = cat.len();
+    let start = o.pos();
+    let tail = &cat[head..];
+    let m = tail.iter().filter(|&&k| k != u8::MAX).count();
+    let w = bits_for(cats.len().saturating_sub(1) as u64);
+    let mut meta = Meta { ptype: T_BYTE_ARRAY, dict: false, size: 0, data_off: start, dict_off: 0, nv: n };
+    if m > 0 {
+        emit_dict_page_strs(o, cats)?;
+        meta.dict = true;
+        meta.dict_off = start;
+        meta.data_off = o.pos();
+    }
+    if head > 0 {
+        null_page(o, head);
+    }
+    if !tail.is_empty() {
+        if m > 0 {
+            emit_u8_opt_page(o, tail, m, w)?;
+        } else {
+            null_page(o, tail.len());
+        }
+    }
+    o.check()?;
+    meta.size = o.pos() - start;
+    Ok(meta)
+}
+
+fn user_cols<'a>(u: &UserCols<'a>) -> [Column<'a>; 6] {
+    [
+        Column { name: "user_id", data: Data::Dict { dict: u.names, keys: Keys::U32Off(u.keys, 0), nullable: false, plain: false } },
+        Column { name: "day", data: Data::Date(u.day, IntEnc::Dense) },
+        Column { name: "sessions", data: Data::I32(u.ses, IntEnc::Dense) },
+        Column { name: "events", data: Data::I32(u.evs, IntEnc::Auto) },
+        Column { name: "revenue_cents", data: Data::I32(u.rev, IntEnc::Plain) },
+        Column { name: "top_category", data: Data::Dict { dict: u.cats, keys: Keys::U8(u.cat), nullable: true, plain: false } },
+    ]
+}
+
+pub struct UserFile {
+    o: Out,
+    groups: Vec<(usize, Vec<Meta>)>,
+    rows: usize,
+}
+impl UserFile {
+    pub fn create(path: &Path, limit: usize) -> io::Result<UserFile> {
+        let f = File::create(path)?;
+        let mut o = Out { buf: Vec::with_capacity(limit + BLOCK * 64), flushed: 0, file: Some(f), limit };
+        o.put(b"PAR1");
+        Ok(UserFile { o, groups: Vec::new(), rows: 0 })
+    }
+    pub fn add(&mut self, u: &UserCols, scratch: &mut Vec<u8>) -> io::Result<()> {
+        let n = u.keys.len();
+        assert!(n > 0 && u.head <= n && u.day.len() == n && u.ses.len() == n && u.evs.len() == n && u.rev.len() == n && u.cat.len() == n);
+        let cols = user_cols(u);
+        let o = &mut self.o;
+        let mut metas = Vec::with_capacity(cols.len());
+        unsafe {
+            metas.push(emit_user_ids(o, &narrow(cols[0].data), u.head, scratch)?);
+            for c in &cols[1..4] {
+                let p = plan(&c.data);
+                metas.push(emit_chunk(o, &c.data, &p)?);
+            }
+            metas.push(emit_zero_head(o, u.rev, u.head)?);
+            metas.push(emit_null_head(o, &u.cats, u.cat, u.head)?);
+        }
+        self.groups.push((n, metas));
+        self.rows += n;
+        Ok(())
+    }
+    pub fn finish(mut self) -> io::Result<u64> {
+        let e = StrCol { offsets: &[], data: &[] };
+        let cols = user_cols(&UserCols { names: e, keys: &[], day: &[], ses: &[], evs: &[], rev: &[], cat: &[], cats: e, head: 0 });
+        let f = footer(&cols, &self.groups, self.rows);
+        self.o.put(&f);
+        self.o.put(&(f.len() as u32).to_le_bytes());
+        self.o.put(b"PAR1");
+        self.o.flush()?;
+        Ok(self.o.flushed)
+    }
 }
 
 pub fn encode(cols: &[Column], opts: &Opts) -> Vec<u8> {
@@ -770,14 +1112,33 @@ pub fn write_file(path: &Path, cols: &[Column], opts: &Opts, method: Method) -> 
     match method {
         Method::Whole => {
             let v = encode(cols, opts);
+            #[cfg(feature = "tl")]
+            let t0 = crate::sys::tl::now();
             let mut f = File::create(path)?;
+            #[cfg(feature = "tl")]
+            let t1 = crate::sys::tl::now();
             f.write_all(&v)?;
+            #[cfg(feature = "tl")]
+            {
+                crate::sys::tl::WR_OPEN.fetch_add(t1 - t0, std::sync::atomic::Ordering::Relaxed);
+                crate::sys::tl::WR_IO.fetch_add(crate::sys::tl::now() - t1, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(v.len() as u64)
         }
         Method::Stream(limit) => {
+            #[cfg(feature = "tl")]
+            let t0 = crate::sys::tl::now();
             let f = File::create(path)?;
+            #[cfg(feature = "tl")]
+            crate::sys::tl::WR_OPEN.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
             let mut o = Out { buf: Vec::with_capacity(limit + BLOCK * 64), flushed: 0, file: Some(f), limit };
             encode_into(&mut o, cols, opts)?;
+            #[cfg(feature = "tl")]
+            {
+                let t0 = crate::sys::tl::now();
+                drop(o.file.take());
+                crate::sys::tl::WR_CLOSE.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(o.flushed)
         }
         Method::Mmap { populate } => {

@@ -23,6 +23,33 @@ const HP: usize = 2 << 20;
 pub static HUGE: AtomicBool = AtomicBool::new(true);
 pub static SMALLPAGES: AtomicBool = AtomicBool::new(false);
 
+pub static FD_ALL: AtomicBool = AtomicBool::new(false);
+
+pub fn fd_reserve() {
+    extern "C" {
+        fn dup2(a: i32, b: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    if std::env::var("XL_FDALL").is_ok_and(|v| v == "0") {
+        return;
+    }
+    unsafe {
+        if dup2(2, 1000) == 1000 {
+            close(1000);
+            FD_ALL.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn minflt(who: i32) -> i64 {
+    extern "C" {
+        fn getrusage(who: i32, ru: *mut [i64; 18]) -> i32;
+    }
+    let mut ru = [0i64; 18];
+    unsafe { getrusage(who, &mut ru) };
+    ru[8]
+}
+
 pub fn detect_pages() {
     let never = std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled").map_or(false, |s| s.windows(7).any(|w| w == b"[never]"));
     SMALLPAGES.store(!HUGE.load(Ordering::Relaxed) || never, Ordering::Relaxed);
@@ -246,6 +273,9 @@ fn rdtsc() -> u64 {
     unsafe { std::arch::x86_64::_rdtsc() }
 }
 
+pub static CORE_NOTOUCH: AtomicBool = AtomicBool::new(true);
+pub static SETUP_KP: AtomicUsize = AtomicUsize::new(0);
+pub static SETUP_PARTS: AtomicBool = AtomicBool::new(true);
 pub fn pool_start(nt: usize) {
     if nt < 2 || POOL_N.load(Ordering::SeqCst) != 0 {
         return;
@@ -391,6 +421,8 @@ pub mod tl {
     pub static WR_COL: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
     pub static mut TASK: [(u64, u64, u64); 64] = [(0, 0, 0); 64];
     pub static mut SH: [(u64, u64, u64); 64] = [(0, 0, 0); 64];
+    pub static mut STASK: [(u64, u64); 64] = [(0, 0); 64];
+    pub static mut CHAIN_END: u64 = 0;
     #[inline(always)]
     pub fn now() -> u64 {
         unsafe { std::arch::x86_64::_rdtsc() }
@@ -517,6 +549,13 @@ pub mod tl {
                 }
             }
             eprintln!("[tl] shards over 0.05 ms (start+dur):{s}");
+            let mut s = String::new();
+            for (i, &(a, b)) in STASK.iter().enumerate() {
+                if a != 0 {
+                    s.push_str(&format!(" {i}:{:.3}-{:.3}", ms(T0, a), ms(T0, b)));
+                }
+            }
+            eprintln!("[tl] u8 setup queue (ms after t0; chain end {:.3}, post0 {:.3}, post1 {:.3}):{s}", ms(T0, CHAIN_END), ms(T0, POST[0]), ms(T0, POST[1]));
             eprintln!("[tl] campaign: agg {:.3} cols {:.3} file {:.3}", ms(TASK[8].0, MK[15][4]), ms(MK[15][4], MK[15][5]), ms(MK[15][5], MK[15][6]));
             eprintln!("[tl] lookups (ms after t0): start {:.3} prod read {:.3} prod parsed {:.3} done {:.3}", ms(T0, MK[15][0]), ms(T0, MK[15][1]), ms(T0, MK[15][2]), ms(T0, MK[15][3]));
             if std::env::var("XL_EXITPROF").is_ok() {

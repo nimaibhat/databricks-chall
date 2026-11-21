@@ -277,6 +277,7 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
         unsafe { crate::parse::keep_fd(f) };
         off += (len + pg + hpg - 1) & !(hpg - 1);
     }
+    crate::parse::fault_around_check(region, &files);
     lap("s.mmap");
     let total_bytes = ev_bytes + ck_bytes + lk_bytes;
     let ch = (total_bytes / (nt * 16)).clamp(64 << 10, 2 << 20);
@@ -883,6 +884,7 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
                 }
             }
         }
+        crate::parse::fault_around_check(region, &files);
         lap("s.mmap");
         if !sbytes.done.load(Ordering::Relaxed) {
             sbytes.set((region as usize, 0));
