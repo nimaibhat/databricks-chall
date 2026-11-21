@@ -1102,6 +1102,8 @@ struct Scratch {
     apos: Vec<u32>,
     since: Vec<u32>,
     active: Vec<u32>,
+    /// one person's clicks in time order: ts << 32 | index into the group
+    ck: Vec<u64>,
 }
 
 #[inline(never)]
@@ -1248,10 +1250,21 @@ fn process_partition(
         if evs.len() > 1 {
             evs.sort_unstable();
         }
-        let cls = &mut cl[coff[g] as usize..coff[g + 1] as usize];
-        if cls.len() > 1 {
-            cls.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
+        // The person's clicks in time order, as words (ts << 32 | index):
+        // sorting words is cheaper than sorting records with a comparator.
+        // Clicks with equal times stay in no particular order; the one place
+        // that cares (credit goes to the smallest click_id among the latest)
+        // looks at the whole run of equal times.
+        let cls = &cl[coff[g] as usize..coff[g + 1] as usize];
+        let ck = &mut sc.ck;
+        ck.clear();
+        ck.extend(cls.iter().enumerate().map(|(i, c)| ((c.ts as u64) << 32) | i as u64));
+        if ck.len() > 1 {
+            ck.sort_unstable();
         }
+        let ncl = ck.len();
+        let cts = |j: usize| -> u32 { (ck[j] >> 32) as u32 };
+        let cat = |j: usize| -> &CSort { &cls[(ck[j] & 0xFFFF_FFFF) as usize] };
         let person = gkeys[g];
         let mut cur_day: i32 = i32::MIN;
         // sessions, events, revenue of the current day so far
@@ -1312,8 +1325,8 @@ fn process_partition(
             // that enters the window notes how many sessions the day had
             // (`since`), and is paid for the sessions since then when it
             // leaves, when the day ends, or when the person ends.
-            while cj < cls.len() && cls[cj].ts as u64 <= start_off as u64 + WEEK {
-                let c = cls[cj].camp as usize;
+            while cj < ncl && cts(cj) as u64 <= start_off as u64 + WEEK {
+                let c = cat(cj).camp as usize;
                 if acnt[c] == 0 {
                     apos[c] = active.len() as u32;
                     active.push(c as u32);
@@ -1322,8 +1335,8 @@ fn process_partition(
                 acnt[c] += 1;
                 cj += 1;
             }
-            while wlo < cj && cls[wlo].ts < start_off {
-                let c = cls[wlo].camp as usize;
+            while wlo < cj && cts(wlo) < start_off {
+                let c = cat(wlo).camp as usize;
                 acnt[c] -= 1;
                 if acnt[c] == 0 {
                     // it assisted the sessions before this one
@@ -1339,13 +1352,20 @@ fn process_partition(
             }
             let mut camp = organic;
             if cj > 0 {
-                let lt = cls[cj - 1].ts;
+                let lt = cts(cj - 1);
                 if lt >= start_off {
+                    // the latest click; among clicks at that same time, the
+                    // one with the byte-wise smallest click_id
+                    let mut best = cat(cj - 1);
                     let mut q = cj - 1;
-                    while q > 0 && cls[q - 1].ts == lt {
+                    while q > 0 && cts(q - 1) == lt {
                         q -= 1;
+                        let c = cat(q);
+                        if key_cmp(c.cid, best.cid) == std::cmp::Ordering::Less {
+                            best = c;
+                        }
                     }
-                    camp = cls[q].camp;
+                    camp = best.camp;
                 }
             }
             let cell = a.camp_cell(camp as usize, di);
