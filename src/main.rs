@@ -1170,24 +1170,212 @@ fn dedup_partition(
     }
 }
 
+/// One 30-minute bin of a person's events. Two events in one bin are less than
+/// 30 minutes apart, so a session can only end between occupied bins.
+#[derive(Clone, Copy)]
+struct Bin {
+    min: u32,
+    max: u32,
+    cnt: u32,
+    ph: u32, // head of the bin's purchase list in `Bins::purch`, or u32::MAX
+}
+const FREE_BIN: Bin = Bin { min: u32::MAX, max: 0, cnt: 0, ph: u32::MAX };
+
 #[derive(Default)]
-struct Scratch {
-    gmap: Option<KMap<u32>>,
-    gkeys: Vec<Key>,
-    counts: Vec<u32>,
-    off: Vec<u32>,
-    pos: Vec<u32>,
-    gid: Vec<u32>,
-    ev: Vec<SRec>,
-    ccounts: Vec<u32>,
-    coff: Vec<u32>,
-    cgid: Vec<u32>,
-    cl: Vec<CRec>,
+struct Bins {
+    bins: Vec<Bin>,
+    bits: Vec<u64>,
+    purch: Vec<(u32, u32)>, // (pc, next)
+}
+
+/// Per-thread accumulators of the session walk.
+#[derive(Default)]
+struct Sink {
     cat_rev: Vec<u64>,
     touched: Vec<u16>,
     acnt: Vec<u32>,
     apos: Vec<u32>,
     active: Vec<u32>,
+}
+
+#[derive(Default)]
+struct Scratch {
+    gmap: Option<KMap<u32>>,
+    gkeys: Vec<Key>,
+    off: Vec<u32>,
+    fill: Vec<u32>,
+    gid: Vec<u32>,
+    ev: Vec<u64>, // ts << 32 | pc, grouped by person
+    coff: Vec<u32>,
+    cgid: Vec<u32>,
+    cl: Vec<(u64, Key)>, // (ts since ws - 7 days) << 32 | campaign, click_id
+    bins: Bins,
+    sink: Sink,
+}
+
+/// Persons with more events than this walk bins instead of sorting.
+const BIN_MIN: usize = 16;
+
+#[inline(always)]
+fn isort_by<T: Copy>(v: &mut [T], key: impl Fn(&T) -> u64) {
+    for i in 1..v.len() {
+        let x = v[i];
+        let kx = key(&x);
+        let mut j = i;
+        while j > 0 && key(&v[j - 1]) > kx {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+    }
+}
+
+/// One person's sessions in start order: `begin`, events and purchases, `end`.
+struct Sess<'a> {
+    a: &'a mut out::Acc,
+    k: &'a mut Sink,
+    cls: &'a [(u64, Key)],
+    person: Key,
+    day0: i64,
+    r0: u64, // ms from the first day's midnight to window start
+    organic: u32,
+    cur_day: u32,
+    d_sess: u32,
+    d_events: u32,
+    d_rev: u64,
+    cj: usize,
+    wlo: usize,
+    start: u32,
+    cnt: u32,
+    rev: u64,
+    purchase: bool,
+}
+
+impl Sess<'_> {
+    #[inline(always)]
+    fn begin(&mut self, start: u32) {
+        let di = ((start as u64 + self.r0) / DAY_MS as u64) as u32;
+        if di != self.cur_day {
+            if self.cur_day != u32::MAX {
+                self.flush_day();
+            }
+            self.cur_day = di;
+            self.d_sess = 0;
+            self.d_events = 0;
+            self.d_rev = 0;
+        }
+        self.start = start;
+        self.cnt = 0;
+        self.rev = 0;
+        self.purchase = false;
+    }
+
+    #[inline(always)]
+    fn add(&mut self, pc: u32) {
+        let price = pc >> 8;
+        if price != 0 {
+            self.purchase = true;
+            self.rev += price as u64;
+            let c = (pc & 0xFF) as usize;
+            let k = &mut *self.k;
+            let v = unsafe { k.cat_rev.get_unchecked_mut(c) };
+            if *v == 0 {
+                k.touched.push(c as u16);
+            }
+            *v += price as u64;
+        }
+    }
+
+    #[inline(always)]
+    fn end(&mut self) {
+        self.d_sess += 1;
+        self.d_events += self.cnt;
+        self.d_rev += self.rev;
+        // clicks in [start - 7d, start] form the window: credit picks the
+        // latest (smallest click_id on a tie), every distinct campaign assists
+        let cls = self.cls;
+        let k = &mut *self.k;
+        let hi = self.start as u64 + WEEK_MS as u64;
+        let lo = self.start as u64;
+        while self.cj < cls.len() && cls[self.cj].0 >> 32 <= hi {
+            let c = cls[self.cj].0 as u32 as usize;
+            if k.acnt[c] == 0 {
+                k.apos[c] = k.active.len() as u32;
+                k.active.push(c as u32);
+            }
+            k.acnt[c] += 1;
+            self.cj += 1;
+        }
+        while self.wlo < self.cj && cls[self.wlo].0 >> 32 < lo {
+            let c = cls[self.wlo].0 as u32 as usize;
+            k.acnt[c] -= 1;
+            if k.acnt[c] == 0 {
+                let i = k.apos[c] as usize;
+                let last = k.active.pop().unwrap();
+                if last as usize != c {
+                    k.active[i] = last;
+                    k.apos[last as usize] = i as u32;
+                }
+            }
+            self.wlo += 1;
+        }
+        let mut camp = self.organic;
+        if self.cj > self.wlo {
+            let lt = cls[self.cj - 1].0 >> 32;
+            let mut q = self.cj - 1;
+            let mut best = q;
+            while q > self.wlo && cls[q - 1].0 >> 32 == lt {
+                q -= 1;
+                if key_cmp(cls[q].1, cls[best].1) == std::cmp::Ordering::Less {
+                    best = q;
+                }
+            }
+            camp = cls[best].0 as u32;
+        }
+        let di = self.cur_day as usize;
+        let cell = self.a.camp_cell(camp as usize, di);
+        cell[0] += 1;
+        cell[1] += self.purchase as u64;
+        cell[2] += self.rev;
+        for &c in k.active.iter() {
+            self.a.camp_cell(c as usize, di)[3] += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn flush_day(&mut self) {
+        let k = &mut *self.k;
+        let mut top = u16::MAX;
+        let mut best = 0u64;
+        for &c in k.touched.iter() {
+            let v = k.cat_rev[c as usize];
+            if v > best || (v == best && c < top) {
+                best = v;
+                top = c;
+            }
+            k.cat_rev[c as usize] = 0;
+        }
+        k.touched.clear();
+        self.a.users.push(out::URow {
+            person: self.person,
+            day: (self.day0 + self.cur_day as i64) as i32,
+            sessions: self.d_sess,
+            events: self.d_events,
+            revenue: self.d_rev,
+            top,
+        });
+    }
+
+    #[inline(always)]
+    fn finish(&mut self) {
+        self.end();
+        self.flush_day();
+        let k = &mut *self.k;
+        for &c in k.active.iter() {
+            k.acnt[c as usize] = 0;
+        }
+        k.active.clear();
+    }
 }
 
 #[inline(never)]
@@ -1204,57 +1392,63 @@ fn process_partition(
         return;
     }
     let gmap = sc.gmap.get_or_insert_with(|| KMap::<u32>::with_capacity(16));
-    gmap.reset(n / 4 + 16);
+    gmap.reset(n / 32 + 16);
     // group events by person (counting sort)
     let gkeys = &mut sc.gkeys;
-    let counts = &mut sc.counts;
+    let off = &mut sc.off;
     let gid = &mut sc.gid;
     gkeys.clear();
-    counts.clear();
+    off.clear();
     gid.clear();
+    gid.reserve(n);
     for l in slists {
         l.for_each_slice(|sl| {
             for r in sl {
-                if r.pc == INVALID {
-                    gid.push(u32::MAX);
-                    continue;
+                let g = if r.pc == INVALID {
+                    u32::MAX
+                } else {
+                    let (s, ins) = gmap.entry(r.person, gkeys.len() as u32);
+                    if ins {
+                        gkeys.push(r.person);
+                        off.push(0);
+                    }
+                    let g = *gmap.val_mut(s);
+                    unsafe { *off.get_unchecked_mut(g as usize) += 1 };
+                    g
+                };
+                unsafe {
+                    gid.as_mut_ptr().add(gid.len()).write(g);
+                    gid.set_len(gid.len() + 1);
                 }
-                let (s, ins) = gmap.entry(r.person, gkeys.len() as u32);
-                if ins {
-                    gkeys.push(r.person);
-                    counts.push(0);
-                }
-                let g = *gmap.val_mut(s);
-                counts[g as usize] += 1;
-                gid.push(g);
             }
         });
     }
     let ng = gkeys.len();
-    let off = &mut sc.off;
-    off.clear();
-    off.push(0);
-    for g in 0..ng {
-        let o = off[g] + counts[g];
-        off.push(o);
+    let mut tot = 0u32;
+    for c in off.iter_mut() {
+        let x = *c;
+        *c = tot;
+        tot += x;
     }
-    let pos = &mut sc.pos;
-    pos.clear();
-    pos.extend_from_slice(&off[..ng]);
+    off.push(tot);
+    let fill = &mut sc.fill;
+    fill.clear();
+    fill.extend_from_slice(&off[..ng]);
     let ev = &mut sc.ev;
-    let n = off[ng] as usize;
+    let ne = tot as usize;
     ev.clear();
-    ev.reserve(n);
-    unsafe { ev.set_len(n) };
+    ev.reserve(ne);
+    unsafe { ev.set_len(ne) };
     {
         let mut i = 0;
         for l in slists {
             l.for_each_slice(|sl| {
                 for r in sl {
-                    let g = gid[i] as usize;
+                    let g = unsafe { *gid.get_unchecked(i) } as usize;
                     if g != u32::MAX as usize {
-                        unsafe { *ev.get_unchecked_mut(pos[g] as usize) = *r };
-                        pos[g] += 1;
+                        let f = unsafe { fill.get_unchecked_mut(g) };
+                        unsafe { *ev.get_unchecked_mut(*f as usize) = ((r.ts as u64) << 32) | r.pc as u64 };
+                        *f += 1;
                     }
                     i += 1;
                 }
@@ -1262,9 +1456,9 @@ fn process_partition(
         }
     }
     // group clicks by person (only persons with events)
-    let ccounts = &mut sc.ccounts;
-    ccounts.clear();
-    ccounts.resize(ng, 0);
+    let coff = &mut sc.coff;
+    coff.clear();
+    coff.resize(ng + 1, 0);
     let cgid = &mut sc.cgid;
     cgid.clear();
     for l in clists {
@@ -1272,26 +1466,26 @@ fn process_partition(
             for r in sl {
                 let g = gmap.get(r.person).unwrap_or(u32::MAX);
                 if g != u32::MAX {
-                    ccounts[g as usize] += 1;
+                    coff[g as usize] += 1;
                 }
                 cgid.push(g);
             }
         });
     }
-    let coff = &mut sc.coff;
-    coff.clear();
-    coff.push(0);
-    for g in 0..ng {
-        let o = coff[g] + ccounts[g];
-        coff.push(o);
+    let mut tot = 0u32;
+    for c in coff.iter_mut() {
+        let x = *c;
+        *c = tot;
+        tot += x;
     }
-    pos.clear();
-    pos.extend_from_slice(&coff[..ng]);
+    fill.clear();
+    fill.extend_from_slice(&coff[..ng]);
     let cl = &mut sc.cl;
-    let ncl = coff[ng] as usize;
+    let ncl = tot as usize;
     cl.clear();
     cl.reserve(ncl);
     unsafe { cl.set_len(ncl) };
+    let cbase = ctx.ws - WEEK_MS;
     {
         let mut j = 0;
         for l in clists {
@@ -1299,8 +1493,10 @@ fn process_partition(
                 for r in sl {
                     let g = cgid[j];
                     if g != u32::MAX {
-                        unsafe { *cl.get_unchecked_mut(pos[g as usize] as usize) = *r };
-                        pos[g as usize] += 1;
+                        let f = &mut fill[g as usize];
+                        let k = (((r.ts - cbase) as u64) << 32) | r.camp as u64;
+                        unsafe { *cl.get_unchecked_mut(*f as usize) = (k, r.cid) };
+                        *f += 1;
                     }
                     j += 1;
                 }
@@ -1308,150 +1504,108 @@ fn process_partition(
         }
     }
 
-    let cat_rev = &mut sc.cat_rev;
-    cat_rev.clear();
-    cat_rev.resize(ncat, 0);
-    let touched = &mut sc.touched;
-    if sc.acnt.len() < ctx.camp_names.len() + 1 {
-        sc.acnt = vec![0; ctx.camp_names.len() + 1];
-        sc.apos = vec![0; ctx.camp_names.len() + 1];
+    let sink = &mut sc.sink;
+    if sink.cat_rev.len() < ncat {
+        sink.cat_rev = vec![0; ncat];
     }
-    let acnt = &mut sc.acnt;
-    let apos = &mut sc.apos;
-    let active = &mut sc.active;
+    if sink.acnt.len() < ctx.camp_names.len() + 1 {
+        sink.acnt = vec![0; ctx.camp_names.len() + 1];
+        sink.apos = vec![0; ctx.camp_names.len() + 1];
+    }
+    let bb = &mut sc.bins;
+    if bb.bins.is_empty() {
+        let nbins = ((ctx.we - ctx.ws) as u64).div_ceil(GAP_MS as u64) as usize + 1;
+        bb.bins = vec![FREE_BIN; nbins];
+        bb.bits = vec![0; nbins.div_ceil(64)];
+    }
     let organic = ctx.camp_names.len() as u32;
-    let ws = ctx.ws;
+    let r0 = (ctx.ws - ctx.day0 * DAY_MS) as u64;
 
     for g in 0..ng {
         let evs = &mut ev[off[g] as usize..off[g + 1] as usize];
-        if evs.len() > 1 {
-            evs.sort_unstable_by_key(|r| r.ts);
-        }
         let cls = &mut cl[coff[g] as usize..coff[g + 1] as usize];
-        if cls.len() > 1 {
-            cls.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
+        if cls.len() > 16 {
+            cls.sort_unstable_by_key(|c| c.0);
+        } else {
+            isort_by(cls, |c| c.0);
         }
-        let person = gkeys[g];
-        let mut cur_day: i32 = i32::MIN;
-        let mut d_sess = 0u32;
-        let mut d_events = 0u32;
-        let mut d_rev = 0u64;
-        let mut cj = 0usize;
-        let mut wlo = 0usize;
-
-        let mut k = 0usize;
-        let ne = evs.len();
-        while k < ne {
-            let start_off = evs[k].ts;
-            let start = ws + start_off as i64;
-            let mut last = start_off;
-            let mut cnt = 0u32;
-            let mut rev = 0u64;
-            let mut purchase = false;
-            let day = start.div_euclid(DAY_MS) as i32;
-            if day != cur_day {
-                if cur_day != i32::MIN {
-                    flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
+        let mut s = Sess {
+            a: &mut *a,
+            k: &mut *sink,
+            cls,
+            person: gkeys[g],
+            day0: ctx.day0,
+            r0,
+            organic,
+            cur_day: u32::MAX,
+            d_sess: 0,
+            d_events: 0,
+            d_rev: 0,
+            cj: 0,
+            wlo: 0,
+            start: 0,
+            cnt: 0,
+            rev: 0,
+            purchase: false,
+        };
+        if evs.len() <= BIN_MIN {
+            isort_by(evs, |&e| e);
+            let mut last = (evs[0] >> 32) as u32;
+            s.begin(last);
+            for &e in evs.iter() {
+                let ts = (e >> 32) as u32;
+                if ts - last > GAP_MS as u32 {
+                    s.end();
+                    s.begin(ts);
                 }
-                cur_day = day;
-                d_sess = 0;
-                d_events = 0;
-                d_rev = 0;
+                last = ts;
+                s.cnt += 1;
+                s.add(e as u32);
             }
-            while k < ne && evs[k].ts - last <= GAP_MS as u32 {
-                let r = &evs[k];
-                last = r.ts;
-                cnt += 1;
-                let price = r.pc >> 8;
-                if price != 0 {
-                    purchase = true;
-                    rev += price as u64;
-                    let c = (r.pc & 0xFF) as usize;
-                    if cat_rev[c] == 0 {
-                        touched.push(c as u16);
+        } else {
+            let (mut wmin, mut wmax) = (usize::MAX, 0usize);
+            for &e in evs.iter() {
+                let ts = (e >> 32) as u32;
+                let b = (ts / GAP_MS as u32) as usize;
+                let bin = unsafe { bb.bins.get_unchecked_mut(b) };
+                bin.cnt += 1;
+                bin.min = bin.min.min(ts);
+                bin.max = bin.max.max(ts);
+                if (e as u32) >> 8 != 0 {
+                    bb.purch.push((e as u32, bin.ph));
+                    bin.ph = (bb.purch.len() - 1) as u32;
+                }
+                unsafe { *bb.bits.get_unchecked_mut(b >> 6) |= 1u64 << (b & 63) };
+                wmin = wmin.min(b >> 6);
+                wmax = wmax.max(b >> 6);
+            }
+            let mut open = false;
+            let mut prev_max = 0u32;
+            for wi in wmin..=wmax {
+                let mut m = std::mem::take(&mut bb.bits[wi]);
+                while m != 0 {
+                    let b = wi * 64 + m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let bin = std::mem::replace(unsafe { bb.bins.get_unchecked_mut(b) }, FREE_BIN);
+                    if !open {
+                        open = true;
+                        s.begin(bin.min);
+                    } else if bin.min - prev_max > GAP_MS as u32 {
+                        s.end();
+                        s.begin(bin.min);
                     }
-                    cat_rev[c] += price as u64;
-                }
-                k += 1;
-            }
-            d_sess += 1;
-            d_events += cnt;
-            d_rev += rev;
-            // clicks in [start - 7d, start] form the window: credit picks the
-            // latest, every distinct campaign in it assists
-            while cj < cls.len() && cls[cj].ts <= start {
-                let c = cls[cj].camp as usize;
-                if acnt[c] == 0 {
-                    apos[c] = active.len() as u32;
-                    active.push(c as u32);
-                }
-                acnt[c] += 1;
-                cj += 1;
-            }
-            while wlo < cj && cls[wlo].ts < start - WEEK_MS {
-                let c = cls[wlo].camp as usize;
-                acnt[c] -= 1;
-                if acnt[c] == 0 {
-                    let i = apos[c] as usize;
-                    let last = active.pop().unwrap();
-                    if last as usize != c {
-                        active[i] = last;
-                        apos[last as usize] = i as u32;
+                    prev_max = bin.max;
+                    s.cnt += bin.cnt;
+                    let mut p = bin.ph;
+                    while p != u32::MAX {
+                        let (pc, nx) = bb.purch[p as usize];
+                        s.add(pc);
+                        p = nx;
                     }
                 }
-                wlo += 1;
             }
-            let mut camp = organic;
-            if cj > 0 {
-                let lt = cls[cj - 1].ts;
-                if start - lt <= WEEK_MS {
-                    let mut q = cj - 1;
-                    while q > 0 && cls[q - 1].ts == lt {
-                        q -= 1;
-                    }
-                    camp = cls[q].camp;
-                }
-            }
-            let di = (day as i64 - ctx.day0) as usize;
-            let cell = a.camp_cell(camp as usize, di);
-            cell[0] += 1;
-            cell[1] += purchase as u64;
-            cell[2] += rev;
-            for &c in active.iter() {
-                a.camp_cell(c as usize, di)[3] += 1;
-            }
+            bb.purch.clear();
         }
-        flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
-
-        for &c in active.iter() {
-            acnt[c as usize] = 0;
-        }
-        active.clear();
+        s.finish();
     }
-}
-
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn flush_user(
-    a: &mut out::Acc,
-    person: Key,
-    day: i32,
-    sessions: u32,
-    events: u32,
-    rev: u64,
-    cat_rev: &mut [u64],
-    touched: &mut Vec<u16>,
-) {
-    let mut top = u16::MAX;
-    let mut best = 0u64;
-    for &c in touched.iter() {
-        let v = cat_rev[c as usize];
-        if v > best || (v == best && c < top) {
-            best = v;
-            top = c;
-        }
-        cat_rev[c as usize] = 0;
-    }
-    touched.clear();
-    a.users.push(out::URow { person, day, sessions, events, revenue: rev, top });
 }
