@@ -7,4 +7,4 @@ RUN sh /src/build.sh
 FROM scratch
 COPY --from=build /out/ /
 USER 1000:1000
-ENTRYPOINT ["/probe"]
+ENTRYPOINT ["/p/mn"]
