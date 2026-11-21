@@ -11,7 +11,7 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
 | 1 | Fresh numbers for the new pipeline (no code): lap line, `prof` thread-ms, fault count, user/system time, peak RSS, `perf report` top 15 symbols, and `perf annotate` of the new `ev_loop` | n/a | Directs everything else | Every figure these notes rank by was measured on `941879e`/`801982c`; the parser, record size, click index and writer have all changed since (experiments 15, 16) | None | 18.1 |
-| 2 | Staging footprint of the 12-byte event path: prefetch the staging block a batch ahead | `parse.rs:318` (`EV_STAGE = 192`), `parse.rs:428` (`EvPart::push_many`) | Unknown; experiment 15 shows the sign: more buckets now costs parse 8 ms at 20M | Staging is now 256 B per bucket per thread (was 64 B): 197 KB at 20M, 295 KB at 30M, two hyperthreads per 1 MiB L2 | None | 18.2 |
+| 2 | Staging footprint of the 12-byte event path: first the 10M parse lap (no code), then the prefetch pre-pass | `parse.rs:428` (`EvPart::push_many`) | Pool about 7 ms at 20M if the bucket-count line extrapolates (arithmetic on experiments 15 and 16, mine); the prefetch would take part of it, **my estimate** 0 to 2 ms | Staging is now 256 B per bucket per thread (was 64 B): 197 KB at 20M, 295 KB at 30M, two hyperthreads per 1 MiB L2 | None | 19 |
 | 3 | Frequency-licence probe at three points | end of `stage1`, end of `stage3a` | Diagnostic | Still not run; the new push path uses a masked 128-bit store only, so the picture has not got worse | None | 14.2 |
 | 4 | (empty until 18.1's numbers exist) | | | | | |
 | 5 | (empty) | | | | | |
@@ -569,6 +569,36 @@ On `9363748`, seed 20, tmpfs, the same commands as the "Facts for the research s
 - So the stage is now on the edge at 20M. `XL_BB=16` is not available: the 12-byte layout asserts `BB <= 15` (`parse.rs:325`), so a larger bucket would mean giving up the 12-byte records. That leaves one cheap test: in `EvPart::push_many` (`parse.rs:428`), prefetch each row's target (`l + f`, from `lp` and `fill`) a batch ahead. **My estimate of sign only; no size claimed.**
 - Users numbered at or above 2^22 take the 16-byte escape path (`R12_UMAX`, `parse.rs:324`, `esc_defer`). At one user per 30 events that is 126M events, far beyond any stated size; noted so nobody is surprised by a slow run on a synthetic set with many users.
 - Risk to output: none.
+
+## Iteration 19 (2026-11-21): the staging lead, sized from the log, with patch text
+
+Read `EvPart::push_many` and its flush (`parse.rs:428-560`), `block_out` (`parse.rs:827`).
+
+**How the push works now.** Per row: load bucket `b` and block address `l` from the batch, load `fill[b]` (u16), one masked 16-byte store of the 12-byte record at `l + fill`, add 12, and when the block reaches 256 a three-line non-temporal copy to the bucket's chunk. Per thread and bucket: 192 B of staging plus 2 B of `fill` and 8 B of `cur`.
+
+**Size of the pool, from measured numbers (the arithmetic is mine).**
+- Experiment 15, 20M: doubling the buckets (769 to 1,538) cost parse +8 ms, about 5%.
+- Experiment 16, same build: parse 148.6 at 20M (20.92M events, 7.10 ms per million) and 230.5 at 30M seed 6. If seed 6 has 1.5 times the events (I do not have its row count), that is 7.34 ms per million, +3.4% for 1.5 times the buckets.
+- Both points fit one line: about +5% of parse per extra 769 buckets. If the line continues down to zero buckets, the staging cost already inside the 20M run is about 5%, 7 ms. That extrapolation is the weak step, and it is cheap to check without code: **run seed 3 (10M) on the shipped build and report the parse lap and the event count.** The line predicts about 6.9 ms per million there. If 10M comes out at 7.1, the cost only starts above 769 buckets and this lead is worth nothing at 20M (it would still matter at 30M).
+
+**Why I think it is the cache and not the stores.** The flush cost per record does not depend on the bucket count (every block is three full lines whatever the count), and the chunks sit on 2 MiB pages. What grows with buckets is only the staging: 197 KB per thread at 20M, two threads per 1 MiB L2, with about 1.5 input lines per row per thread streaming through the same L2. A staging line is touched once per roughly 769 rows; the longer the gap, the likelier it has been pushed out to L3, and L3 on this CPU is slow (about 70 cycles).
+
+**Change A, prefetch (no output risk).** At the top of `EvPart::push_many`, before the row loop:
+
+```rust
+for i in 0..n {
+    let b = *ob.add(i) as usize;
+    _mm_prefetch::<_MM_HINT_T0>((*lp.add(i) as *const i8).add(*fill.add(b) as usize));
+}
+```
+
+- About 4 micro-operations per row. `fill` is 1.5 KB and stays in L1. For the masked-off rows of a partial batch `ob`/`lp` may be stale: restrict the loop to set bits of `m`, or keep it for the full-mask path only (the common case).
+- It gives the 64 lines of a batch a head start of one pre-pass. The out-of-order window already looks about 16 rows ahead in the row loop, so the gain is only on lines that are in L3, and only part of that. **My estimate: 0 to 2 ms at 20M, more at 30M.** Test at 30M first, where the effect is larger; if nothing shows there, drop it.
+- A stronger form, if A shows a gain: issue the prefetch from `ev_vec` as each group of four rows is computed (the bucket vector `bv` is in hand there), which is a whole batch earlier.
+
+**Change B, smaller staging block (output-neutral, layout change).** 192 B is the smallest size that is both whole cache lines and whole 12-byte records, so the block cannot shrink without padding. Not proposed.
+
+**A side observation, not proposed:** 3 of every 16 rows (fill offsets 52, 56, 60 within a line) make the 16-byte masked store cross a cache line. That is a split store on 19% of rows. On this CPU a split store costs a cycle or two, so I do not think it is worth a layout change; noted in case the annotate shows time on that store.
 
 ## Next passes
 
