@@ -277,6 +277,51 @@ pub fn chunk_data<'a>(m: &'a Mapped, file: usize, start: usize, end: usize, buf:
     let _ = (mode, buf);
     (map, start, end)
 }
+/// IOMODE 5: reads chunk [start, end) of `file` into `buf` in blocks of about
+/// 256 KiB (cache resident) and calls `f(data, s, e)` for each run of whole
+/// lines data[s..e]. `data` holds up to 16 bytes before `s` and up to 128
+/// bytes past `e` (whatever the file has), like a mapping would.
+#[cfg(unix)]
+pub fn for_blocks(m: &Mapped, file: usize, start: usize, end: usize, buf: &mut Vec<u8>, mut f: impl FnMut(&[u8], usize, usize)) {
+    use std::os::unix::fs::FileExt;
+    const B: usize = 256 << 10;
+    let flen = m.maps[file].len();
+    let mut pos = start;
+    let mut want = B;
+    while pos < end {
+        let pre = pos.min(16);
+        let w = want.min(end - pos);
+        let tail = (flen - (pos + w)).min(128);
+        let n = pre + w + tail;
+        if buf.len() < n {
+            buf.resize(n, 0);
+        }
+        let mut got = 0;
+        while got < n {
+            let r = m.files[file].read_at(&mut buf[got..n], (pos - pre + got) as u64).expect("pread");
+            if r == 0 {
+                break;
+            }
+            got += r;
+        }
+        let lim = pre + w;
+        let stop = if pos + w >= end {
+            lim
+        } else {
+            match memchr::memrchr(b'\n', &buf[pre..lim]) {
+                Some(i) => pre + i + 1,
+                None => {
+                    want *= 2; // a line longer than the block
+                    continue;
+                }
+            }
+        };
+        f(&buf[..n], pre, stop);
+        pos += stop - pre;
+        want = B;
+    }
+}
+
 /// After a chunk is parsed: drop its page-table entries now, in parallel,
 /// instead of in the single-threaded teardown at exit. Re-touching a dropped
 /// page just maps the page-cache page again, so this is always safe.

@@ -84,6 +84,40 @@ fn map_noreserve() -> i32 {
     0
 }
 
+static WC_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Write-combining for the partition scatters, from env WC (read once at start).
+pub fn wc_init() {
+    WC_ON.store(std::env::var("WC").map(|v| v == "1").unwrap_or(false), Ordering::Relaxed);
+}
+#[inline(always)]
+fn wc_on() -> bool {
+    WC_ON.load(Ordering::Relaxed)
+}
+
+#[inline(always)]
+unsafe fn stream128(s: *const u8, d: *mut u8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        let s = s as *const __m128i;
+        let d = d as *mut __m128i;
+        for j in 0..8 {
+            _mm_stream_si128(d.add(j), _mm_load_si128(s.add(j)));
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    std::ptr::copy_nonoverlapping(s, d, 128);
+}
+
+/// Orders this thread's earlier non-temporal stores before later reads by others.
+#[inline(always)]
+pub fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    };
+}
+
 /// Per-thread source of blocks: recycled ones first, then fresh arena blocks.
 pub struct Blocks<'a> {
     pub arena: &'a Arena,
@@ -103,12 +137,20 @@ impl<'a> Blocks<'a> {
     }
 }
 
-/// Append-only list of T in 64 KiB blocks.
+/// Write-combining stage: `push_wc` collects 128 bytes here and then writes
+/// them to the block with non-temporal stores (no read-for-ownership).
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub struct Stage([u8; 128]);
+
+/// Append-only list of T in fixed blocks.
 pub struct BList<T: Copy> {
     pub blocks: Vec<*mut T>,
     cur: *mut T,
     left: usize,
     pub len: usize,
+    stage: Stage,
+    ns: usize,
 }
 unsafe impl<T: Copy + Send> Send for BList<T> {}
 unsafe impl<T: Copy + Sync> Sync for BList<T> {}
@@ -122,7 +164,42 @@ impl<T: Copy> Default for BList<T> {
 impl<T: Copy> BList<T> {
     pub const PER: usize = BLK / std::mem::size_of::<T>();
     pub fn new() -> Self {
-        BList { blocks: Vec::new(), cur: std::ptr::null_mut(), left: 0, len: 0 }
+        BList { blocks: Vec::new(), cur: std::ptr::null_mut(), left: 0, len: 0, stage: Stage([0; 128]), ns: 0 }
+    }
+    /// `push` through the write-combining stage. T's size must divide 128 and
+    /// every `push_wc` sequence must end with `flush_wc` before the list is read.
+    #[inline(always)]
+    pub fn push_wc(&mut self, x: T, src: &mut Blocks) {
+        if !wc_on() {
+            return self.push(x, src);
+        }
+        let k = 128 / std::mem::size_of::<T>();
+        debug_assert!(128 % std::mem::size_of::<T>() == 0 && Self::PER % k == 0);
+        unsafe { (self.stage.0.as_mut_ptr() as *mut T).add(self.ns).write(x) };
+        self.ns += 1;
+        self.len += 1;
+        if self.ns == k {
+            if self.left == 0 {
+                let b = src.get() as *mut T;
+                self.blocks.push(b);
+                self.cur = b;
+                self.left = Self::PER;
+            }
+            unsafe { stream128(self.stage.0.as_ptr(), self.cur as *mut u8) };
+            self.cur = unsafe { self.cur.add(k) };
+            self.left -= k;
+            self.ns = 0;
+        }
+    }
+    /// Moves what is left in the stage into the blocks (plain stores).
+    pub fn flush_wc(&mut self, src: &mut Blocks) {
+        let n = self.ns;
+        self.ns = 0;
+        self.len -= n;
+        for j in 0..n {
+            let x = unsafe { (self.stage.0.as_ptr() as *const T).add(j).read() };
+            self.push(x, src);
+        }
     }
     #[inline(always)]
     pub fn push(&mut self, x: T, src: &mut Blocks) {
@@ -220,5 +297,6 @@ impl<T: Copy> BList<T> {
         self.cur = std::ptr::null_mut();
         self.left = 0;
         self.len = 0;
+        self.ns = 0;
     }
 }

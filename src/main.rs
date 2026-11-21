@@ -77,13 +77,14 @@ fn par_for(n: usize, threads: usize, f: impl Fn(usize, usize) + Sync) {
 // ---------------------------------------------------------------------------
 /// One parsed event copy. `pc` = price << 8 | category, or INVALID.
 #[derive(Clone, Copy, Default)]
-#[repr(C, packed(4))]
+#[repr(C)]
 struct ERec {
     eid: Key,
     person: Key,
     ts: u32,     // ms since window start (valid copies only)
     ingest: i32, // seconds since window start, saturated
     pc: u32,
+    _pad: u32, // 32 B so whole records fill the 128 B write-combining stage
 }
 const INVALID: u32 = u32::MAX;
 
@@ -441,6 +442,7 @@ fn main() {
     // ---- phase 0
     P1_BITS_V.store(env("P1BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
     P2_BITS_V.store(env("P2BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
+    mem::wc_init();
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
@@ -575,7 +577,15 @@ fn main() {
         let c = chunks[i];
         let buf = unsafe { iobufs.get(t) };
         let bs = unsafe { blocks.get(t) };
-        if c.kind == 0 {
+        if io_mode() == 5 {
+            if c.kind == 0 {
+                let eb = unsafe { ebl.get(t) };
+                for_blocks(&ev_m, c.file as usize, c.start, c.end, buf, |d, s, e| parse_events(&ctx, d, s, e, eb, bs));
+            } else {
+                let cb = unsafe { cbl.get(t) };
+                for_blocks(&cl_m, c.file as usize, c.start, c.end, buf, |d, s, e| parse_clicks(&ctx, d, s, e, cb, bs));
+            }
+        } else if c.kind == 0 {
             let (d, s, e) = chunk_data(&ev_m, c.file as usize, c.start, c.end, buf);
             parse_events(&ctx, d, s, e, unsafe { ebl.get(t) }, bs);
             chunk_done(&ev_m, c.file as usize, c.start, c.end);
@@ -586,6 +596,8 @@ fn main() {
         }
     });
     std::mem::forget(iobufs);
+    flush_all(&ebl, &blocks, threads);
+    flush_all(&cbl, &blocks, threads);
     let eparts = PerThread::from_vec(transpose(ebl.into_inner(), 1usize << p1_bits()));
     let cparts = transpose(cbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
@@ -609,6 +621,7 @@ fn main() {
         let sb = unsafe { sbl.get(t) };
         dedup_partition(&ctx, lists, mp, dead, filt, susp, sb, bs);
     });
+    flush_all(&sbl, &blocks, threads);
     let sparts = transpose(sbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
 
@@ -802,7 +815,19 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             // the category is only ever read for purchases
             r.pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
         }
-        unsafe { eb.get_unchecked_mut((hk(eid) >> (64 - p1_bits())) as usize) }.push(r, bs);
+        unsafe { eb.get_unchecked_mut((hk(eid) >> (64 - p1_bits())) as usize) }.push_wc(r, bs);
+    });
+    sfence();
+}
+
+/// Ends every write-combining sequence of a phase: list set t is flushed with
+/// thread t's blocks.
+fn flush_all<T: Copy + Send>(lists: &PerThread<Vec<BList<T>>>, blocks: &PerThread<Blocks>, threads: usize) {
+    par_for(threads, threads, |_w, t| {
+        let bs = unsafe { blocks.get(t) };
+        for l in unsafe { lists.get(t) }.iter_mut() {
+            l.flush_wc(bs);
+        }
     });
 }
 
@@ -824,8 +849,9 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
         let Some(camp) = ctx.campaigns.get(f[2], floor) else { return };
         let u = pack_fast(f[1], ceil);
         let r = CRec { person: u, cid: pack_fast(f[0], ceil), ts, camp };
-        unsafe { cb.get_unchecked_mut((hk(u) >> (64 - p2_bits())) as usize) }.push(r, bs);
+        unsafe { cb.get_unchecked_mut((hk(u) >> (64 - p2_bits())) as usize) }.push_wc(r, bs);
     });
+    sfence();
 }
 
 /// Events with the links already built: each valid copy goes straight to its
@@ -1114,7 +1140,7 @@ fn dedup_partition(
     let emit = |s: SRec, h: u64, sb: &mut [BList<SRec>], bs: &mut Blocks| {
         let v = ctx.person_h(s.person, h);
         let hv = if v == s.person { h } else { hk(v) };
-        unsafe { sb.get_unchecked_mut((hv >> (64 - p2_bits())) as usize) }.push(SRec { person: v, ..s }, bs);
+        unsafe { sb.get_unchecked_mut((hv >> (64 - p2_bits())) as usize) }.push_wc(SRec { person: v, ..s }, bs);
     };
     let mut i = 0u32;
     for l in lists.iter() {
@@ -1138,6 +1164,7 @@ fn dedup_partition(
         let (s, h) = ring[k % PD];
         emit(s, h, sb, bs);
     }
+    sfence();
     for l in lists.iter_mut() {
         l.release(&mut bs.free);
     }
