@@ -123,6 +123,22 @@ Why it did nothing: the 512-bit instructions in the writer are not from intrinsi
 
 Experiment 21: upstream's probe set at 00591fc (18:12) has four source variants newer than c7d4aa4: `v/26`, `v/27`, `v/d2`, `v/d3` (the rest are run-time knob settings of `v/kb`). Built as they are, 9 rounds, seed 20, wall min / med: `v21p` 196.2 / 199.7; `j3s` 195.3 / 199.7; 26: 196.1 / 198.4; 27: 196.4 / 198.1; d2: 197.1 / 199.4; d3: 198.3 / 201.0. Stages for 26 and 27: parse 148.3 and 148.8, ev3a 35.8 and 35.7, write 5.3. No variant differs from `v21p` by more than the noise. Nothing taken.
 
+Experiment 22: upstream 078e760 ("cut work per line in both line loops", on top of c7d4aa4's rows written during stage 3), taken at the user's request. `j4` as is, `j4s` with 64 MiB chunk and prefetch 512 (commit 7519633 on main). Gate clean: 36/36, dev and seed 20 match, `j4s` equal to 941879e at NCPU 8, 2 and 1 on seeds 7, 3 and 6, no fallback. 11 rounds, wall min / med:
+
+| Set | v21p (9363748) | j3s (c7d4aa4 + constants) | j4 | j4s (kept) |
+|---|---|---|---|---|
+| 20M seed 20 | 195.4 / 200.0 | 194.0 / 197.4 | 193.0 / 195.2 | 191.6 / 195.5 |
+| 20M seed 7 | 201.8 / 203.9 | 199.2 / 202.8 | 196.6 / 200.7 | 197.3 / 199.4 |
+
+Stages, seed 20, v21p to j4s: parse 148.1 to 144.7, ev3a 34.0 to 35.6, write 7.2 to 5.4. Kept: -3.8 / -4.5 ms on seed 20, -4.5 / -4.5 on seed 7. The two constants are level with plain upstream here (seed 20 -1.4 at the minimum, seed 7 +0.7), kept as before. 30M seed 6, 7 rounds:
+
+```
+v21p                       wall min 297.0 med 301.6 max 302.9 | setup=0.0 parse=229.5 ev3a=50.3 write=10.1 total=295.1
+j4s                        wall min 289.4 med 295.3 max 297.8 | setup=0.0 parse=221.8 ev3a=52.7 write=7.1 total=287.8
+```
+
+The binary is now `j4s` on the VM; file and line references in the research notes are stale again (5 source files changed, +861 -192).
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
