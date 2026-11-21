@@ -775,11 +775,11 @@ fn civil_swar(p: *const u8) -> Option<i64> {
     let c = ld8(unsafe { p.add(12) });
     const SA: u64 = 0xFF00_00FF_0000_0000;
     const SB: u64 = 0x0000_FF00_00FF_0000;
-    const SC: u64 = 0x0000_00FF_0000_0000;
-    let sep = ((a & SA) ^ 0x2D00_002D_0000_0000) | ((b & SB) ^ 0x0000_3A00_0054_0000) | ((c & SC) ^ 0x0000_003A_0000_0000);
+    const SC: u64 = 0x0000_00FF_0000_FF00;
+    let sep = ((a & SA) ^ 0x2D00_002D_0000_0000) | ((b & SB) ^ 0x0000_3A00_0054_0000) | ((c & SC) ^ 0x0000_003A_0000_3A00);
     let a2 = (a & !SA) | 0x3000_0030_0000_0000;
     let b2 = (b & !SB) | 0x0000_3000_0030_0000;
-    let c2 = (c & 0x00FF_FFFF_FFFF_FFFF & !SC) | 0x3000_0030_0000_0000;
+    let c2 = (c & 0x00FF_FFFF_FFFF_FFFF & !SC) | 0x3000_0030_0000_3000;
     if sep != 0 || !digits8(a2) || !digits8(b2) || !digits8(c2) {
         return None;
     }
@@ -956,6 +956,42 @@ pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8) -> Option<i64>
 #[cfg(test)]
 mod swar_tests {
     use super::*;
+    #[test]
+    fn civil_swar_fuzz() {
+        let mut x: u64 = 88172645463325252;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut hits = 0;
+        for i in 0..3_000_000u32 {
+            let mut s = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 1990 + rnd(60), rnd(14), rnd(33), rnd(26), rnd(62), rnd(62)).into_bytes();
+            if i % 3 == 0 {
+                let k = rnd(20) as usize;
+                s[k] = b"0123456789:-TZtz +/.9\r,\""[rnd(24) as usize];
+            }
+            let mut buf = vec![b'x'; 16];
+            buf.extend_from_slice(&s);
+            buf.extend_from_slice(&[b','; 16]);
+            let f = &buf[16..36];
+            let r = parse_ts_fast(f, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
+            assert_eq!(r, parse_ts(&s), "{:?}", String::from_utf8_lossy(&s));
+            if f[19] == b'Z' {
+                let c = civil_swar(f.as_ptr());
+                assert_eq!(c.map(|v| v * 1000), parse_ts(&s), "{:?}", String::from_utf8_lossy(&s));
+                hits += c.is_some() as u32;
+            }
+        }
+        assert!(hits > 100_000);
+    }
+    #[test]
+    fn civil_swar_hits() {
+        let b = b"2027-12-18T22:22:54Z,xxxxxxxxxxxx";
+        assert_eq!(civil_swar(b.as_ptr()).map(|v| v * 1000), parse_ts(&b[..20]));
+        assert!(civil_swar(b.as_ptr()).is_some());
+    }
     #[test]
     fn ts_fuzz() {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
