@@ -609,7 +609,69 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
-/// Calls `f` with the N fields of every well-formed line in `data[start..end]`.
+/// The fields of one well-formed line, quotes already stripped.
+pub trait Fields<'a> {
+    /// True when every field of the line starts at least 16 bytes after the
+    /// start of the buffer and ends at least 32 bytes before its end, so the
+    /// word loads of the field decoders need no bounds check of their own.
+    const ROOMY: bool;
+    fn get(&self, i: usize) -> &'a [u8];
+}
+
+/// Field starts and lengths as the bytes of two words, relative to the line
+/// start (lines under 128 bytes, at most 8 fields): a field is cut out only
+/// where it is used, with two shifts.
+#[allow(dead_code)]
+pub struct Packed<'a, const R: bool> {
+    lp: *const u8,
+    at: u64,
+    ln: u64,
+    _m: std::marker::PhantomData<&'a [u8]>,
+}
+impl<'a, const R: bool> Fields<'a> for Packed<'a, R> {
+    const ROOMY: bool = R;
+    #[inline(always)]
+    fn get(&self, i: usize) -> &'a [u8] {
+        unsafe { std::slice::from_raw_parts(self.lp.add((self.at >> (8 * i)) as u8 as usize), (self.ln >> (8 * i)) as u8 as usize) }
+    }
+}
+
+/// Fields as an array of slices (the scalar splitter's output).
+pub struct Slices<'a, 'b, const N: usize>(pub &'b [&'a [u8]; N]);
+impl<'a, 'b, const N: usize> Fields<'a> for Slices<'a, 'b, N> {
+    const ROOMY: bool = false;
+    #[inline(always)]
+    fn get(&self, i: usize) -> &'a [u8] {
+        self.0[i]
+    }
+}
+
+/// Receives every well-formed line of a scan.
+pub trait LineSink<'a> {
+    fn line<F: Fields<'a>>(&mut self, f: &F);
+}
+
+/// A sink from a closure over an array of N slices.
+pub struct FnSink<const N: usize, C>(pub C);
+impl<'a, const N: usize, C: FnMut(&[&'a [u8]; N])> LineSink<'a> for FnSink<N, C> {
+    #[inline(always)]
+    fn line<F: Fields<'a>>(&mut self, f: &F) {
+        let mut a: [&'a [u8]; N] = [&[]; N];
+        for (i, x) in a.iter_mut().enumerate() {
+            *x = f.get(i);
+        }
+        (self.0)(&a)
+    }
+}
+
+/// The rare lines (long ones, the first and last of a buffer) go through
+/// this call so that only the common case is inlined into the scan loop.
+#[inline(never)]
+fn line_cold<'a, S: LineSink<'a>, F: Fields<'a>>(sink: &mut S, f: &F) {
+    sink.line(f)
+}
+
+/// Hands `sink` the N fields of every well-formed line in `data[start..end]`.
 /// Lines start at `start` and none crosses `end` (the last one may lack its
 /// newline). Bytes of `data` after `end` are never interpreted.
 ///
@@ -618,12 +680,14 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 /// count (commas below it) and, in one expression, whether every quote wraps
 /// a whole field. Lines of 128 bytes or more take the scalar `split`.
 #[inline(always)]
-pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+pub fn scan_lines<'a, const N: usize, S: LineSink<'a>>(data: &'a [u8], start: usize, end: usize, sink: &mut S) {
     let len = end - start;
     if len == 0 {
         return;
     }
     let base = unsafe { data.as_ptr().add(start) };
+    let avail = data.len() - start; // readable bytes from `base`
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     let mut fields: [&'a [u8]; N] = [&[]; N];
     let mut ls = 0usize; // current line start
     while ls < len {
@@ -655,19 +719,20 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
         }
         let nw = (n0 as u128) | ((n1 as u128) << 64);
         if nw == 0 {
-            // a line of 128 bytes or more (rare): the scalar splitter, then
-            // the same single call site as the fast path so `f` is inlined once
+            // a line of 128 bytes or more (rare): the scalar splitter
             let rest = unsafe { std::slice::from_raw_parts(base.add(ls), len - ls) };
             let l = memchr::memchr(b'\n', rest).unwrap_or(rest.len());
             ls += l + 1;
-            if !split(&rest[..l], &mut fields) {
-                continue;
+            let mut tmp: [&'a [u8]; N] = [&[]; N];
+            if split(&rest[..l], &mut tmp) {
+                line_cold(sink, &Slices(&tmp));
             }
         } else {
             let ll = nw.trailing_zeros(); // line length, 0..=127
             let below = (1u128 << ll) - 1;
             let c = ((c0 as u128) | ((c1 as u128) << 64)) & below;
             let q = ((q0 as u128) | ((q1 as u128) << 64)) & below;
+            let l0 = ls;
             ls += ll as usize + 1;
             // Quotes: with `d` = delimiters (commas and the line end), a field
             // starts after each delimiter and ends before one. Every quote must
@@ -716,8 +781,11 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
                 let quoted = _pdep_u64(qbits, ONES);
                 let at = starts.wrapping_add(quoted);
                 let ln = ends.wrapping_sub(at).wrapping_sub(quoted);
-                for i in 0..N {
-                    fields[i] = std::slice::from_raw_parts(lp.add((at >> (8 * i)) as u8 as usize), (ln >> (8 * i)) as u8 as usize);
+                // room for the decoders' word loads on both sides of the line?
+                if start + l0 >= 16 && l0 + ll as usize + 32 <= avail {
+                    sink.line(&Packed::<true> { lp, at, ln, _m: std::marker::PhantomData });
+                } else {
+                    line_cold(sink, &Packed::<false> { lp, at, ln, _m: std::marker::PhantomData });
                 }
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
@@ -736,9 +804,10 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
                     fields[i] = unsafe { std::slice::from_raw_parts(lp.add((fs + qa) as usize), (fe - fs - 2 * qa) as usize) };
                     fs = fe + 1;
                 }
+                let _ = (l0, avail);
+                sink.line(&Slices(&fields));
             }
         }
-        f(&fields);
     }
 }
 
@@ -757,7 +826,7 @@ mod tests {
     }
     fn simd<const N: usize>(d: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut v = Vec::new();
-        scan_lines::<N>(d, 0, d.len(), |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        scan_lines::<N, _>(d, 0, d.len(), &mut FnSink::<N, _>(|f: &[&[u8]; N]| v.push(f.iter().map(|x| x.to_vec()).collect())));
         v
     }
     fn check<const N: usize>(d: &[u8]) {
@@ -971,6 +1040,65 @@ mod tests {
         }
         let _ = std::fs::remove_dir(&dir);
     }
+    /// A line reported as ROOMY really has the promised room on both sides:
+    /// 16 bytes before its first field and 16 readable bytes after the start
+    /// of any field (so after its last one too).
+    #[test]
+    fn roomy_lines_have_room() {
+        struct Check<'d> {
+            lo: usize,
+            hi: usize,
+            roomy: usize,
+            total: usize,
+            _d: std::marker::PhantomData<&'d [u8]>,
+        }
+        impl<'a, 'd> LineSink<'a> for Check<'d> {
+            fn line<F: Fields<'a>>(&mut self, f: &F) {
+                self.total += 1;
+                if F::ROOMY {
+                    self.roomy += 1;
+                    for i in 0..4 {
+                        let s = f.get(i);
+                        let p = s.as_ptr() as usize;
+                        assert!(p >= self.lo + 16, "field {i} starts too close to the buffer start");
+                        assert!(p + s.len() + 16 <= self.hi && p + 25 <= self.hi, "field {i} too close to the buffer end");
+                    }
+                }
+            }
+        }
+        let mut rnd = xs(0x700D);
+        let (mut roomy, mut total) = (0, 0);
+        for _ in 0..2000 {
+            let mut d = Vec::new();
+            let mut starts = vec![0usize];
+            for _ in 0..(1 + rnd(30)) {
+                for i in 0..4 {
+                    if i > 0 {
+                        d.push(b',');
+                    }
+                    let lim = if rnd(6) == 0 { 30 } else { 9 };
+                    let n = rnd(lim);
+                    for _ in 0..n {
+                        d.push(b'a' + rnd(26) as u8);
+                    }
+                }
+                d.push(b'\n');
+                starts.push(d.len());
+            }
+            let a = starts[rnd(starts.len() as u64) as usize];
+            let b = starts[rnd(starts.len() as u64) as usize];
+            let (a, b) = (a.min(b), a.max(b));
+            let mut c = Check { lo: d.as_ptr() as usize, hi: d.as_ptr() as usize + d.len(), roomy: 0, total: 0, _d: std::marker::PhantomData };
+            scan_lines::<4, _>(&d, a, b, &mut c);
+            roomy += c.roomy;
+            total += c.total;
+        }
+        assert!(total > 5000);
+        // the packed, roomy path exists only on x86-64 with BMI2
+        if cfg!(all(target_arch = "x86_64", target_feature = "bmi2")) {
+            assert!(roomy > total / 3, "roomy {roomy} of {total}");
+        }
+    }
     /// A scan of a sub-range must not look at bytes outside it, wherever the
     /// range starts and ends relative to the 64-byte blocks and the buffer end.
     #[test]
@@ -1004,7 +1132,7 @@ mod tests {
             let b = starts[rnd(starts.len() as u64) as usize];
             let (a, b) = (a.min(b), a.max(b));
             let mut got = Vec::new();
-            scan_lines::<4>(&d, a, b, |f| got.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>()));
+            scan_lines::<4, _>(&d, a, b, &mut FnSink::<4, _>(|f: &[&[u8]; 4]| got.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>())));
             assert_eq!(got, scalar::<4>(&d[a..b]));
         }
     }
@@ -1165,9 +1293,9 @@ fn civil_memo(p: *const u8, memo: &mut DateMemo) -> Option<i64> {
 /// 20-byte "YYYY-MM-DDTHH:MM:SSZ" without validation; anything of another
 /// shape goes through the checked parser.
 #[inline(always)]
-pub fn parse_ingest_s(s: &[u8], ceil: *const u8, memo: &mut DateMemo) -> Option<i64> {
+pub fn parse_ingest_s(s: &[u8], ceil: *const u8, memo: &mut DateMemo, roomy: bool) -> Option<i64> {
     let p = s.as_ptr();
-    if s.len() == 20 && (p as usize) + 20 <= ceil as usize && s[19] == b'Z' {
+    if s.len() == 20 && (roomy || (p as usize) + 20 <= ceil as usize) && s[19] == b'Z' {
         // a known date with a well-formed time of day (the value is then the
         // same as the unvalidated arithmetic below, which stays for the rest)
         let ka = ld8(p);
@@ -1214,10 +1342,10 @@ pub fn parse_ingest_s(s: &[u8], ceil: *const u8, memo: &mut DateMemo) -> Option<
 /// (true inside a scanned line: at least the newline or 64-byte tail padding
 /// is not guaranteed, so callers pass `ceil` = one past the last readable byte).
 #[inline(always)]
-pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8, memo: &mut DateMemo) -> Option<i64> {
+pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8, memo: &mut DateMemo, roomy: bool) -> Option<i64> {
     let n = s.len();
     let p = s.as_ptr();
-    if n == 20 && (p as usize) + 20 <= ceil as usize {
+    if n == 20 && (roomy || (p as usize) + 20 <= ceil as usize) {
         if s[19] == b'Z' {
             if let Some(v) = civil_memo(p, memo) {
                 return Some(v * 1000);
@@ -1225,7 +1353,7 @@ pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8, memo: &mut Dat
         }
         return parse_ts(s);
     }
-    if n == 25 && (p as usize) + 25 <= ceil as usize {
+    if n == 25 && (roomy || (p as usize) + 25 <= ceil as usize) {
         let sign = s[19];
         let oh = d2(s, 20);
         let om = d2(s, 23);
@@ -1238,7 +1366,7 @@ pub fn parse_ts_fast(s: &[u8], floor: *const u8, ceil: *const u8, memo: &mut Dat
         return parse_ts(s);
     }
     let e = p as usize + n;
-    if n >= 9 && n <= 16 && e >= floor as usize + 16 {
+    if n >= 9 && n <= 16 && (roomy || e >= floor as usize + 16) {
         let lo = ld8((e - 16) as *const u8);
         let hi = ld8((e - 8) as *const u8);
         let keep = 16 - n; // leading bytes of `lo` outside the field
@@ -1281,15 +1409,15 @@ mod swar_tests {
                 hits_memo += memo.hits;
                 memo = DateMemo::new();
             }
-            let r = parse_ts_fast(f, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo);
+            let r = parse_ts_fast(f, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo, false);
             assert_eq!(r, parse_ts(&s), "{:?}", String::from_utf8_lossy(&s));
-            let r2 = parse_ts_fast(f, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo);
+            let r2 = parse_ts_fast(f, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo, false);
             assert_eq!(r2, parse_ts(&s), "warm {:?}", String::from_utf8_lossy(&s));
             if f[19] == b'Z' {
                 // ingest path: unvalidated for malformed input, exact for valid input, and
                 // always equal to what it returns with an empty table
-                let cold = parse_ingest_s(f, unsafe { buf.as_ptr().add(buf.len()) }, &mut DateMemo::new());
-                assert_eq!(parse_ingest_s(f, unsafe { buf.as_ptr().add(buf.len()) }, &mut memo), cold, "ingest {:?}", String::from_utf8_lossy(&s));
+                let cold = parse_ingest_s(f, unsafe { buf.as_ptr().add(buf.len()) }, &mut DateMemo::new(), false);
+                assert_eq!(parse_ingest_s(f, unsafe { buf.as_ptr().add(buf.len()) }, &mut memo, false), cold, "ingest {:?}", String::from_utf8_lossy(&s));
                 if let Some(v) = parse_ts(&s) {
                     assert_eq!(cold, Some(v / 1000));
                 }
@@ -1402,8 +1530,8 @@ mod swar_tests {
             let sl = &buf[32..32 + v.len()];
             let (fl, ce) = (buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) });
             let want = parse_ts(&v);
-            assert_eq!(parse_ts_fast(sl, fl, ce, &mut memo), want, "fast {:?}", String::from_utf8_lossy(&v));
-            assert_eq!(parse_ts_fast(sl, fl, ce, &mut DateMemo::new()), want, "cold {:?}", String::from_utf8_lossy(&v));
+            assert_eq!(parse_ts_fast(sl, fl, ce, &mut memo, false), want, "fast {:?}", String::from_utf8_lossy(&v));
+            assert_eq!(parse_ts_fast(sl, fl, ce, &mut DateMemo::new(), false), want, "cold {:?}", String::from_utf8_lossy(&v));
         }
     }
     #[test]
@@ -1434,12 +1562,12 @@ mod swar_tests {
             buf.extend_from_slice(&[b','; 32]);
             let s = &buf[32..32 + c.len()];
             for _ in 0..2 {
-                let r = parse_ts_fast(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo);
+                let r = parse_ts_fast(s, buf.as_ptr(), unsafe { buf.as_ptr().add(buf.len()) }, &mut memo, false);
                 assert_eq!(r, parse_ts(c.as_bytes()), "{c:?}");
             }
             if let Some(v) = parse_ts(c.as_bytes()) {
                 if c.len() == 20 && c.ends_with('Z') {
-                    assert_eq!(parse_ingest_s(s, unsafe { buf.as_ptr().add(buf.len()) }, &mut memo), Some(v.div_euclid(1000)), "{c:?}");
+                    assert_eq!(parse_ingest_s(s, unsafe { buf.as_ptr().add(buf.len()) }, &mut memo, false), Some(v.div_euclid(1000)), "{c:?}");
                 }
             }
         }

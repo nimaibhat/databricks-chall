@@ -144,7 +144,7 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
         let d: &[u8] = &m.maps[c.file as usize];
         let p = unsafe { pairs.get(t) };
         let sk = unsafe { skeys.get(t) };
-        scan_lines::<2>(d, c.start, c.end, |f| {
+        let mut sink = FnSink::<2, _>(|f: &[&[u8]; 2]| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
@@ -157,6 +157,7 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
             sk[(hk(a) >> shift) as usize].push(a);
             sk[(hk(b) >> shift) as usize].push(b);
         });
+        scan_lines::<2, _>(d, c.start, c.end, &mut sink);
     });
     let t_parse = t0.elapsed();
     let pairs = pairs.into_inner();
@@ -618,55 +619,66 @@ fn emit_event(tab: &LinkTab, p: &PendE, eb: &mut Scatter<DRec>, sb: &mut Scatter
     eb.push((hk(p.eid) >> sh1) as usize, DRec { eid: p.eid, ingest: p.ingest, loc }, bs);
 }
 
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<DRec>, sb: &mut Scatter<SRec>, bs: &mut Blocks, abase: usize) {
-    let ws = ctx.ws;
-    let we = ctx.we;
-    let ws_s = ws.div_euclid(1000);
-    let floor = d.as_ptr();
-    let ceil = unsafe { floor.add(d.len()) };
-    let unknown = ctx.cat_unknown as u32;
-    let mut memo = DateMemo::new();
-    let sh1 = 64 - p1_bits();
-    let sh2 = 64 - p2_bits();
-    let tab = &ctx.links;
-    let mut ring = [PendE::default(); RING];
-    let mut rn = 0usize;
-    let stage = diag_stage();
-    let mut sink = 0u64;
-    scan_lines::<7>(d, start, end, |f| {
+/// Per-chunk state of the event parser; `line` is the per-line work.
+struct EventSink<'x, 'b> {
+    ctx: &'x Ctx,
+    floor: *const u8,
+    ceil: *const u8,
+    eb: &'x mut Scatter<DRec>,
+    sb: &'x mut Scatter<SRec>,
+    bs: &'x mut Blocks<'b>,
+    abase: usize,
+    ws: i64,
+    we: i64,
+    ws_s: i64,
+    unknown: u32,
+    sh1: u32,
+    sh2: u32,
+    memo: DateMemo,
+    ring: [PendE; RING],
+    rn: usize,
+    stage: u32,
+    acc: u64,
+}
+
+impl<'a, 'x, 'b> LineSink<'a> for EventSink<'x, 'b> {
+    #[inline(always)]
+    fn line<F: Fields<'a>>(&mut self, f: &F) {
+        let (floor, ceil, stage) = (self.floor, self.ceil, self.stage);
         if cfg!(feature = "diag") && stage == 1 {
-            sink = sink.wrapping_add(f[6].len() as u64);
+            self.acc = self.acc.wrapping_add(f.get(6).len() as u64);
             return;
         }
-        if f[0].is_empty() {
+        let f0 = f.get(0);
+        if f0.is_empty() {
             return;
         }
-        let eid = pack_fast(f[0], ceil);
-        let ingest = match parse_ingest_s(f[3], ceil, &mut memo) {
-            Some(v) => (v - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        let eid = pack_fast(f0, ceil, F::ROOMY);
+        let ingest = match parse_ingest_s(f.get(3), ceil, &mut self.memo, F::ROOMY) {
+            Some(v) => (v - self.ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
         };
         if cfg!(feature = "diag") && stage == 2 {
-            sink = sink.wrapping_add(eid).wrapping_add(ingest as u64);
+            self.acc = self.acc.wrapping_add(eid).wrapping_add(ingest as u64);
             return;
         }
         'v: {
-            if f[1].is_empty() || f[5].is_empty() {
+            let f1 = f.get(1);
+            let f5 = f.get(5);
+            if f1.is_empty() || f5.is_empty() {
                 break 'v;
             }
-            let Some(ts) = parse_ts_fast(f[2], floor, ceil, &mut memo) else { break 'v };
+            let Some(ts) = parse_ts_fast(f.get(2), floor, ceil, &mut self.memo, F::ROOMY) else { break 'v };
             if cfg!(feature = "diag") && stage == 3 {
-                sink = sink.wrapping_add(eid).wrapping_add(ingest as u64).wrapping_add(ts as u64);
+                self.acc = self.acc.wrapping_add(eid).wrapping_add(ingest as u64).wrapping_add(ts as u64);
                 return;
             }
-            if ts < ws || ts >= we || (ingest as i64 + ws_s) * 1000 - ts > DAY_MS {
+            if ts < self.ws || ts >= self.we || (ingest as i64 + self.ws_s) * 1000 - ts > DAY_MS {
                 break 'v;
             }
             // event type by length and one word compare (the field's own
             // bytes: 4 or 8 of them, so the loads stay inside it)
-            let ty = f[4];
+            let ty = f.get(4);
             let price = if ty.len() == 4 {
                 let w = u32::from_le_bytes([ty[0], ty[1], ty[2], ty[3]]);
                 if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
@@ -674,7 +686,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<
                 }
                 0
             } else if ty.len() == 8 && u64::from_le_bytes([ty[0], ty[1], ty[2], ty[3], ty[4], ty[5], ty[6], ty[7]]) == u64::from_le_bytes(*b"purchase") {
-                match parse_price(f[6]) {
+                match parse_price(f.get(6)) {
                     Some(p) => p,
                     None => break 'v,
                 }
@@ -682,42 +694,72 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<
                 break 'v;
             };
             // the category is read only for purchases (price > 0)
-            let pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
-            let user = pack_fast(f[1], ceil);
+            let pc = if price != 0 { (price << 8) | self.ctx.products.get(f5, floor, F::ROOMY).unwrap_or(self.unknown) } else { 0 };
+            let user = pack_fast(f1, ceil, F::ROOMY);
             let h = hk(user);
             if cfg!(feature = "diag") && stage == 4 {
-                sink = sink.wrapping_add(eid).wrapping_add(ingest as u64).wrapping_add(ts as u64).wrapping_add(pc as u64).wrapping_add(h);
+                self.acc = self.acc.wrapping_add(eid).wrapping_add(ingest as u64).wrapping_add(ts as u64).wrapping_add(pc as u64).wrapping_add(h);
                 return;
             }
+            let tab = &self.ctx.links;
             tab.prefetch(h);
-            let slot = rn & (RING - 1);
-            if rn >= RING {
-                let old = ring[slot];
+            let slot = self.rn & (RING - 1);
+            if self.rn >= RING {
+                let old = self.ring[slot];
                 if cfg!(feature = "diag") && stage >= 5 {
                     let pr = tab.person(old.user, old.h);
-                    sink = sink.wrapping_add(pr);
+                    self.acc = self.acc.wrapping_add(pr);
                     if stage >= 6 {
                         let hp = hk(pr);
-                        let at = sb.push((hp >> sh2) as usize, SRec { person: pr, ts: old.ts, pc: old.pc }, bs);
-                        sink = sink.wrapping_add(at as u64);
+                        let at = self.sb.push((hp >> self.sh2) as usize, SRec { person: pr, ts: old.ts, pc: old.pc }, self.bs);
+                        self.acc = self.acc.wrapping_add(at as u64);
                     }
                 } else {
-                    emit_event(tab, &old, eb, sb, bs, sh1, sh2, abase);
+                    emit_event(tab, &old, self.eb, self.sb, self.bs, self.sh1, self.sh2, self.abase);
                 }
             }
-            ring[slot] = PendE { user, h, eid, ts: (ts - ws) as u32, pc, ingest };
-            rn += 1;
+            self.ring[slot] = PendE { user, h, eid, ts: (ts - self.ws) as u32, pc, ingest };
+            self.rn += 1;
             return;
         }
         // an invalid copy still takes part in dedup
-        eb.push((hk(eid) >> sh1) as usize, DRec { eid, ingest, loc: 0 }, bs);
-    });
-    std::hint::black_box(sink);
-    if cfg!(feature = "diag") && stage != 0 {
+        self.eb.push((hk(eid) >> self.sh1) as usize, DRec { eid, ingest, loc: 0 }, self.bs);
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<DRec>, sb: &mut Scatter<SRec>, bs: &mut Blocks, abase: usize) {
+    let floor = d.as_ptr();
+    let mut sink = EventSink {
+        ctx,
+        floor,
+        ceil: unsafe { floor.add(d.len()) },
+        eb,
+        sb,
+        bs,
+        abase,
+        ws: ctx.ws,
+        we: ctx.we,
+        ws_s: ctx.ws.div_euclid(1000),
+        unknown: ctx.cat_unknown as u32,
+        sh1: 64 - p1_bits(),
+        sh2: 64 - p2_bits(),
+        memo: DateMemo::new(),
+        ring: [PendE::default(); RING],
+        rn: 0,
+        stage: diag_stage(),
+        acc: 0,
+    };
+    scan_lines::<7, _>(d, start, end, &mut sink);
+    std::hint::black_box(sink.acc);
+    if cfg!(feature = "diag") && sink.stage != 0 {
         return;
     }
-    for p in &ring[..rn.min(RING)] {
-        emit_event(tab, p, eb, sb, bs, sh1, sh2, abase);
+    let n = sink.rn.min(RING);
+    for i in 0..n {
+        let p = sink.ring[i];
+        emit_event(&ctx.links, &p, sink.eb, sink.sb, sink.bs, sink.sh1, sink.sh2, abase);
     }
     Scatter::<SRec>::fence();
 }
@@ -740,39 +782,69 @@ fn emit_click(tab: &LinkTab, p: &PendC, cb: &mut Scatter<CRec>, bs: &mut Blocks,
     cb.push((hp >> sh2) as usize, CRec { person, cid: p.cid, ts: p.ts, camp: p.camp }, bs);
 }
 
+/// Per-chunk state of the click parser.
+struct ClickSink<'x, 'b> {
+    ctx: &'x Ctx,
+    floor: *const u8,
+    ceil: *const u8,
+    cb: &'x mut Scatter<CRec>,
+    bs: &'x mut Blocks<'b>,
+    cws: i64,
+    we: i64,
+    sh2: u32,
+    memo: DateMemo,
+    ring: [PendC; RING],
+    rn: usize,
+}
+
+impl<'a, 'x, 'b> LineSink<'a> for ClickSink<'x, 'b> {
+    #[inline(always)]
+    fn line<F: Fields<'a>>(&mut self, f: &F) {
+        let f0 = f.get(0);
+        let f1 = f.get(1);
+        if f0.is_empty() || f1.is_empty() {
+            return;
+        }
+        let Some(ts) = parse_ts_fast(f.get(3), self.floor, self.ceil, &mut self.memo, F::ROOMY) else { return };
+        if ts < self.cws || ts >= self.we {
+            return;
+        }
+        let Some(camp) = self.ctx.campaigns.get(f.get(2), self.floor, F::ROOMY) else { return };
+        let user = pack_fast(f1, self.ceil, F::ROOMY);
+        let h = hk(user);
+        let tab = &self.ctx.links;
+        tab.prefetch(h);
+        let slot = self.rn & (RING - 1);
+        if self.rn >= RING {
+            let old = self.ring[slot];
+            emit_click(tab, &old, self.cb, self.bs, self.sh2);
+        }
+        self.ring[slot] = PendC { user, h, cid: pack_fast(f0, self.ceil, F::ROOMY), ts, camp };
+        self.rn += 1;
+    }
+}
+
 #[inline(never)]
 fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut Scatter<CRec>, bs: &mut Blocks) {
-    let cws = ctx.ws - WEEK_MS;
-    let we = ctx.we;
-    let mut memo = DateMemo::new();
     let floor = d.as_ptr();
-    let ceil = unsafe { floor.add(d.len()) };
-    let sh2 = 64 - p2_bits();
-    let tab = &ctx.links;
-    let mut ring = [PendC::default(); RING];
-    let mut rn = 0usize;
-    scan_lines::<4>(d, start, end, |f| {
-        if f[0].is_empty() || f[1].is_empty() {
-            return;
-        }
-        let Some(ts) = parse_ts_fast(f[3], floor, ceil, &mut memo) else { return };
-        if ts < cws || ts >= we {
-            return;
-        }
-        let Some(camp) = ctx.campaigns.get(f[2], floor) else { return };
-        let user = pack_fast(f[1], ceil);
-        let h = hk(user);
-        tab.prefetch(h);
-        let slot = rn & (RING - 1);
-        if rn >= RING {
-            let old = ring[slot];
-            emit_click(tab, &old, cb, bs, sh2);
-        }
-        ring[slot] = PendC { user, h, cid: pack_fast(f[0], ceil), ts, camp };
-        rn += 1;
-    });
-    for p in &ring[..rn.min(RING)] {
-        emit_click(tab, p, cb, bs, sh2);
+    let mut sink = ClickSink {
+        ctx,
+        floor,
+        ceil: unsafe { floor.add(d.len()) },
+        cb,
+        bs,
+        cws: ctx.ws - WEEK_MS,
+        we: ctx.we,
+        sh2: 64 - p2_bits(),
+        memo: DateMemo::new(),
+        ring: [PendC::default(); RING],
+        rn: 0,
+    };
+    scan_lines::<4, _>(d, start, end, &mut sink);
+    let n = sink.rn.min(RING);
+    for i in 0..n {
+        let p = sink.ring[i];
+        emit_click(&ctx.links, &p, sink.cb, sink.bs, sink.sh2);
     }
     Scatter::<CRec>::fence();
 }
