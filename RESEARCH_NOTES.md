@@ -1294,6 +1294,46 @@ A single board score is good to about 20%, so only same-run A/B should pick betw
 - **Link filter: the evidence is split.** micah-andelman gained with a bit filter in front of the link table ([`3d8a80b`](https://github.com/micah-andelman/shopping-sessions/commit/3d8a80b): wall 0.601 to 0.565 s, 9 rounds); TejasviniChawla gained by removing theirs together with a one-multiply hash ([`6a56d39`](https://github.com/TejasviniChawla/shopping-sessions/commit/6a56d39): in-process 0.80 to 0.74 s at 10M on Granite Rapids; the filter stall was 4.5% of samples). The four-keys-per-line table the optimizer is measuring (18.1) makes a filter unnecessary; if that A/B loses, the filter of 13.1 is the fallback.
 - **AVX-512 downclocking is being tested, not yet answered**: joch44 [`86c52b0`](https://github.com/joch44/shopping-sessions/commit/86c52b0) built AVX2 twins of its AVX-512 paths for a frequency-license A/B; no result logged yet. The reported team-67 repo builds for `cascadelake`. Check joch44's log next cycle before trying `XCPU`.
 
+## Iteration 32 (2026-11-21, ~02:45): the reported board leader's design (hansliu-dev/676767)
+
+Read in full: `src/` (3,086 lines), `Dockerfile`, `Cargo.toml`, `scripts/`, all 17 commit messages (none carries a timing). Nothing built or run by this iteration; an x86 run of it is in flight on `bench-ext`.
+
+### 32.1 The public head is a plainer design than ours, so it does not explain 0.59 s
+
+Either the 0.59 s was scored by code that is not in this repo (the last commit is Friday 20:59 ET, and TejasviniChawla's note naming it is from about 01:30 Saturday), or the attribution is wrong. The x86 run decides; until then do not treat this as the leader's method.
+
+| Stage | hansliu-dev `68ea737` | Ours (`79cb1f5`) |
+|---|---|---|
+| Input | whole-file `mmap`, 4 MiB chunks, `MADV_POPULATE_READ` per chunk ([`io.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/io.rs) 63-77, [`main.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/main.rs) 835) | same (`IOMODE=3` default, `chunk_data` in `parse.rs`) |
+| Scanner | 64-byte blocks, three AVX2 compares, one `tzcnt` per separator, per-field first/last-byte quote test, quote count per line ([`scan.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/scan.rs) 100-170) | line-at-a-time masks (experiment 3); ours does less per field |
+| IDs | **no packing**: one unaligned 16-byte load, byte-swap, mask, length in the low byte ([`ids.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/ids.rs) `key`); IDs over 15 bytes interned under a mutex | SIMD nibble packing (experiment 4) |
+| Timestamps | month table 1970-2099 plus SWAR ([`ts.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/ts.rs) 159-235) | date table (experiment 7) |
+| Products | `<prefix><number>` straight into an array ([`main.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/main.rs) 1368-1456) | dense `Catalog`, same idea |
+| Scatter | 48-byte `EvRec` by `hash(event_id)`, 128-record blocks, plain stores, no write-combining ([`arena.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/arena.rs) `push`) | 32/16-byte records by person, write-combining with streaming stores (experiment 5) |
+| Person | looked up **after** dedup, prefetch distance 32 ([`main.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/main.rs) 1017-1044); links by union-find on a helper thread during parse | at parse time (experiment 2) |
+| Dedup | open-addressing table per bucket (8-byte slots: 32-bit tag, record ref), winners as a bitmap so survivors are read in memory order; the bucket's blocks are recycled for the person scatter ([`main.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/main.rs) 960-1050) | tombstone side stream plus bitmap prefilter (experiments 2, 13) |
+| Sessions | per bucket: local person map, counting pass, events as one `u64` (`rel<<32 | price<<8 | cat`) sorted with `sort_unstable`; assists by per-campaign stamp when sessions x clicks <= 2048, interval union otherwise ([`main.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/main.rs) 469-664, 1120-1212) | 8-byte keys, interval assists (experiment 9) |
+| Output | PLAIN v1 pages, no dictionary, no compression ([`parquet.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/parquet.rs) 1-2, 176) | dictionary `user_daily` (experiment 19): ours is smaller |
+| Memory | one reservation, `MADV_HUGEPAGE`; **a global allocator that sends every allocation of 1 MiB or more to its own 2 MiB-aligned `mmap` with `MADV_HUGEPAGE`** and grows with `mremap` ([`alloc.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/alloc.rs)) | arena with `MADV_HUGEPAGE`; large `Vec`s go through mimalloc |
+| Exit | inputs unmapped on a helper thread after parse (`34b6db8`: "~10 ms of single-threaded work inside exit()"); `process::exit(0)` | `chunk_done` drops PTEs per chunk; `process::exit(0)` |
+| Build | PGO in the Dockerfile (3M-event generated set, two runs, plus all fixtures); `target-cpu=cascadelake` if the build machine has AVX-512BW/VL, else `x86-64-v3`; fat LTO, one codegen unit ([`Dockerfile`](https://github.com/hansliu-dev/676767/blob/68ea737/Dockerfile)) | `target-cpu=$XCPU`, fat LTO, no PGO |
+
+There are no AVX-512 intrinsics anywhere in the source: `cascadelake` only changes what the compiler may emit.
+
+### 32.2 What it has that we lack and that is not logged as tried
+
+1. **PGO in the image build** (already rank 1; this is a third working recipe). Theirs trains on the fixtures as well as generated data, and has no fallback if the training run fails; the recipe in 24.6 keeps the fallback. Expected -3 to -5% (25.1). No risk to exactness.
+2. **Huge pages for every large heap allocation, by a 120-line global allocator** ([`alloc.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/alloc.rs)). Applies to our non-arena buffers: the link table in `build_links` (`keys.rs`), the dedup bitmaps (`main.rs:768-770`), `ev`/`cl` in the sessions phase (`main.rs:973, 1020`) and the output buffers in `pq.rs`. The optimizer has this queued from Vibhor7-7's log (-3.7% there) and rejected only mimalloc's own large-page flag (experiment 17); this file is a drop-in way to do it. Low risk: `realloc` moves pages with `mremap`, and small allocations fall through to the system allocator.
+3. **Raw 16-byte keys instead of packing** ([`ids.rs`](https://github.com/hansliu-dev/676767/blob/68ea737/src/ids.rs) `key`): about five instructions per ID against a nibble-table pack, at the price of 16-byte keys in every record. Not a fit for our 8-byte packed records; noted only because it shows packing is not required for a fast parse.
+4. **Direct assists by stamp for small people** (`68ea737`): when sessions x clicks <= 2048, each session walks its click window and marks a per-campaign stamp, with no sort by campaign. Applies to the assists part of `process_partition`; ours already counts by intervals, so the gain is at most the per-person sort of `(campaign, ts)` pairs for people with few clicks, under 1% of wall. Exactness: a campaign is counted once per session by the stamp, same as the interval union.
+5. **Recycling a dedup bucket's blocks as the next scatter's blocks** (`01d0db7`): our `Blocks` free lists already do this (`mem.rs` header).
+
+### 32.3 What explains a 0.59 against our estimated 0.9 s, ranked
+
+From this source, nothing structural: the design does more work per event than ours (48-byte records, two scatters of full records, a hash-table dedup). If the x86 run shows it faster than ours, the candidates in order are (a) PGO, (b) the huge-page allocator covering all large buffers, (c) simpler per-line code (no ID packing, plain stores) that suits 8 hyperthreads on 4 cores. If the run shows it slower than ours, the 0.59 s belongs to other code and this entry is closed.
+
+Top five: unchanged; PGO stays first, and the huge-page allocator joins the optimizer's queued Vibhor7-7 item with this file as the reference.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
