@@ -139,6 +139,24 @@ impl<T: Copy> BList<T> {
         self.left -= 1;
         self.len += 1;
     }
+    /// `push` that returns where the element landed (stable: blocks never move).
+    #[inline(always)]
+    pub fn push_at(&mut self, x: T, src: &mut Blocks) -> *mut T {
+        if self.left == 0 {
+            let b = src.get() as *mut T;
+            self.blocks.push(b);
+            self.cur = b;
+            self.left = Self::PER;
+        }
+        let at = self.cur;
+        unsafe {
+            at.write(x);
+            self.cur = at.add(1);
+        }
+        self.left -= 1;
+        self.len += 1;
+        at
+    }
     /// The filled parts of each block.
     #[inline]
     pub fn for_each_slice(&self, mut f: impl FnMut(&[T])) {

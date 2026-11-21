@@ -96,6 +96,26 @@ struct SRec {
     pc: u32,
 }
 
+/// One event copy for dedup: `at` is the address of its SRec in the person
+/// partitions, or 0 when the copy is invalid.
+#[derive(Clone, Copy, Default)]
+#[repr(C, packed(4))]
+struct LRec {
+    eid: Key,
+    ingest: i32,
+    at: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Pend {
+    eid: Key,
+    uid: Key,
+    h: u64,
+    ingest: i32,
+    ts: u32,
+    pc: u32,
+}
+
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct CRec {
@@ -118,21 +138,105 @@ pub struct Ctx {
     pub camp_channels: Vec<Vec<u8>>,
     pub links: Vec<KMap<Key>>, // sharded by top bits of hk
     pub link_shift: u32,
+    pub flat: Flat,
 }
 
 impl Ctx {
     #[inline(always)]
     fn prefetch_person(&self, h: u64) {
-        if !self.links.is_empty() {
+        if !self.flat.base.is_null() {
+            prefetch(unsafe { self.flat.base.add(self.flat.home(h)) });
+        } else if !self.links.is_empty() {
             prefetch(self.links[(h >> self.link_shift) as usize].slot_ptr(h));
         }
     }
     #[inline(always)]
     fn person_h(&self, uid: Key, h: u64) -> Key {
+        if !self.flat.base.is_null() {
+            return self.flat.get_h(uid, h).unwrap_or(uid);
+        }
         if self.links.is_empty() {
             return uid;
         }
         self.links[(h >> self.link_shift) as usize].get_h(uid, h).unwrap_or(uid)
+    }
+}
+
+/// The link maps copied into one huge-page table with equal-size shard
+/// regions (same shard bits as the maps), so a lookup misses no TLB entry.
+pub struct Flat {
+    base: *mut (Key, Key),
+    bits: u32,
+    shift: u32,
+}
+unsafe impl Sync for Flat {}
+unsafe impl Send for Flat {}
+
+impl Flat {
+    fn empty() -> Flat {
+        Flat { base: std::ptr::null_mut(), bits: 0, shift: 64 }
+    }
+    #[inline(always)]
+    fn home(&self, h: u64) -> usize {
+        (((h >> self.shift) as usize) << self.bits) | (h as usize & ((1usize << self.bits) - 1))
+    }
+    #[inline(always)]
+    fn get_h(&self, k: Key, h: u64) -> Option<Key> {
+        let m = (1usize << self.bits) - 1;
+        let rb = ((h >> self.shift) as usize) << self.bits;
+        let mut i = h as usize & m;
+        loop {
+            let s = unsafe { *self.base.add(rb | i) };
+            if s.0 == k {
+                return Some(s.1);
+            }
+            if s.0 == EMPTY {
+                return None;
+            }
+            i = (i + 1) & m;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn build(maps: &[KMap<Key>], shift: u32, threads: usize) -> Flat {
+        if maps.is_empty() {
+            return Flat::empty();
+        }
+        // ids that name themselves are left out: a miss already means "self"
+        let counts: Vec<usize> = maps.iter().map(|m| m.slots.iter().filter(|s| s.0 != EMPTY && s.0 != s.1).count()).collect();
+        let maxn = counts.iter().copied().max().unwrap_or(0);
+        eprintln!("flat: {} remapping ids, max {} per shard", counts.iter().sum::<usize>(), maxn);
+        let cap = (maxn + maxn / 8 + 16).next_power_of_two();
+        let bits = cap.trailing_zeros();
+        let bytes = maps.len() * cap * std::mem::size_of::<(Key, Key)>();
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        if p == libc::MAP_FAILED {
+            return Flat::empty();
+        }
+        unsafe { libc::madvise(p, bytes, libc::MADV_HUGEPAGE) };
+        let f = Flat { base: p as *mut (Key, Key), bits, shift };
+        let fr = &f;
+        par_for(maps.len(), threads, |_t, s| {
+            let m = cap - 1;
+            let region = unsafe { std::slice::from_raw_parts_mut(fr.base.add(s << bits), cap) };
+            region.fill((EMPTY, EMPTY));
+            for &(k, v) in &maps[s].slots {
+                if k == EMPTY || k == v {
+                    continue;
+                }
+                let mut i = hk(k) as usize & m;
+                while region[i].0 != EMPTY {
+                    i = (i + 1) & m;
+                }
+                region[i] = (k, v);
+            }
+        });
+        f
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn build(_maps: &[KMap<Key>], _shift: u32, _threads: usize) -> Flat {
+        Flat::empty()
     }
 }
 
@@ -378,12 +482,14 @@ fn main() {
     let ev_bytes: usize = ev_m.maps.iter().map(|m| m.len()).sum();
     let cl_bytes: usize = cl_m.maps.iter().map(|m| m.len()).sum();
     // ERec 32 B per ~78 B line, CRec 32 B per ~45 B line, plus partial blocks
-    let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * BLK * 2 + (256 << 20);
+    // (one-shuffle: SRec 16 B + LRec 20 B per event line)
+    let est = ev_bytes / 78 * 36 + cl_bytes / 40 * 32 + ((1usize << p1_bits()) + 3 * (1usize << p2_bits())) * threads * BLK * 2 + (256 << 20);
     let arena = Arena::new(est * 3 / 2);
 
     // ---- phase 1, concurrent with phase 2: parsing never reads the link maps
+    let oneshuf = env("ONESHUF", "0") == "1";
     let link_threads: usize = env("LINKT", "0").parse().unwrap_or(0);
-    let link_threads = if link_threads == 0 { (threads / 2).max(1) } else { link_threads };
+    let link_threads = if link_threads != 0 { link_threads } else if oneshuf { threads } else { (threads / 2).max(1) };
     let links_job = {
         let data = data.clone();
         std::thread::spawn(move || build_links(&data, link_threads))
@@ -402,12 +508,27 @@ fn main() {
         camp_channels,
         links: Vec::new(),
         link_shift: 64,
+        flat: Flat::empty(),
     };
 
-    if env("BENCH", "0") == "2" {
+    let links_job = if oneshuf || env("LINKFIRST", "0") == "1" {
         let (links, link_shift) = links_job.join().expect("links");
         ctx.links = links;
         ctx.link_shift = link_shift;
+        if env("FLAT", "1") == "1" {
+            ctx.flat = Flat::build(&ctx.links, ctx.link_shift, threads);
+        }
+        eprintln!("phase1 first {:?}", t_start.elapsed());
+        std::thread::spawn(|| (Vec::new(), 64))
+    } else {
+        links_job
+    };
+    if env("BENCH", "0") == "2" {
+        let (links, link_shift) = links_job.join().expect("links");
+        if !links.is_empty() {
+            ctx.links = links;
+            ctx.link_shift = link_shift;
+        }
         microbench(&ctx, &ev_m, &cl_m, &arena);
         return;
     }
@@ -417,6 +538,36 @@ fn main() {
     chunks_of(0, &ev_m, 4 << 20, &mut chunks);
     chunks_of(1, &cl_m, 4 << 20, &mut chunks);
     let blocks = PerThread::new(threads, || Blocks::new(&arena));
+    let (sparts, cparts) = if oneshuf {
+        let lbl = PerThread::new(threads, || (0..(1usize << p1_bits())).map(|_| BList::<LRec>::new()).collect::<Vec<_>>());
+        let sbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
+        let cbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
+        let iobufs = PerThread::new(threads, Vec::<u8>::new);
+        par_for(chunks.len(), threads, |t, i| {
+            let c = chunks[i];
+            let buf = unsafe { iobufs.get(t) };
+            let bs = unsafe { blocks.get(t) };
+            if c.kind == 0 {
+                let (d, s, e) = chunk_data(&ev_m, c.file as usize, c.start, c.end, buf);
+                parse_events1(&ctx, d, s, e, unsafe { lbl.get(t) }, unsafe { sbl.get(t) }, bs);
+                chunk_done(&ev_m, c.file as usize, c.start, c.end);
+            } else {
+                let (d, s, e) = chunk_data(&cl_m, c.file as usize, c.start, c.end, buf);
+                parse_clicks1(&ctx, d, s, e, unsafe { cbl.get(t) }, bs);
+                chunk_done(&cl_m, c.file as usize, c.start, c.end);
+            }
+        });
+        std::mem::forget(iobufs);
+        let lparts = PerThread::from_vec(transpose(lbl.into_inner(), 1usize << p1_bits()));
+        eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
+        let dscr = PerThread::new(threads, || (KMap::<u64>::with_capacity(16), Vec::<u64>::new()));
+        par_for(1usize << p1_bits(), threads, |t, p| {
+            let (mp, dead) = unsafe { dscr.get(t) };
+            dedup_mark(unsafe { lparts.get(p) }, mp, dead, unsafe { blocks.get(t) });
+        });
+        eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
+        (transpose(sbl.into_inner(), 1usize << p2_bits()), transpose(cbl.into_inner(), 1usize << p2_bits()))
+    } else {
     let ebl = PerThread::new(threads, || (0..(1usize << p1_bits())).map(|_| BList::<ERec>::new()).collect::<Vec<_>>());
     let cbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
     let iobufs = PerThread::new(threads, Vec::<u8>::new);
@@ -439,8 +590,13 @@ fn main() {
     let cparts = transpose(cbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
     let (links, link_shift) = links_job.join().expect("links");
-    ctx.links = links;
-    ctx.link_shift = link_shift;
+    if !links.is_empty() {
+        ctx.links = links;
+        ctx.link_shift = link_shift;
+        if env("FLATOLD", "0") == "1" {
+            ctx.flat = Flat::build(&ctx.links, ctx.link_shift, threads);
+        }
+    }
     eprintln!("phase1 joined {:?}", t_start.elapsed());
 
     // ---- phase 3: dedup per eid partition, survivors partitioned by person
@@ -471,6 +627,8 @@ fn main() {
         cparts[p].extend(v.into_iter().filter(|l| l.len > 0));
     }
     eprintln!("phase3b resolve {:?} {}", t_start.elapsed(), cpu());
+    (sparts, cparts)
+    };
 
     // ---- phase 4: per person partition
     let ncamp = ctx.camp_names.len();
@@ -575,6 +733,15 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, cl_m: &Mapped, arena: &Arena) {
         parse_events(ctx, &ev_m.maps[c.file as usize], c.start, c.end, &mut eb, &mut bs);
     }
     eprintln!("  full       {:.1} ns/line ({} lines, {})", t.elapsed().as_nanos() as f64 / lines as f64, lines, acc);
+    for pass in 0..3 {
+        let mut lb: Vec<BList<LRec>> = (0..(1usize << p1_bits())).map(|_| BList::new()).collect();
+        let mut sb: Vec<BList<SRec>> = (0..(1usize << p2_bits())).map(|_| BList::new()).collect();
+        let t = Instant::now();
+        for c in ch {
+            parse_events1(ctx, &ev_m.maps[c.file as usize], c.start, c.end, &mut lb, &mut sb, &mut bs);
+        }
+        eprintln!("  full1 #{pass}   {:.1} ns/line", t.elapsed().as_nanos() as f64 / lines as f64);
+    }
     let mut cch = Vec::new();
     chunks_of(1, cl_m, 4 << 20, &mut cch);
     let cch = &cch[..cch.len().min(40)];
@@ -659,6 +826,185 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
         let r = CRec { person: u, cid: pack_fast(f[0], ceil), ts, camp };
         unsafe { cb.get_unchecked_mut((hk(u) >> (64 - p2_bits())) as usize) }.push(r, bs);
     });
+}
+
+/// Events with the links already built: each valid copy goes straight to its
+/// person partition as an SRec, and every copy leaves an LRec in its eid
+/// partition. The person lookup is prefetched PD lines ahead through a ring.
+#[inline(never)]
+fn parse_events1(
+    ctx: &Ctx,
+    d: &[u8],
+    start: usize,
+    end: usize,
+    lb: &mut [BList<LRec>],
+    sb: &mut [BList<SRec>],
+    bs: &mut Blocks,
+) {
+    const PD: usize = 16;
+    let ws = ctx.ws;
+    let we = ctx.we;
+    let ws_s = ws.div_euclid(1000);
+    let floor = d.as_ptr();
+    let ceil = unsafe { floor.add(d.len()) };
+    let unknown = ctx.cat_unknown as u32;
+    let tsbl = ts_bl();
+    let s1 = 64 - p1_bits();
+    let s2 = 64 - p2_bits();
+    let emit = |p: Pend, lb: &mut [BList<LRec>], sb: &mut [BList<SRec>], bs: &mut Blocks| {
+        let v = ctx.person_h(p.uid, p.h);
+        let hv = if v == p.uid { p.h } else { hk(v) };
+        let at = unsafe { sb.get_unchecked_mut((hv >> s2) as usize) }.push_at(SRec { person: v, ts: p.ts, pc: p.pc }, bs);
+        unsafe { lb.get_unchecked_mut((hk(p.eid) >> s1) as usize) }.push(LRec { eid: p.eid, ingest: p.ingest, at: at as u64 }, bs);
+    };
+    let mut ring = [Pend::default(); PD];
+    let mut nr = 0usize;
+    scan_lines_fast::<7>(d, start, end, |f| {
+        if f[0].is_empty() {
+            return;
+        }
+        let eid = pack_fast(f[0], ceil);
+        let ingest = match parse_ingest_s(f[3], ceil) {
+            Some(v) => (v - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            None => i32::MAX,
+        };
+        'v: {
+            if f[1].is_empty() || f[5].is_empty() {
+                break 'v;
+            }
+            let Some(ts) = (if tsbl { parse_ts_bl(f[2], floor, ceil) } else { parse_ts_fast(f[2], floor, ceil) }) else { break 'v };
+            if ts < ws || ts >= we || (ingest as i64 + ws_s) * 1000 - ts > DAY_MS {
+                break 'v;
+            }
+            let price = match f[4] {
+                b"view" | b"cart" => 0,
+                b"purchase" => match parse_price(f[6]) {
+                    Some(p) => p,
+                    None => break 'v,
+                },
+                _ => break 'v,
+            };
+            let uid = pack_fast(f[1], ceil);
+            let h = hk(uid);
+            ctx.prefetch_person(h);
+            // the category is only ever read for purchases
+            let pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
+            let slot = &mut ring[nr % PD];
+            if nr >= PD {
+                emit(*slot, lb, sb, bs);
+            }
+            *slot = Pend { eid, uid, h, ingest, ts: (ts - ws) as u32, pc };
+            nr += 1;
+            return;
+        }
+        unsafe { lb.get_unchecked_mut((hk(eid) >> s1) as usize) }.push(LRec { eid, ingest, at: 0 }, bs);
+    });
+    for k in nr.saturating_sub(PD)..nr {
+        emit(ring[k % PD], lb, sb, bs);
+    }
+}
+
+/// Clicks with the links already built: routed straight to person partitions.
+#[inline(never)]
+fn parse_clicks1(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<CRec>], bs: &mut Blocks) {
+    const PD: usize = 16;
+    let cws = ctx.ws - WEEK_MS;
+    let we = ctx.we;
+    let tsbl = ts_bl();
+    let floor = d.as_ptr();
+    let ceil = unsafe { floor.add(d.len()) };
+    let s2 = 64 - p2_bits();
+    let emit = |r: CRec, h: u64, cb: &mut [BList<CRec>], bs: &mut Blocks| {
+        let v = ctx.person_h(r.person, h);
+        let hv = if v == r.person { h } else { hk(v) };
+        unsafe { cb.get_unchecked_mut((hv >> s2) as usize) }.push(CRec { person: v, ..r }, bs);
+    };
+    let mut ring = [(CRec::default(), 0u64); PD];
+    let mut nr = 0usize;
+    scan_lines_fast::<4>(d, start, end, |f| {
+        if f[0].is_empty() || f[1].is_empty() {
+            return;
+        }
+        let Some(ts) = (if tsbl { parse_ts_bl(f[3], floor, ceil) } else { parse_ts_fast(f[3], floor, ceil) }) else { return };
+        if ts < cws || ts >= we {
+            return;
+        }
+        let Some(camp) = ctx.campaigns.get(f[2], floor) else { return };
+        let u = pack_fast(f[1], ceil);
+        let h = hk(u);
+        ctx.prefetch_person(h);
+        let slot = &mut ring[nr % PD];
+        if nr >= PD {
+            emit(slot.0, slot.1, cb, bs);
+        }
+        *slot = (CRec { person: u, cid: pack_fast(f[0], ceil), ts, camp }, h);
+        nr += 1;
+    });
+    for k in nr.saturating_sub(PD)..nr {
+        let (r, h) = ring[k % PD];
+        emit(r, h, cb, bs);
+    }
+}
+
+/// Per eid partition: the copy with the smallest ingest wins; every other
+/// copy that produced an SRec gets that SRec marked dropped.
+#[inline(never)]
+fn dedup_mark(lists: &mut [BList<LRec>], mp: &mut KMap<u64>, dead: &mut Vec<u64>, bs: &mut Blocks) {
+    let n: usize = lists.iter().map(|l| l.len).sum();
+    if n == 0 {
+        return;
+    }
+    mp.reset(n);
+    dead.clear();
+    dead.resize(n / 64 + 1, 0);
+    let mut i = 0u32;
+    let mut ndead = 0usize;
+    for l in lists.iter() {
+        l.for_each_slice(|sl| {
+            for r in sl {
+                let v = ((r.ingest as u32 as u64) << 32) | i as u64;
+                let (s, ins) = mp.entry(r.eid, v);
+                if !ins {
+                    let cur = *mp.val_mut(s);
+                    if r.ingest < (cur >> 32) as u32 as i32 {
+                        let ci = cur as u32;
+                        dead[(ci / 64) as usize] |= 1 << (ci % 64);
+                        *mp.val_mut(s) = v;
+                    } else {
+                        dead[(i / 64) as usize] |= 1 << (i % 64);
+                    }
+                    ndead += 1;
+                }
+                i += 1;
+            }
+        });
+    }
+    if ndead != 0 {
+        let mut i = 0usize;
+        for l in lists.iter() {
+            l.for_each_slice(|sl| {
+                let w0 = i / 64;
+                let w1 = (i + sl.len()).div_ceil(64);
+                for w in w0..w1 {
+                    let mut m = dead[w];
+                    while m != 0 {
+                        let j = w * 64 + m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        if j >= i && j < i + sl.len() {
+                            let at = sl[j - i].at;
+                            if at != 0 {
+                                unsafe { (*(at as *mut SRec)).pc = INVALID };
+                            }
+                        }
+                    }
+                }
+                i += sl.len();
+            });
+        }
+    }
+    for l in lists.iter_mut() {
+        l.release(&mut bs.free);
+    }
 }
 
 /// Rewrites user ids to person ids inside one user-hash partition (the links
@@ -813,6 +1159,10 @@ fn process_partition(
     for l in slists {
         l.for_each_slice(|sl| {
             for r in sl {
+                if r.pc == INVALID {
+                    gid.push(u32::MAX);
+                    continue;
+                }
                 let (s, ins) = gmap.entry(r.person, gkeys.len() as u32);
                 if ins {
                     gkeys.push(r.person);
@@ -836,6 +1186,7 @@ fn process_partition(
     pos.clear();
     pos.extend_from_slice(&off[..ng]);
     let ev = &mut sc.ev;
+    let n = off[ng] as usize;
     ev.clear();
     ev.reserve(n);
     unsafe { ev.set_len(n) };
@@ -845,8 +1196,10 @@ fn process_partition(
             l.for_each_slice(|sl| {
                 for r in sl {
                     let g = gid[i] as usize;
-                    unsafe { *ev.get_unchecked_mut(pos[g] as usize) = *r };
-                    pos[g] += 1;
+                    if g != u32::MAX as usize {
+                        unsafe { *ev.get_unchecked_mut(pos[g] as usize) = *r };
+                        pos[g] += 1;
+                    }
                     i += 1;
                 }
             });
