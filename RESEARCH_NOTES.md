@@ -306,6 +306,39 @@ From [Encodings.md](https://raw.githubusercontent.com/apache/parquet-format/mast
 
 Not opened: parquet-mr source, polars' `max_page_size` default, any measured write benchmark, anything specific to overlayfs.
 
+---
+
+## Iteration 6 (2026-11-21): primary sources on write-combining (design rules for idea 1.2)
+
+Opened by a research agent; links per claim. The sources support the plan in 1.2 and settle its open parameters.
+
+### 6.1 Stage size: start at 4 cache lines per partition, sweep 2
+
+- Schuhknecht et al. measured the best streamed buffer at 6 lines for 256 partitions, 4 for 512, 2 for 1024 and 1 from 2048 up, and advise fewer than 8 lines ([PVLDB 2015](https://www.vldb.org/pvldb/vol8/p934-schuhknecht.pdf), Table 2; 8-byte tuples, 32 KB L1, 256 KB L2). Streaming was 1.18x faster than buffering alone on the partition step at 512 partitions, and 0.98x to 1.0x at 128 or fewer.
+- Wassenberg and Sanders, Balkesen et al. and Polychroniou and Ross use exactly one line ([arXiv 1008.2849](https://arxiv.org/pdf/1008.2849); [TKDE version](https://cs.uwaterloo.ca/~tozsu/publications/other/hash-joins-tkde-final.pdf) §6.9; [SIGMOD 2014](https://www.cs.columbia.edu/~orestis/sigmod14I.pdf) §3.2.1). One line holds only two `ERec`s, so that is too small here.
+- **Here.** `N = 8` for `ERec` and `CRec` (4 lines, 128 KB of stage per thread at 512 partitions), with `N = 4` as the sweep point; `N = 8` or `16` for `SRec`. This matches what Vibhor7-7 converged on by experiment (entry 1.2).
+
+### 6.2 Keep the two halves of a line together, and fence once
+
+- Cascade Lake has 10 write-combining buffers and Ice Lake 12 by Intel's manual (§3.6.9, [248966-050](https://web.archive.org/web/2024id_/https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-optimization-manual.pdf)); a Stack Overflow answer disputes the Cascade Lake figure and says they are shared between hyperthreads ([question 49959963](https://stackoverflow.com/questions/49959963)). The same buffers serve L1 load misses.
+- If other traffic closes a buffer before its line is complete, the line leaves as partial writes at a fraction of the data rate (Intel §11.5.5, §3.6.11). So read the whole stage first, then issue the two `_mm256_stream_si256` of each line back to back with no parsing load between them. Whether one 64-byte AVX-512 store avoids this window is not established by any source.
+- A fence is needed only before another thread reads the data (Intel §9.4.1.4; [Cordes](https://stackoverflow.com/questions/35516878)). One `_mm_sfence` per thread after `finish`, before the `par_for` task returns; none per flush.
+- `_mm256_stream_si256` faults on a destination that is not 32-byte aligned. Arena blocks and the heap fallback in `Arena::block` (`mem.rs:72`, 64-byte alignment) both qualify.
+
+### 6.3 Where not to stream
+
+- Non-temporal stores pay only when the destination would miss L2 and is not read again before eviction ([Agner Fog](https://www.agner.org/optimize/optimizing_cpp.pdf)); do not mix them with ordinary writes to the same area.
+- **Here.** Stream the parse scatter (`parse_events`, `parse_clicks`) and dedup pass 2, whose outputs are hundreds of MB. Keep the plain `push` for the `mv` lists in `resolve_partition` (`main.rs:682`) and for the links scatter, which are small and read back soon.
+- On Ice Lake, ordinary stores skip the read-for-ownership only near memory-bus saturation, seen at 29 or more cores on a Xeon 8358 ([Hager](https://blogs.fau.de/hager/?p=8997)); with 4 cores that does not apply, so streaming still matters there.
+
+### 6.4 Alternatives closed
+
+- **Prefetch-for-write of the next slot** helps from 4,096 partitions and hurts below 1,024 (Schuhknecht §3.3). Not for 512.
+- **Two-pass partitioning.** A single buffered pass stays flat to 2^14 or 2^15 partitions while the buffers fit the cache ([Schuh et al., SIGMOD 2016](https://bigdata.uni-saarland.de/publications/An%20Experimental%20Comparison%20of%20Thirteen%20Relational%20Equi-Joins%20in%20Main%20Memory.pdf); Balkesen §6.9). 9 bits needs one pass.
+- **`movdir64b`, `clzero`, `rep movsb`.** The first is absent before Sapphire Rapids and the second is AMD-only ([GCC x86 options](https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html)); `rep movsb` is slower than non-temporal copies and only competitive from 256 bytes.
+
+Not found: any measurement of non-temporal stores under hyperthread contention, in a VM, or Zen against Intel beyond Vibhor7-7's A/B.
+
 ## Next iteration
 
 - Re-read `OVERNIGHT_LOG.md` if it exists and drop anything it marks tried.
