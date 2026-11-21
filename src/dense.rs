@@ -187,6 +187,16 @@ pub fn detect(ev_paths: &[PathBuf], ev_bytes: usize, ws: i64, threads: usize) ->
 fn start_over(why: &str) -> ! {
     use std::os::unix::process::CommandExt;
     eprintln!("dense: abandoned ({why}), restarting on the general path");
+    // what this run already wrote must not survive: the general path
+    // creates an output file only when it has rows for it
+    let out = PathBuf::from(env("OUTPUT_DIR", "/output"));
+    for dir in ["user_daily", "campaign_daily"] {
+        if let Ok(rd) = std::fs::read_dir(out.join(dir)) {
+            for e in rd.flatten() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let exe = std::env::current_exe().expect("own path");
     let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("DENSE", "0").exec();
     panic!("restart failed: {err}");
@@ -886,7 +896,8 @@ pub fn run(dn: Dense, data: &Path, outdir: &Path, threads: usize, arena: &Arena,
             index_run(&shared, a, sc, o.index, &o.words, &o.class);
         }
     }
-    if dn.abandon.load(Ordering::Relaxed) {
+    // DENSE_ABANDON=1 takes the way out on purpose, to test it
+    if dn.abandon.load(Ordering::Relaxed) || env("DENSE_ABANDON", "0") == "1" {
         start_over("a user's events are not one run of numbers");
     }
     eprintln!("dense events {:?} {}", t_start.elapsed(), cpu());
