@@ -30,36 +30,9 @@ if [ -n "${CG_REF:-}" ]; then
     rm -rf /tmp/o; mkdir /tmp/o
     STAGE=$st NCPU=1 DATA_DIR=$HOME/dev OUTPUT_DIR=/tmp/o valgrind --tool=cachegrind --branch-sim=yes --cache-sim=no --cachegrind-out-file=/tmp/cg.out ./target/release/sessions 2>&1 | grep -E "I +refs|Branches|Mispred|rror|valgrind:" | sed "s/^/CG$st /"
     (cg_annotate /tmp/cg.out --show=Ir,Bcm --annotate=yes > /tmp/ann.txt 2>/tmp/ann.err || cg_annotate /tmp/cg.out > /tmp/ann.txt 2>>/tmp/ann.err); head -5 /tmp/ann.err | sed 's/^/CGE /'; wc -l /tmp/ann.txt | sed 's/^/CGE /'
-    head -70 /tmp/ann.txt | cut -c1-230 | sed "s/^/CGR$st /"
     grep -nE "^-- (Auto|User)-annotated|annotated source" /tmp/ann.txt | head -8 | sed "s/^/CGR$st /"
     awk '/annotated source/{f++} f>=1 && NR%1==0' /tmp/ann.txt | grep -E "^ *[0-9,]{9,}" | sort -t'(' -k1,1 -r | head -5 | cut -c1-200 | sed "s/^/CGS$st /"
-    python3 - $st <<'PY'
-import re,sys
-st=sys.argv[1]
-cur=''; rows=[]; inblk=False
-for l in open('/tmp/ann.txt',errors='replace'):
-    if 'annotated source' in l or l.startswith('-- Auto-annotated') or l.startswith('-- User-annotated'):
-        cur=l.strip().split('/')[-1][:14]; continue
-    m=re.match(r'\s*([\d,]+) \(\s*[\d.]+%\)\s+([\d,]+|\.)?(?: \(\s*[\d.]+%\))?\s*(.*)',l)
-    if m and cur:
-        try: ir=int(m.group(1).replace(',',''))
-        except: continue
-        b=m.group(2); b=0 if b in (None,'.') else int(b.replace(',',''))
-        if ir>=1000000 or b>=30000: rows.append((ir,b,cur,m.group(3).strip()[:110]))
-# function summary
-f=False
-for l in open('/tmp/ann.txt',errors='replace'):
-    if 'File:function summary' in l or 'Function:file summary' in l: f=True; n=0; continue
-    if f:
-        if l.startswith('-- ') and 'summary' not in l and n>3: break
-        if re.search(r'sessions::|\*\*\*|memcpy|memmove|memset',l):
-            print(('CGF%s '%st)+l.strip()[:200]); n+=1
-            if n>40: break
-rows.sort(reverse=True)
-for r in rows[:110]: print(('CGL%s ir=%%10d bcm=%%8d %%-14s %%s'%st)%r)
-rows.sort(key=lambda r:-r[1])
-for r in rows[:25]: print(('CGB%s ir=%%10d bcm=%%8d %%-14s %%s'%st)%r)
-PY
+    awk '/^-- (Auto|User)-annotated source: /{f=$NF; sub(/.*\//,"",f)} /^ *[0-9,]+ \(/{n=$1; gsub(/,/,"",n); if (n+0>=1500000 && f!="") {line=$0; sub(/^ *[0-9,]+ \([^)]*\) +[0-9,]+ +\([^)]*\) +[0-9,]+ +\([^)]*\) +[0-9,.]+( +\([^)]*\))? +[0-9,.]+( +\([^)]*\))? */,"",line); m=$5; gsub(/,/,"",m); printf "%d %d %s | %s\n", n, m, f, substr(line,1,110)}}' /tmp/ann.txt | sort -rn | head -130 | sed "s/^/CGL$st /"
   done
 fi
 
