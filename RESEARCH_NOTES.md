@@ -1498,6 +1498,25 @@ Model check ([`chk2/linkuf.py`] in the scratchpad): the steps above as atomic op
 - **Risk**: low for values (model-checked, same naming rule); the new part is concurrency, which the fuzz test for links should cover by running the build at 1 and 8 threads against the present implementation on random graphs.
 - cherylaurelia goes one step further (the person is the slot number, and unlinked users are added to the same table during parse); that is a different pipeline and not proposed.
 
+## Iteration 37 (2026-11-21, 03:15): cachegrind of ours and the two fastest public builds, same machine and data
+
+Run [44882607432](https://github.com/nimaibhat/databricks-chall/actions/runs/44882607432) on `bench-ext` (`bench/cg.sh`): each repo built natively with `-C target-cpu=x86-64-v3`, generator seed 1, 1,072,116 event lines and 255,280 click lines, one thread, `valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes`. Ours is `origin/main` at `fc2fb77` code.
+
+| Whole run | ours | cherylaurelia `2e4261f` | Vibhor7-7 `bee0cbf` |
+|---|---|---|---|
+| Instructions | 1,599 M | 1,175 M | 1,284 M |
+| D1 misses (read + write) | 12.7 M | 11.5 M | 15.7 M |
+| Last-level misses | 1.20 M | 1.07 M | 1.13 M |
+| Conditional branches | 150.9 M | 148.5 M | 113.8 M |
+| Mispredicted (simulated) | 4.80 M | 4.53 M | 3.88 M |
+
+- **The gap is instructions and nothing else.** We run 36% more instructions than cherylaurelia and 25% more than Vibhor7-7, with the same simulated cache misses and mispredictions; the wall gap in iteration 35 (in-process 1.154 against 0.885 and 0.960 s) is the same ratio. Memory layout, prefetching and branch work have nothing left to give against these two; only shorter code does.
+- **All of it is in parse.** By function (inlined callees included): ours `parse_events` 856 M + `parse_clicks` 154 M = 1,010 M; cherylaurelia's parse closure 715 M; Vibhor7-7's parse closure plus index build about 730 M. That is about 760 instructions per input line against 540 to 550. Sessions is the other way round: our `process_partition` 141 M against cherylaurelia's 178 M; our dedup is 49 M.
+- **Where our 856 M in `parse_events` sits, by source file of the inlined code**: `parse.rs` 484 M (scanner, timestamps, field checks: 451 per event line), `keys.rs` 128 M (ID packing, hash, link lookup: 120), core library generics 138 M (pointer, slice and integer helpers inlined into the loop: 129), `main.rs` 82 M (record build and emit: 76), `mem.rs` 24 M (scatter push: 23).
+- **What this ranks.** The scanner stages of 34 (about 315 to 160 per line) would close roughly 155 of the 220 instructions per line that separate us from both builds, so they are worth more than the -3 to -4% estimated there if the count carries to time as it has so far (ratio of instructions and of in-process time agree). The remaining 65 per line are spread over `keys.rs` and the emit path: 28.2 (one-multiply hash), 28.3 (one ring path) and 28.4 (one room check per line) are the logged candidates.
+- **Mispredictions**: ours 4.80 M, of which `process_partition` in `main.rs` has 0.90 M and `parse_events` about 0.87 M across files; Vibhor7-7 has 19% fewer overall with a quarter fewer branches. Not a lever of the size of the instruction count.
+- Reusable: `bench/cg.sh` on `bench-ext` takes any ref or public repo; the per-function table (`CGF` lines) is in the run log.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
