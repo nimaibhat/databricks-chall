@@ -32,7 +32,7 @@ if [ -n "${CG_REF:-}" ]; then
     (cg_annotate /tmp/cg.out --show=Ir,Bcm --annotate=yes > /tmp/ann.txt 2>/tmp/ann.err || cg_annotate /tmp/cg.out > /tmp/ann.txt 2>>/tmp/ann.err); head -5 /tmp/ann.err | sed 's/^/CGE /'; wc -l /tmp/ann.txt | sed 's/^/CGE /'
     grep -nE "^-- (Auto|User)-annotated|annotated source" /tmp/ann.txt | head -8 | sed "s/^/CGR$st /"
     awk '/annotated source/{f++} f>=1 && NR%1==0' /tmp/ann.txt | grep -E "^ *[0-9,]{9,}" | sort -t'(' -k1,1 -r | head -5 | cut -c1-200 | sed "s/^/CGS$st /"
-    awk '/^-- Annotated source file: /{f=$NF; sub(/.*\//,"",f); next} /^-- /{ if ($0 !~ /Annotated source file/) f="" } /^ *[0-9,]+ \(/{n=$1; gsub(/,/,"",n); if (n+0>=1200000 && f!="") {l=$0; gsub(/ +/," ",l); printf "%d %s | %s\n", n, f, substr(l,1,170)}}' /tmp/ann.txt | sort -rn | head -140 | sed "s/^/CGL$st /"
+    awk '/^-- Annotated source file: /{f=$NF; sub(/.*\//,"",f); next} /^-- /{ if ($0 !~ /Annotated source file/) f="" } /^ *[0-9,]+ /{n=$1; gsub(/,/,"",n); if (n+0>=1200000 && f!="") {l=$0; gsub(/ +/," ",l); printf "%d %s | %s\n", n, f, substr(l,1,170)}}' /tmp/ann.txt | sort -rn | head -140 | sed "s/^/CGL$st /"
   done
 fi
 
