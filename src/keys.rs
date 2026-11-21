@@ -127,11 +127,11 @@ unsafe fn codes16(p: *const u8, n: usize) -> Option<(u64, u64)> {
 /// The bytes are classified and turned into 6-bit codes 16 at a time, then
 /// the codes are squeezed together with shifts.
 #[inline(always)]
-pub fn pack_fast(s: &[u8], ceil: *const u8) -> Key {
+pub fn pack_fast(s: &[u8], ceil: *const u8, roomy: bool) -> Key {
     let n = s.len();
     let p = s.as_ptr();
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if n <= 10 && (p as usize) + 16 <= ceil as usize {
+    if n <= 10 && (roomy || (p as usize) + 16 <= ceil as usize) {
         let Some((lo, hi)) = (unsafe { codes16(p, n) }) else { return pack_long(s) };
         // first byte to the top, then 8 -> 6 bits per code: one bit-extract
         // where the CPU has it, three shift-merges elsewhere
@@ -504,7 +504,7 @@ mod tests {
             let mut buf = vec![0xEEu8; 7];
             buf.extend_from_slice(id);
             buf.extend(std::iter::repeat(b'z').take(slack));
-            pack_fast(&buf[7..7 + id.len()], unsafe { buf.as_ptr().add(buf.len()) })
+            pack_fast(&buf[7..7 + id.len()], unsafe { buf.as_ptr().add(buf.len()) }, false)
         };
         let mut hits = 0u32;
         for n in 0..=11usize {
@@ -551,7 +551,7 @@ mod tests {
                 let (a, b) = (pack(x), pack(y));
                 let mut buf = x.to_vec();
                 buf.extend_from_slice(&[b'\xff'; 16]);
-                assert_eq!(pack_fast(&buf[..x.len()], unsafe { buf.as_ptr().add(buf.len()) }), a);
+                assert_eq!(pack_fast(&buf[..x.len()], unsafe { buf.as_ptr().add(buf.len()) }, false), a);
                 assert_eq!(key_cmp(a, b), x.cmp(y), "{:?} {:?}", x, y);
                 assert_eq!(a == b, x == y);
                 let mut o = Vec::new();
@@ -684,13 +684,13 @@ impl Catalog {
     }
     /// The value for `s`; bytes from `floor` up to `s` are readable.
     #[inline(always)]
-    pub fn get(&self, s: &[u8], floor: *const u8) -> Option<u32> {
+    pub fn get(&self, s: &[u8], floor: *const u8, roomy: bool) -> Option<u32> {
         let pl = self.pl;
         let n = s.len();
         let e = unsafe { s.as_ptr().add(n) };
         // dense path: prefix + 1..=8 digits, at most 8 bytes in all, compared
         // and converted from the single word that ends at the field end
-        if n > pl && n <= 8 && e as usize >= floor as usize + 8 {
+        if n > pl && n <= 8 && (roomy || e as usize >= floor as usize + 8) {
             let x = crate::parse::ld8(unsafe { e.sub(8) });
             let k = n - pl; // 1..=8 digits
             let pre = (x >> (8 * (8 - n))) & self.pmask;
@@ -733,8 +733,8 @@ mod cat_tests {
             buf.extend_from_slice(b",,,,,,,,");
             let s = &buf[16..16 + pr.len()];
             let exp = c.map_get(pr, pr.as_ptr());
-            assert_eq!(c.get(s, buf.as_ptr()), exp, "{:?}", std::str::from_utf8(pr));
+            assert_eq!(c.get(s, buf.as_ptr(), false), exp, "{:?}", std::str::from_utf8(pr));
         }
-        assert_eq!(c.get(b"p7", b"p7".as_ptr()), Some(21));
+        assert_eq!(c.get(b"p7", b"p7".as_ptr(), false), Some(21));
     }
 }
