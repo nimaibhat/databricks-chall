@@ -1,5 +1,6 @@
 # label|ref|build-args|env
-main|origin/gate-main-11f3bcf||
-s30|origin/gate-s30-9990300||
-s30tmpfs|origin/gate-s30tmpfs-9990300||@tmpfs
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+main|origin/gate-main-09b1677||
+s32|origin/gate-s32-6dd1fd7||
+s32sync1|origin/gate-s32sync1-6dd1fd7||OUTSYNC=1
+s32sync2|origin/gate-s32sync2-6dd1fd7||OUTSYNC=2
+s32tmpfs|origin/gate-s32tmpfs-6dd1fd7||@tmpfs
