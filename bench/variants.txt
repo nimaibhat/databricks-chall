@@ -1,5 +1,2 @@
 # label|ref|build-args|env
-main|origin/gate-main-ddb99e9||
-s21|origin/gate-s21-3bf651d||
-s22|origin/gate-s22-82942b4||
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+s22d|origin/gate-s22d-82942b4||
