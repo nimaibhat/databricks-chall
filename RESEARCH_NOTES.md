@@ -10,13 +10,11 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
-| 1 | **Risk item, not a speed-up:** find which of experiment 9's three parts makes 40M events slower (+11 ms), and ship only the parts that do not | `main.rs:64` (`BB`), `parse.rs:1800` (`CH_DEFAULT`), `k_free.rs:1683` (`PFD`) | Removes a 2.7% loss if the hidden set is larger than reported, at a cost of at most about 1 ms at 20M | Log, experiment 9: 422.7 against 411.5 at 40M, parse +16.5, ev3a -5.7. **My reading:** it is the bucket size. Bucket count grows with the input (`nb = ecap >> BB`), so at 40M each parse thread scatters into about 3,100 staging lines (197 KiB) instead of 1,540; experiment 7 already showed `BB=14` costing parse 2.1 ms at 20M and `BB=13` 11 ms | None | 14.1 |
-| 2 | Frequency-licence probe at three points (worker start, end of parse, end of ev3a) | `parse.rs:2181`, `events.rs:2096` | Probe: none. If parse is held at L1 by its 256-bit multiplies: **my estimate** up to 5 ms | Log: memory traffic accounts for about 70 of parse's 158 ms, "the rest is computation". So about 88 ms scales with the core clock. Quoted: Lemire 2018, Downs 2020 (1.2) | Probe: none | 1.2, 3.3, 14.2 |
-| 3 | Clear arena blocks during setup, on workers spawned flat from main (the two changes only work together) | `sys.rs:279-292` (`pool_start`, `worker`), `setup.rs:826-833`, `parse.rs:180` (`new_chunk`) | **My estimate** 1 to 2 ms | Log: page zeroing is 11.1% of samples; the VM writes 30 GB/s on 8 threads and parse uses that bandwidth for zeroing and records at once, while setup's 2.5 ms uses almost none. Log: workers only exist from 0.9 to 1.45 ms (13.1) | None: same bytes in the same places | 15.1 |
-| 4 | `ev3b`: find out whether its 2.6 ms of wall is one item, and if so split it | `events.rs:2126-2222` (`stage3b`), `:2312` (the sort by size) | Up to 1.5 ms | Log: `ev3b wall 2.56, busy 16.2, idle 4.34 (21%)`, 599 joined runs. 16 thread-ms on 8 threads should take 2.0 ms; the rest is a tail | Low if only the scheduling changes; any change to how one user's segments are fed is row-sensitive | 15.2 |
-| 5 | Put the scanner's lookup tables on one huge page | `k_free.rs:604-624` (`static T`) | **My estimate** 0 to 2 ms of parse, could be 0; costs about 0.3 ms at start | Mechanism only: the tables are about 1 MB of `.rodata` on 4 KiB pages, read about 12 times per line. The VM has no counters, so the dTLB miss rate is unknown | None to output; start-up remapping is delicate (15.3) | 15.3 |
-
-Diagnostics that cost no code and would direct the next round (15.4): `perf annotate` of the three hottest functions; a profile of the write stage alone; the one-thread-per-core run (11.1).
+| 1 | **Insurance, no gain at 20M:** pick the bucket size by input size. Ship two builds (`XL_BB=14`, `XL_BB=15`); the default one `execv`s the other when `events.csv` is above about 25M events' worth of bytes | `setup.rs:844` (sizes known after the listing; a bare `stat` in `main` is earlier still), `Dockerfile` | 0 at 20M; 5 ms at 30M, 15 ms at 40M (**measured**, experiment 14); costs one `execv`, **my estimate** 0.3 to 0.5 ms, on the large path only | Experiment 14: bucket 2^14 alone is +15 ms at 40M, crossover near 25M | None if both builds pass the gate; both must be gated | 17.1 |
+| 2 | `perf annotate` of `run_events`, `ev_batch`, `links::job` (no code) | n/a | Directs everything else | Experiment 13's thread table shows parse is bound by computation on the cores, so the next gain is in instructions, and I cannot rank instructions without samples | None | 15.4, 17.3 |
+| 3 | Prefetch the 64 staging lines of a batch as `ev_vec` computes their addresses | `parse.rs:714` (after `st4::<LP>`), same in `ck_vec` | **My estimate** 0 to 1 ms at 20M; possibly several ms of the 30M/40M penalty | Mechanism only. Experiment 14: doubling the buckets cost nothing at 20M, so the lines are not latency-bound there | None | 17.2 |
+| 4 | Frequency-licence probe at three points | `parse.rs:2181`, `events.rs:2096` | Diagnostic | Not yet run; see the caution in 15.5 | None | 14.2 |
+| 5 | (empty: nothing else I can support with evidence) | | | | | |
 
 **Closed by measurement since iteration 9 (do not re-propose):**
 - Row 1 of iteration 9 (release input once at the end): experiment 5. Parse does drop to 151.0, but the parallel release then takes 8.6 ms, so the wall is the same. The log's conclusion is the durable fact: **unmapping 1.8 GB of 4 KiB input pages costs about 8 ms of wall on 8 threads wherever it is done.** My estimate of 3 to 6 ms for the parallel release was too low.
@@ -522,6 +520,35 @@ The authors wrote all vector code that runs during parse through 256-bit wrapper
 Read `links.rs:825-931` (`count_chunk`, `scatter_chunk`, `bucket`).
 - Per user bucket the job reads that bucket's click and link records twice (count, then scatter into the index), about 500 KiB per bucket, then sorts within users. The second read comes from cache. I found no pass to remove; mode 2, which drops the count pass, measured equal (experiment 6), which fits.
 - **Reading the log's `st2b_*` figures:** `st2b_pass2` is taken from the job's start, not from the end of pass 1 (`links.rs:919-920`, `dbg2 = tstart.elapsed()`), so it includes `st2b_pass1`. The scatter itself is 113.2 - 18.4 = about 95 thread-ms, of which about 48 is the kernel clearing the index's pages (profile). So the job's own work on 5.1M clicks is about 9 ns per click for the scatter: not a target. The page clearing is, and 15.1 now names the click index as the first thing to pre-clear.
+
+## Iteration 17 (2026-11-21): experiments 11 to 14 read
+
+**Closed, with what each one taught:**
+- 15.3 tables on huge pages (experiment 11): parse -1.1 ms, eaten by making the two pages. So table TLB misses are worth about 1 ms in all.
+- 15.1 and 16 pre-clearing (experiments 12, 13): 28 to 36 MB cleared before parse, run not faster. **My bandwidth argument was wrong**: taking zeroing out of parse does not shorten parse, so parse is not held up by the kernel's clearing.
+- 15.2 `ev3b`: 1.7 ms in the shipped build (thread table, experiment 13). No tail worth chasing.
+- 11.1 one thread per core: the second hyperthread gives 1.22x in parse, two cores to four gives 1.93x. Parse scales with cores almost linearly, which a memory-bound stage would not. The "70 ms of parse is memory traffic" reading from the bandwidth test should not be used to rank ideas any more; what is left in parse is computation.
+- 14.1 (experiment 14): the 40M cost is the bucket size alone, as read. Chunk and prefetch constants are safe at every size.
+
+### 17.1 Row 1: choose the bucket size at run time, without touching the hot code
+
+- `BB` is a compile-time constant used in about 50 places, including constant offsets in the stage 3 layouts (`events.rs:1022-1054`) and shift immediates in `ev_vec` (`parse.rs:712`). Making it a variable would touch all of them; I do not propose that.
+- Instead: build the binary twice (`XL_BB=14` as now, `XL_BB=15`). In the default one, before any thread starts, `stat` `/data/events.csv`; if its size is above the threshold, `execv` the other with the same arguments. Threshold: the byte size of a 25M-event file, taken from the seed 6 and seed 20 files on the VM (bytes per event is stable in the generator).
+- Per-bucket work is the same at every input size (a bucket is 2^BB ids); what changes with size is the number of buckets, 1,538 at 20M and 3,076 at 40M with 2^14. Experiment 14 says about 1,500 is free and about 2,300 is not.
+- Cost at 20M: nothing, the `stat` happens anyway. On the large path one `execv` of a static binary (**my estimate** 0.3 to 0.5 ms, not measured).
+- Check first that the rules permit a second executable in the image; I found nothing against it in `rules.md` but the earlier commit "single pipeline binary" may have had a reason.
+- This removes the open decision between `801982c` and `safe-constants`.
+
+### 17.2 Row 3: prefetch the staging lines
+
+- `ev_vec` computes each row's staging-line address (`lp`, `parse.rs:714`) a whole batch before `push_many` stores to it (`parse.rs:104-110`). Per thread the lines are 64 B x buckets: 98 KB at 20M, 197 KB at 40M, and two hyperthreads share a 1 MiB L2 with the scanner tables and input.
+- Change: after `st4::<LP>`, four `prefetcht0` on the four line addresses (extract from the vector, or prefetch in a short scalar loop over `out.lp` at the top of `push_many`). Same in `ck_vec`.
+- Expected: little at 20M (doubling the lines cost nothing there). It is a candidate for recovering part of the penalty at 30M and 40M, which would make row 1 unnecessary; test at 40M first.
+- Risk to output: none.
+
+### 17.3 Where I stand
+
+Four ideas from iterations 15 and 16 were measured and none paid. The mechanisms I can argue from the source and the log's totals are used up; the remaining time is inside three functions and I need per-instruction samples (15.4 item 1) to say anything better than a guess. That profile is the most valuable thing the coding agent can run next.
 
 ## Next passes
 
