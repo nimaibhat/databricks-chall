@@ -228,7 +228,7 @@ pub struct Mapped {
 /// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread.
 pub fn io_mode() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
+    *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
 }
 
 /// Makes chunk bytes available. Returns (data, start, end) to scan.
@@ -266,51 +266,6 @@ pub fn chunk_data<'a>(m: &'a Mapped, file: usize, start: usize, end: usize, buf:
     let _ = (mode, buf);
     (map, start, end)
 }
-/// IOMODE 5: reads chunk [start, end) of `file` into `buf` in blocks of about
-/// 256 KiB (cache resident) and calls `f(data, s, e)` for each run of whole
-/// lines data[s..e]. `data` holds up to 16 bytes before `s` and up to 128
-/// bytes past `e` (whatever the file has), like a mapping would.
-#[cfg(unix)]
-pub fn for_blocks(m: &Mapped, file: usize, start: usize, end: usize, buf: &mut Vec<u8>, mut f: impl FnMut(&[u8], usize, usize)) {
-    use std::os::unix::fs::FileExt;
-    const B: usize = 256 << 10;
-    let flen = m.maps[file].len();
-    let mut pos = start;
-    let mut want = B;
-    while pos < end {
-        let pre = pos.min(16);
-        let w = want.min(end - pos);
-        let tail = (flen - (pos + w)).min(128);
-        let n = pre + w + tail;
-        if buf.len() < n {
-            buf.resize(n, 0);
-        }
-        let mut got = 0;
-        while got < n {
-            let r = m.files[file].read_at(&mut buf[got..n], (pos - pre + got) as u64).expect("pread");
-            if r == 0 {
-                break;
-            }
-            got += r;
-        }
-        let lim = pre + w;
-        let stop = if pos + w >= end {
-            lim
-        } else {
-            match memchr::memrchr(b'\n', &buf[pre..lim]) {
-                Some(i) => pre + i + 1,
-                None => {
-                    want *= 2; // a line longer than the block
-                    continue;
-                }
-            }
-        };
-        f(&buf[..n], pre, stop);
-        pos += stop - pre;
-        want = B;
-    }
-}
-
 /// After a chunk is parsed: drop its page-table entries now, in parallel,
 /// instead of in the single-threaded teardown at exit. Re-touching a dropped
 /// page just maps the page-cache page again, so this is always safe.
@@ -625,130 +580,9 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
     }
 }
 
-/// Same lines and fields as `scan_lines`, decoded one line at a time from
-/// 128-byte line-local masks. Quote rules, as bit arithmetic on the line
-/// (separators `s` = commas plus the newline, quotes `q`):
-/// a field-start quote `qs` borrows up to its field's separator in `s - qs`,
-/// so `(s ^ (s - qs)) & s` are the separators that must follow a closing
-/// quote; every quote is a field's first byte or directly before a
-/// separator; a field-start quote directly before a separator is a lone `"`.
-/// Lines of 128 bytes or more and the last 128 bytes of `data` go through
-/// the exact block scanner or splitter.
-#[inline(always)]
-pub fn scan_lines_fast<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
-    let base = data.as_ptr();
-    let dl = data.len();
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut ls = start;
-    while ls < end && ls + 128 <= dl {
-        let p = unsafe { base.add(ls) };
-        let (c0, q0, n0) = unsafe { masks64(p) };
-        let (c1, q1, n1) = unsafe { masks64(p.add(64)) };
-        let n = (n0 as u128) | ((n1 as u128) << 64);
-        if n == 0 {
-            let nl = memchr::memchr(b'\n', &data[ls..end]).map_or(end, |i| ls + i);
-            if split(&data[ls..nl], &mut fields) {
-                f(&fields);
-            }
-            ls = nl + 1;
-            continue;
-        }
-        let len = n.trailing_zeros();
-        let lm = (1u128 << len) - 1;
-        let c = ((c0 as u128) | ((c1 as u128) << 64)) & lm;
-        let q = ((q0 as u128) | ((q1 as u128) << 64)) & lm;
-        let s = c | (1u128 << len);
-        ls += len as usize + 1;
-        if c.count_ones() as usize != N - 1 {
-            continue;
-        }
-        if q != 0 {
-            let fst = (s << 1) | 1;
-            let qs = q & fst;
-            let closing = (s ^ s.wrapping_sub(qs)) & s;
-            let bad = (q & !(fst | (s >> 1))) | (((q << 1) & s) ^ closing) | (qs & (s >> 1));
-            if bad != 0 {
-                continue;
-            }
-        }
-        let mut x = s;
-        let mut fs = 0u32;
-        for fi in fields.iter_mut() {
-            let fe = x.trailing_zeros();
-            x &= x - 1;
-            let qa = ((q >> fs) & 1) as u32;
-            *fi = unsafe { std::slice::from_raw_parts(p.add((fs + qa) as usize), (fe - fs - 2 * qa) as usize) };
-            fs = fe + 1;
-        }
-        f(&fields);
-    }
-    if ls < end {
-        scan_lines::<N>(data, ls, end, f);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fast<const N: usize>(d: &[u8]) -> Vec<Vec<Vec<u8>>> {
-        let mut v = Vec::new();
-        scan_lines_fast::<N>(d, 0, d.len(), |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
-        v
-    }
-    #[test]
-    fn fuzz_fast_scan() {
-        let mut x: u64 = 0x2545F4914F6CDD1D;
-        let mut rnd = |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
-        for _round in 0..4000 {
-            let mut d = Vec::new();
-            let nf_target = [2u64, 4, 7][rnd(3) as usize];
-            for _ in 0..1 + rnd(300) {
-                let kind = rnd(20);
-                if kind < 17 {
-                    let nf = if rnd(10) == 0 { 1 + rnd(9) } else { nf_target };
-                    for i in 0..nf {
-                        if i > 0 {
-                            d.push(b',');
-                        }
-                        let qmode = rnd(12);
-                        if qmode < 3 {
-                            d.push(b'"');
-                        }
-                        let lim = if rnd(25) == 0 { 140 } else { 14 };
-                        for _ in 0..rnd(lim) {
-                            d.push(b"abcxyz019\r -\""[if rnd(60) == 0 { 12 } else { rnd(12) as usize }]);
-                        }
-                        if qmode < 2 || qmode == 4 {
-                            d.push(b'"');
-                        }
-                    }
-                    d.push(b'\n');
-                } else {
-                    for _ in 0..rnd(60) {
-                        d.push(b"ab,\"\n\r 1"[rnd(8) as usize]);
-                    }
-                    d.push(b'\n');
-                }
-            }
-            if rnd(2) == 0 {
-                d.pop();
-            }
-            assert_eq!(scalar::<2>(&d), fast::<2>(&d));
-            assert_eq!(scalar::<4>(&d), fast::<4>(&d));
-            assert_eq!(scalar::<7>(&d), fast::<7>(&d));
-            // a start offset inside the buffer, as chunks have
-            if let Some(h) = memchr::memchr(b'\n', &d) {
-                let mut a = Vec::new();
-                scan_lines_fast::<7>(&d, h + 1, d.len(), |f| a.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>()));
-                assert_eq!(scalar::<7>(&d[h + 1..]), a);
-            }
-        }
-    }
     fn scalar<const N: usize>(d: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut v = Vec::new();
         for_each_line(d, |l| {

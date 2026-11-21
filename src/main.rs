@@ -100,26 +100,6 @@ struct SRec {
     pc: u32,
 }
 
-/// One event copy for dedup: `at` is the address of its SRec in the person
-/// partitions, or 0 when the copy is invalid.
-#[derive(Clone, Copy, Default)]
-#[repr(C, packed(4))]
-struct LRec {
-    eid: Key,
-    ingest: i32,
-    at: u64,
-}
-
-#[derive(Clone, Copy, Default)]
-struct Pend {
-    eid: Key,
-    uid: Key,
-    h: u64,
-    ingest: i32,
-    ts: u32,
-    pc: u32,
-}
-
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct CRec {
@@ -143,84 +123,6 @@ pub struct Ctx {
     pub links: LinkTab,
 }
 
-/// The link maps copied into one huge-page table with equal-size shard
-/// regions (same shard bits as the maps), so a lookup misses no TLB entry.
-pub struct Flat {
-    base: *mut (Key, Key),
-    bits: u32,
-    shift: u32,
-}
-unsafe impl Sync for Flat {}
-unsafe impl Send for Flat {}
-
-impl Flat {
-    fn empty() -> Flat {
-        Flat { base: std::ptr::null_mut(), bits: 0, shift: 64 }
-    }
-    #[inline(always)]
-    fn home(&self, h: u64) -> usize {
-        (((h >> self.shift) as usize) << self.bits) | (h as usize & ((1usize << self.bits) - 1))
-    }
-    #[inline(always)]
-    fn get_h(&self, k: Key, h: u64) -> Option<Key> {
-        let m = (1usize << self.bits) - 1;
-        let rb = ((h >> self.shift) as usize) << self.bits;
-        let mut i = h as usize & m;
-        loop {
-            let s = unsafe { *self.base.add(rb | i) };
-            if s.0 == k {
-                return Some(s.1);
-            }
-            if s.0 == EMPTY {
-                return None;
-            }
-            i = (i + 1) & m;
-        }
-    }
-    #[cfg(target_os = "linux")]
-    fn build(maps: &[KMap<Key>], shift: u32, threads: usize) -> Flat {
-        if maps.is_empty() {
-            return Flat::empty();
-        }
-        // ids that name themselves are left out: a miss already means "self"
-        let counts: Vec<usize> = maps.iter().map(|m| m.slots.iter().filter(|s| s.0 != EMPTY && s.0 != s.1).count()).collect();
-        let maxn = counts.iter().copied().max().unwrap_or(0);
-        eprintln!("flat: {} remapping ids, max {} per shard", counts.iter().sum::<usize>(), maxn);
-        let cap = (maxn + maxn / 8 + 16).next_power_of_two();
-        let bits = cap.trailing_zeros();
-        let bytes = maps.len() * cap * std::mem::size_of::<(Key, Key)>();
-        let p = unsafe {
-            libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
-        };
-        if p == libc::MAP_FAILED {
-            return Flat::empty();
-        }
-        unsafe { libc::madvise(p, bytes, libc::MADV_HUGEPAGE) };
-        let f = Flat { base: p as *mut (Key, Key), bits, shift };
-        let fr = &f;
-        par_for(maps.len(), threads, |_t, s| {
-            let m = cap - 1;
-            let region = unsafe { std::slice::from_raw_parts_mut(fr.base.add(s << bits), cap) };
-            region.fill((EMPTY, EMPTY));
-            for &(k, v) in &maps[s].slots {
-                if k == EMPTY || k == v {
-                    continue;
-                }
-                let mut i = hk(k) as usize & m;
-                while region[i].0 != EMPTY {
-                    i = (i + 1) & m;
-                }
-                region[i] = (k, v);
-            }
-        });
-        f
-    }
-    #[cfg(not(target_os = "linux"))]
-    fn build(_maps: &[KMap<Key>], _shift: u32, _threads: usize) -> Flat {
-        Flat::empty()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Phase 1: links
 // ---------------------------------------------------------------------------
@@ -242,7 +144,7 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
         let d: &[u8] = &m.maps[c.file as usize];
         let p = unsafe { pairs.get(t) };
         let sk = unsafe { skeys.get(t) };
-        scan_lines_fast::<2>(d, c.start, c.end, |f| {
+        scan_lines::<2>(d, c.start, c.end, |f| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
@@ -511,7 +413,7 @@ fn main() {
     let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels } = cats;
     eprintln!("phase1 done {:?} {}", t_start.elapsed(), cpu());
 
-    let mut ctx = Ctx {
+    let ctx = Ctx {
         ws,
         we,
         day0,
@@ -541,15 +443,7 @@ fn main() {
         let c = chunks[i];
         let buf = unsafe { iobufs.get(t) };
         let bs = unsafe { blocks.get(t) };
-        if io_mode() == 5 {
-            if c.kind == 0 {
-                let eb = unsafe { ebl.get(t) };
-                for_blocks(&ev_m, c.file as usize, c.start, c.end, buf, |d, s, e| parse_events(&ctx, d, s, e, eb, bs));
-            } else {
-                let cb = unsafe { cbl.get(t) };
-                for_blocks(&cl_m, c.file as usize, c.start, c.end, buf, |d, s, e| parse_clicks(&ctx, d, s, e, cb, bs));
-            }
-        } else if c.kind == 0 {
+        if c.kind == 0 {
             let (d, s, e) = chunk_data(&ev_m, c.file as usize, c.start, c.end, buf);
             parse_events(&ctx, d, s, e, unsafe { ebl.get(t) }, unsafe { sbl.get(t) }, bs, abase);
             chunk_done(&ev_m, c.file as usize, c.start, c.end);
@@ -583,8 +477,6 @@ fn main() {
     });
     eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
     eprintln!("phase3b resolve {:?} {}", t_start.elapsed(), cpu());
-    (sparts, cparts)
-    };
 
     // ---- phase 4: per person partition
     let ncamp = ctx.camp_names.len();
@@ -901,11 +793,6 @@ fn dedup_partition(lists: &mut [BList<DRec>], sc: &mut DedupScratch, bs: &mut Bl
             }
         });
     }
-    for k in nr.saturating_sub(PD)..nr {
-        let (s, h) = ring[k % PD];
-        emit(s, h, sb, bs);
-    }
-    sfence();
     for l in lists.iter_mut() {
         l.release(&mut bs.free);
     }
@@ -992,8 +879,9 @@ struct CSort {
 struct Scratch {
     gmap: Option<KMap<u32>>,
     gkeys: Vec<Key>,
+    counts: Vec<u32>,
     off: Vec<u32>,
-    fill: Vec<u32>,
+    pos: Vec<u32>,
     gid: Vec<u32>,
     ev: Vec<u64>,
     ccounts: Vec<u32>,
@@ -1025,12 +913,11 @@ fn process_partition(
     gmap.reset(n / 4 + 16);
     // group events by person (counting sort); copies that lost dedup are skipped
     let gkeys = &mut sc.gkeys;
-    let off = &mut sc.off;
+    let counts = &mut sc.counts;
     let gid = &mut sc.gid;
     gkeys.clear();
-    off.clear();
+    counts.clear();
     gid.clear();
-    gid.reserve(n);
     for l in slists {
         l.for_each_slice(|sl| {
             for r in sl {
@@ -1042,15 +929,19 @@ fn process_partition(
                     gkeys.push(r.person);
                     counts.push(0);
                 }
+                let g = *gmap.val_mut(s);
+                counts[g as usize] += 1;
+                gid.push(g);
             }
         });
     }
     let ng = gkeys.len();
-    let mut tot = 0u32;
-    for c in off.iter_mut() {
-        let x = *c;
-        *c = tot;
-        tot += x;
+    let off = &mut sc.off;
+    off.clear();
+    off.push(0);
+    for g in 0..ng {
+        let o = off[g] + counts[g];
+        off.push(o);
     }
     let pos = &mut sc.pos;
     pos.clear();
@@ -1058,10 +949,9 @@ fn process_partition(
     // an event inside its group is one word: ts << 32 | pc, so sorting the
     // words sorts by time (the order among equal times does not matter)
     let ev = &mut sc.ev;
-    let ne = tot as usize;
     ev.clear();
-    ev.reserve(ne);
-    unsafe { ev.set_len(ne) };
+    ev.reserve(n);
+    unsafe { ev.set_len(n) };
     {
         let mut i = 0;
         for l in slists {
@@ -1079,9 +969,9 @@ fn process_partition(
         }
     }
     // group clicks by person (only persons with events)
-    let coff = &mut sc.coff;
-    coff.clear();
-    coff.resize(ng + 1, 0);
+    let ccounts = &mut sc.ccounts;
+    ccounts.clear();
+    ccounts.resize(ng, 0);
     let cgid = &mut sc.cgid;
     cgid.clear();
     for l in clists {
@@ -1089,22 +979,23 @@ fn process_partition(
             for r in sl {
                 let g = gmap.get(r.person).unwrap_or(u32::MAX);
                 if g != u32::MAX {
-                    coff[g as usize] += 1;
+                    ccounts[g as usize] += 1;
                 }
                 cgid.push(g);
             }
         });
     }
-    let mut tot = 0u32;
-    for c in coff.iter_mut() {
-        let x = *c;
-        *c = tot;
-        tot += x;
+    let coff = &mut sc.coff;
+    coff.clear();
+    coff.push(0);
+    for g in 0..ng {
+        let o = coff[g] + ccounts[g];
+        coff.push(o);
     }
-    fill.clear();
-    fill.extend_from_slice(&coff[..ng]);
+    pos.clear();
+    pos.extend_from_slice(&coff[..ng]);
     let cl = &mut sc.cl;
-    let ncl = tot as usize;
+    let ncl = coff[ng] as usize;
     cl.clear();
     cl.reserve(ncl);
     unsafe { cl.set_len(ncl) };
@@ -1150,10 +1041,8 @@ fn process_partition(
             evs.sort_unstable();
         }
         let cls = &mut cl[coff[g] as usize..coff[g + 1] as usize];
-        if cls.len() > 16 {
-            cls.sort_unstable_by_key(|c| c.0);
-        } else {
-            isort_by(cls, |c| c.0);
+        if cls.len() > 1 {
+            cls.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
         }
         let person = gkeys[g];
         let mut cur_day: i32 = i32::MIN;
@@ -1185,9 +1074,10 @@ fn process_partition(
                     }
                     flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
                 }
-                last = ts;
-                s.cnt += 1;
-                s.add(e as u32);
+                cur_day = day;
+                d_sess = 0;
+                d_events = 0;
+                d_rev = 0;
             }
             while k < ne && ((evs[k] >> 32) as u32) - last <= GAP_MS as u32 {
                 let r = evs[k];
@@ -1266,4 +1156,30 @@ fn process_partition(
         active.clear();
         flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
     }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn flush_user(
+    a: &mut out::Acc,
+    person: Key,
+    day: i32,
+    sessions: u32,
+    events: u32,
+    rev: u64,
+    cat_rev: &mut [u64],
+    touched: &mut Vec<u16>,
+) {
+    let mut top = u16::MAX;
+    let mut best = 0u64;
+    for &c in touched.iter() {
+        let v = cat_rev[c as usize];
+        if v > best || (v == best && c < top) {
+            best = v;
+            top = c;
+        }
+        cat_rev[c as usize] = 0;
+    }
+    touched.clear();
+    a.users.push(out::URow { person, day, sessions, events, revenue: rev, top });
 }
