@@ -1,4 +1,7 @@
 # label|ref|build-args|env
 ours|origin/main||
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
-vibhor|ext:Vibhor7-7/shopping-sessions@765c6e2||
+jshwang|ext:Js-Hwang1/buildathon_databricks@73a09cc343b2d6470f3f91fce258cdb784dc1488||
+yihao|ext:yihao-qiao/p-4a81fb27@95120cb098f03d39d525ab2f6871ede08cfe0530||
+louise|ext:Louise-Ruza/shopping-sessions@75171b8261ae748c9c67676dc69ab8ce754d1f1e||
+fraun|ext:mliao0128/fraun-shopping-sessions@83629fd57761097b4e8fe139a143e5aaae2569d6||
+vibhor|ext:Vibhor7-7/shopping-sessions@e6ccab2||
