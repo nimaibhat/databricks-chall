@@ -62,6 +62,20 @@ Stage minimums at 20M seed 20, cand against up: parse 162.3 to 155.2, ev3a 33.1 
 
 On the new parser the smaller bucket is a loss even at 20M (parse +8, ev3a -3.5), so it is dropped. Chunk and prefetch are worth 1.2 to 1.9 ms at the 20M minimum and nothing at 30M: under the usual bar, kept because the sign matches experiments 9 and 14 on both seeds and it costs nothing at larger sizes (commit a77c66d; gate clean, outputs equal to 941879e's at NCPU 8, 2 and 1 on seeds 7 and 3). All line numbers in the research notes are stale after this change.
 
+Experiment 16: upstream's unreleased scanner. Upstream d7ebc13 carries variant `v/21`, which differs from f122b64 only in `k_free.rs` (+666 lines: the event loop written in assembly, `ev_loop` / `ev_redo`). Taken with prefetch 512 kept (commit 9363748). Gate clean: 36/36, dev and seed 20 match; outputs equal to 941879e's at NCPU 8, 2 and 1 on seeds 7, 3 and 6 (30M), no fallback. 13 rounds, wall min / med:
+
+| Set | ups (a77c66d) | v21 (prefetch 1024) | v21p (prefetch 512, shipped) |
+|---|---|---|---|
+| 20M seed 20 | 200.1 / 201.7 | 195.7 / 197.7 | 195.9 / 198.1 |
+| 20M seed 7 | 203.8 / 208.1 | 200.3 / 203.1 | 199.5 / 202.6 |
+
+Parse 152.8 to 148.6 (seed 20), 155.5 to 150.9 (seed 7); other stages unchanged. Kept: about 4 ms (2%). 30M seed 6, 9 rounds:
+
+```
+ups                        wall min 307.2 med 310.2 max 310.9 | setup=0.0 parse=239.4 ev3a=50.5 write=9.9 total=305.4
+v21p                       wall min 299.0 med 302.1 max 303.8 | setup=0.0 parse=230.5 ev3a=50.4 write=10.1 total=297.1
+```
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
