@@ -1,4 +1,2 @@
 # label|ref|build-args|env
-main|origin/gate-main-b959c3e||
-blk8|origin/gate-blk8-fc5e767||
-blk16|origin/gate-blk16-ed6ce49||
+pgo|origin/gate-pgo-a87bd35||
