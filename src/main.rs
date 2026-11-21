@@ -467,12 +467,13 @@ fn main() {
     let sparts = transpose(sbl.into_inner().into_iter().map(|s| s.finish()).collect(), 1usize << p2_bits());
 
     // ---- phase 3: dedup per eid partition; losers are marked dead in place
-    let dscr = PerThread::new(threads, || KMap::<u64>::with_capacity(16));
-    par_for(1usize << p1_bits(), threads, |t, p| {
+    let dscr = PerThread::new(threads, DedupScratch::default);
+    let p1 = p1_bits();
+    par_for(1usize << p1, threads, |t, p| {
         let lists = unsafe { eparts.get(p) };
-        let mp = unsafe { dscr.get(t) };
+        let sc = unsafe { dscr.get(t) };
         let bs = unsafe { blocks.get(t) };
-        dedup_partition(lists, mp, bs, abase);
+        dedup_partition(lists, sc, bs, abase, p1);
     });
     eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
     eprintln!("phase3b resolve {:?} {}", t_start.elapsed(), cpu());
@@ -715,20 +716,64 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut Scatter<
     Scatter::<CRec>::fence();
 }
 
+/// Scratch of one dedup worker.
+#[derive(Default)]
+struct DedupScratch {
+    map: Option<KMap<u64>>,
+    seen: Vec<u64>,
+    twice: Vec<u64>,
+}
+
 /// Keeps, per event_id, the copy with the smallest ingest_ts: every other
 /// copy that has an event record gets that record marked DEAD. An invalid
 /// copy has no record (loc 0) but still wins or loses like any other, so a
 /// later valid copy never rescues an event whose earliest copy is invalid.
+///
+/// Almost every id occurs once, so a first pass only finds the ids that may
+/// repeat: each copy sets a bit chosen by its id's hash (16 bits per copy,
+/// so the bitmap stays in L2), and a bit that is hit again is noted. All
+/// copies of one id hit the same bit, so every repeated id is noted. The
+/// second pass sends just the copies on noted bits through the exact table.
 #[inline(never)]
-fn dedup_partition(lists: &mut [BList<DRec>], mp: &mut KMap<u64>, bs: &mut Blocks, abase: usize) {
+fn dedup_partition(lists: &mut [BList<DRec>], sc: &mut DedupScratch, bs: &mut Blocks, abase: usize, pbits: u32) {
     let n: usize = lists.iter().map(|l| l.len).sum();
     if n == 0 {
         return;
     }
-    mp.reset(n);
+    let bits = (n * 16).next_power_of_two().max(1 << 12);
+    let sh = 64 - bits.trailing_zeros();
+    let seen = &mut sc.seen;
+    let twice = &mut sc.twice;
+    seen.clear();
+    seen.resize(bits / 64, 0);
+    twice.clear();
+    twice.resize(bits / 64, 0);
+    // the hash bits below the ones that chose this partition
+    let slot = |eid: Key| -> (usize, u64) {
+        let s = ((hk(eid) << pbits) >> sh) as usize;
+        (s >> 6, 1u64 << (s & 63))
+    };
     for l in lists.iter() {
         l.for_each_slice(|sl| {
             for r in sl {
+                let (w, m) = slot(r.eid);
+                unsafe {
+                    let cur = *seen.get_unchecked(w);
+                    *twice.get_unchecked_mut(w) |= cur & m;
+                    *seen.get_unchecked_mut(w) = cur | m;
+                }
+            }
+        });
+    }
+    let mp = sc.map.get_or_insert_with(|| KMap::<u64>::with_capacity(16));
+    mp.reset(n / 8 + 16);
+    for l in lists.iter() {
+        l.for_each_slice(|sl| {
+            for r in sl {
+                let (w, m) = slot(r.eid);
+                if unsafe { *twice.get_unchecked(w) } & m == 0 {
+                    continue; // the only copy of its id
+                }
                 // value = (ingest as u32) << 32 | loc
                 let v = ((r.ingest as u32 as u64) << 32) | r.loc as u64;
                 let (s, ins) = mp.entry(r.eid, v);
@@ -750,6 +795,74 @@ fn dedup_partition(lists: &mut [BList<DRec>], mp: &mut KMap<u64>, bs: &mut Block
     }
     for l in lists.iter_mut() {
         l.release(&mut bs.free);
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    /// `dedup_partition` against the rule stated directly: per id the copy
+    /// with the smallest ingest wins (the first seen on a tie), every other
+    /// copy that has a record is dead, and nothing else is touched.
+    #[test]
+    fn dedup_matches_reference() {
+        let arena = Arena::new(256 << 20, 256 << 20);
+        let mut x: u64 = 0x5DEECE66D;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for &(n, idspace, pbits) in &[(1usize, 1u64, 0u32), (2, 1, 9), (50, 10, 9), (5000, 4000, 9), (200_000, 150_000, 9), (100_000, 3, 4), (70_000, 1 << 40, 11)] {
+            let mut recs: Vec<SRec> = (0..n).map(|i| SRec { person: i as u64, ts: i as u32, pc: 7 }).collect();
+            let abase = recs.as_mut_ptr() as usize;
+            let mut bs = Blocks::new(&arena);
+            let mut sc = Scatter::<DRec>::new(3);
+            let mut all = Vec::new();
+            for i in 0..n {
+                let eid = pack(format!("e{}", rnd() % idspace).as_bytes());
+                let ingest = (rnd() % 5) as i32 - 2;
+                let loc = if rnd() % 7 == 0 { 0 } else { i as u32 + 1 };
+                let d = DRec { eid, ingest, loc };
+                sc.push((rnd() % 3) as usize, d, &mut bs);
+                all.push(d);
+            }
+            let mut lists = sc.finish();
+            // reference, in the order the lists hold the copies
+            let mut order = Vec::new();
+            for l in &lists {
+                l.for_each_slice(|sl| order.extend_from_slice(sl));
+            }
+            assert_eq!(order.len(), n);
+            let mut best: HashMap<Key, (i32, u32)> = HashMap::new();
+            let mut dead = vec![false; n];
+            for d in &order {
+                match best.get_mut(&d.eid) {
+                    None => {
+                        best.insert(d.eid, (d.ingest, d.loc));
+                    }
+                    Some(b) => {
+                        let loser = if d.ingest < b.0 {
+                            let old = b.1;
+                            *b = (d.ingest, d.loc);
+                            old
+                        } else {
+                            d.loc
+                        };
+                        if loser != 0 {
+                            dead[loser as usize - 1] = true;
+                        }
+                    }
+                }
+            }
+            dedup_partition(&mut lists, &mut DedupScratch::default(), &mut bs, abase, pbits);
+            for i in 0..n {
+                assert_eq!(recs[i].pc == DEAD, dead[i], "n {n} rec {i}");
+                assert!(recs[i].pc == DEAD || recs[i].pc == 7);
+                assert_eq!((recs[i].person, recs[i].ts), (i as u64, i as u32));
+            }
+        }
     }
 }
 
