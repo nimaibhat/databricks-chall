@@ -430,7 +430,7 @@ struct TjF {
     koff1: i64,
     pmask: u64,
     pmask3: u64,
-    _pad: i64,
+    koffe: i64,
 }
 
 #[repr(C, align(64))]
@@ -464,7 +464,7 @@ const fn tj_rows() -> ([TjA; 128], [TjB; 128], [TjC; 128], [TjD; 128], [TjE; 128
     let mut jc = [TjC { w2: [0; 16], w3: [0; 16] }; 128];
     let mut jd = [TjD { limv: [0; 8], kmask2: [0; 16], kmask3: [0; 16] }; 128];
     let mut je = [TjE { kme: [0; 4], kmf: [0; 4] }; 128];
-    let mut jf = [TjF { ksel: [0; 32], koff1: 0, pmask: 0, pmask3: DATE_PEXT, _pad: 0 }; 128];
+    let mut jf = [TjF { ksel: [0; 32], koff1: 0, pmask: 0, pmask3: DATE_PEXT, koffe: 0 }; 128];
     let mut j = 0;
     while j < 128 {
         let rows = [j / 2, 20 + 2 * (j % 2)];
@@ -509,6 +509,7 @@ const fn tj_rows() -> ([TjA; 128], [TjB; 128], [TjC; 128], [TjD; 128], [TjE; 128
             jf[j].ksel[8] = 2;
         }
         jf[j].koff1 = c.koff as i64 + 1;
+        jf[j].koffe = c.koff as i64 - (j / 2) as i64;
         jf[j].pmask = if c.dmask != 0 { DATE_PEXT } else { 0 };
         j += 1;
     }
@@ -561,7 +562,7 @@ const fn kind_rows2() -> [KindRow2; 128] {
         let (raw, f) = (i / 2, i % 2);
         t[i].cand = k[raw].cand[f];
         t[i].maskv = k[raw].maskv;
-        t[i].pp = (k[raw].k[f] as u64) << 56;
+        t[i].pp = (k[raw].k[f] as u64) << 56 | (k[raw].k[f] == 2) as u64;
         i += 1;
     }
     t
@@ -1378,7 +1379,7 @@ unsafe fn ev_d<S: EventSink>(cx: &Cx<EvBatch, S>, p: *const u8, st: EvSt, np: *c
         let r = _mm256_mask_sub_epi64(_mm256_add_epi64(t, f), ksub, t, f);
         let r = _mm256_add_epi64(r, st.days);
         store_hi::<0>(s, _mm256_castsi256_si128(r));
-        _mm_storeu_si128(s.byte_add(core::mem::offset_of!(EvBatch, ing)) as *mut __m128i, _mm256_extracti128_si256::<1>(r));
+        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, ing)) as *mut __m128i, _mm256_extracti128_si256::<1>(r));
         let all = _mm256_ternarylogic_epi64::<0xFE>(bad_ta, bad_tb, st.bad2);
         if _mm256_testz_si256(all, all) == 0 {
             let bad_tt = _mm256_or_si256(bad_ta, bad_tb);
@@ -1687,7 +1688,6 @@ unsafe fn cl_fast<S: ClickSink, const TAIL: bool>(cx: &Cx<CkBatch, S>, p: *const
 
 const PIPE: u8 = 0;
 const PFD: usize = 512;
-const UNROLL_EV: usize = 1;
 const CHAIN: u8 = 1;
 
 const TAG: usize = 1 << 63;
@@ -1695,10 +1695,6 @@ const NO_LIM: *const u8 = usize::MAX as *const u8;
 #[inline(always)]
 fn tag_far(r: *const u8, lim: *const u8) -> *const u8 {
     if r > lim { (r as usize | TAG) as *const u8 } else { r }
-}
-#[inline(always)]
-fn untag(r: *const u8) -> *const u8 {
-    (r as usize & !TAG) as *const u8
 }
 
 #[inline(always)]
@@ -1735,60 +1731,8 @@ fn scan_click<S: ClickSink>(buf: &[u8], pos: usize, sink: &mut S) -> usize {
     e + 1
 }
 
-macro_rules! pipe_stages {
-    ($S:ident, $cx:ident, $p:ident, $w:ident, $end:ident, $len:ident, $masks:ident, $adv:expr, $line:ident, $s:ident, $d:ident, $cold:ident, $unroll:expr) => {
-        const REACH: usize = 3 * ($adv + 64) + 2;
-        const FAR: usize = (NB + 1) * ($adv + 64 + 1);
-        if $len >= REACH + FAR {
-            let lim_far = $end.sub(REACH + FAR);
-            'outer: while $p <= lim_far {
-                let k0 = $masks($p);
-                let mut p1 = k0.next($p);
-                let Some(mut st) = $s::<$S, false>($cx, $p, k0, $w) else {
-                    let (r, nw) = kcall!($cold::<$S> as unsafe extern "C" fn(_, _, _) -> Pair, $cx as *const _ as u64, $p as u64, $w as u64, 0u64);
-                    $w = nw as *mut i64;
-                    $p = r as *const u8;
-                    continue 'outer;
-                };
-                let mut k1 = $masks(p1).here();
-                macro_rules! step {
-                    () => {{
-                        let p2 = k1.next(p1);
-                        let k2 = $masks(p2).here();
-                        _mm_prefetch::<_MM_HINT_T0>($p.wrapping_add(PFD) as *const i8);
-                        let r = $d($cx, $p, st, p1, &mut $w, lim_far);
-                        if r != p1 {
-                            $p = untag(r);
-                            continue 'outer;
-                        }
-                        $p = r;
-                        let Some(stn) = $s::<$S, false>($cx, $p, k1, $w) else {
-                            let (r, nw) = kcall!($cold::<$S> as unsafe extern "C" fn(_, _, _) -> Pair, $cx as *const _ as u64, $p as u64, $w as u64, 0u64);
-                            $w = nw as *mut i64;
-                            $p = r as *const u8;
-                            continue 'outer;
-                        };
-                        st = stn;
-                        p1 = p2;
-                        k1 = k2;
-                    }};
-                }
-                loop {
-                    step!();
-                    if $unroll >= 2 {
-                        step!();
-                    }
-                    if $unroll >= 3 {
-                        step!();
-                    }
-                }
-            }
-        }
-    };
-}
-
 macro_rules! runner {
-    ($name:ident, $sink:ident, $get:ident, $line:ident, $masks:ident, $adv:expr, $scan:ident, $pipe:ident, $s:ident, $d:ident, $cold:ident, $unroll:expr) => {
+    ($name:ident, $sink:ident, $get:ident, $line:ident, $masks:ident, $adv:expr, $scan:ident) => {
         #[inline(never)]
         unsafe fn $name<S: $sink, const MODE: u8>(buf: &[u8], sink: &mut S) {
             unsafe {
@@ -1801,7 +1745,20 @@ macro_rules! runner {
                 let mut w = (*b).ts.as_mut_ptr().add((*b).n);
                 let mut p = base;
                 if MODE == PIPE {
-                    $pipe!(S, cx, p, w, end, len, $masks, $adv, $line, $s, $d, $cold, $unroll);
+                    const REACH: usize = 3 * ($adv + 64) + 2;
+                    const FAR: usize = (NB + 1) * ($adv + 64 + 1);
+                    if len >= REACH + FAR {
+                        let lim = end.sub(REACH + FAR);
+                        while p <= lim {
+                            let (code, np, nw) = ev_loop::<S>(p, w, b, cx as *const Cx<EvBatch, S>, lim, sink);
+                            p = np;
+                            w = nw;
+                            if code == 1 {
+                                let k = $masks(p);
+                                p = $line::<S, false>(cx, p, k, k.next(p), &mut w);
+                            }
+                        }
+                    }
                 }
                 {
                     const REACH: usize = 2 * ($adv + 64) + 1;
@@ -1829,7 +1786,652 @@ macro_rules! runner {
         }
     };
 }
-runner!(run_events, EventSink, ev, ev_fast, ev_masks, OB, scan_event, pipe_stages, ev_s, ev_d, ev_cold, UNROLL_EV);
+runner!(run_events, EventSink, ev, ev_fast, ev_masks, OB, scan_event);
+
+#[repr(C, align(128))]
+#[derive(Clone, Copy)]
+struct EjRow {
+    ctrl: [u8; 32],
+    subv: [u8; 32],
+    _pad: [u8; 64],
+}
+const EJ_ROWS: usize = 64 * 64;
+const fn ej_lane(r: &mut EjRow, o: usize, s: &IdShape, sh: i32) {
+    assert!(s.ctrl[7] == 0x80 && s.subv[7] == 0 && s.lz[7] == 0);
+    let mut i = 0;
+    while i < 16 {
+        let c = s.ctrl[i];
+        r.ctrl[o + i] = if c == 0x80 {
+            0x80
+        } else {
+            let n = c as i32 + sh;
+            assert!(n >= 0 && n <= 15);
+            n as u8
+        };
+        r.subv[o + i] = s.subv[i];
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 16 {
+        if s.lz[i] != 0 {
+            assert!(i >= 8 && r.ctrl[o + i] != 0x80);
+            r.ctrl[o + 7] = r.ctrl[o + i];
+            r.subv[o + 7] = b'1';
+        }
+        i += 1;
+    }
+}
+const fn ej_rows() -> [EjRow; EJ_ROWS] {
+    let e = id_shapes_raw(b'e', 8, 0, false);
+    let u = id_shapes_raw(b'u', 8, 0, true);
+    let mut bad = EjRow { ctrl: [0x80; 32], subv: [0; 32], _pad: [0; 64] };
+    bad.subv[0] = 1;
+    bad.subv[16] = 1;
+    let mut t = [bad; EJ_ROWS];
+    let mut c0 = 0;
+    while c0 < 64 {
+        let mut c1 = c0 + 1;
+        while c1 < 64 {
+            let d = c1 - c0 - 1;
+            let mut r = EjRow { ctrl: [0x80; 32], subv: [0; 32], _pad: [0; 64] };
+            ej_lane(&mut r, 0, &e[c0], 0);
+            if d <= 15 && u[d].orv[1] == 0 {
+                ej_lane(&mut r, 16, &u[d], d as i32 - 15);
+            } else {
+                r.subv[16] = 1;
+            }
+            t[c0 * 64 + c1] = r;
+            c1 += 1;
+        }
+        c0 += 1;
+    }
+    t
+}
+static EJ: [EjRow; EJ_ROWS] = ej_rows();
+
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct KindRow3 {
+    cand: [u8; 16],
+    maskv: [u8; 16],
+    pp: u64,
+    r4n: i64,
+    r4p: i64,
+    _pad: u64,
+}
+const fn kind3(t: &mut [KindRow3; 256], s: &[u8], kind: u64) {
+    let n = s.len();
+    assert!(n + 2 <= 16 && t[s[1] as usize].r4n == i64::MIN && t[s[1] as usize].r4p == i64::MIN);
+    let mut r = KindRow3 { cand: [0; 16], maskv: [0; 16], pp: kind << 56, r4n: i64::MIN, r4p: i64::MIN, _pad: 0 };
+    r.cand[0] = b',';
+    let mut i = 0;
+    while i < n {
+        r.cand[1 + i] = s[i];
+        i += 1;
+    }
+    r.cand[n + 1] = b',';
+    let mut i = 0;
+    while i < n + 2 {
+        r.maskv[i] = 0xFF;
+        i += 1;
+    }
+    if kind == 2 {
+        r.r4p = n as i64 - 8;
+    } else {
+        r.r4n = n as i64 - 8;
+    }
+    t[s[1] as usize] = r;
+}
+const fn kind_rows3() -> [KindRow3; 256] {
+    let mut t = [KindRow3 { cand: [0; 16], maskv: [0; 16], pp: 0, r4n: i64::MIN, r4p: i64::MIN, _pad: 0 }; 256];
+    kind3(&mut t, b"view", 0);
+    kind3(&mut t, b"cart", 1);
+    kind3(&mut t, b"purchase", 2);
+    kind3(&mut t, b"\"view\"", 0);
+    kind3(&mut t, b"\"cart\"", 1);
+    kind3(&mut t, b"\"purchase\"", 2);
+    t
+}
+static K3: [KindRow3; 256] = kind_rows3();
+
+#[repr(C, align(64))]
+struct EvConst {
+    e: [u8; 32],
+    diglim: [u8; 32],
+    letlim: [u8; 32],
+    m39: [u8; 32],
+    w124: [u16; 16],
+    w510: [u32; 8],
+    m36: [u64; 4],
+    comma: [u8; 32],
+    nl: [u8; 32],
+    quote: [u8; 32],
+    pidx: [u64; 4],
+}
+const fn ev_const() -> EvConst {
+    let mut c = EvConst { e: [0; 32], diglim: [0; 32], letlim: [0; 32], m39: [217; 32], w124: [0x0124; 16], w510: [0x0001_0510; 8], m36: [1_679_616; 4], comma: [b','; 32], nl: [b'\n'; 32], quote: [b'"'; 32], pidx: [1, 5, 2, 6] };
+    let mut i = 0;
+    while i < 32 {
+        let k = i % 16;
+        if k == 7 {
+            c.e[i] = 208;
+            c.diglim[i] = 8;
+            c.letlim[i] = 25;
+        } else if k >= 8 {
+            c.e[i] = 207;
+            c.diglim[i] = 9;
+            c.letlim[i] = 25;
+        }
+        i += 1;
+    }
+    c
+}
+static EVC: EvConst = ev_const();
+const _: () = assert!(
+    core::mem::offset_of!(EvConst, m39) == 96
+        && core::mem::offset_of!(EvConst, w124) == 128
+        && core::mem::offset_of!(EvConst, w510) == 160
+        && core::mem::offset_of!(EvConst, m36) == 192
+        && core::mem::offset_of!(EvConst, comma) == 224
+        && core::mem::offset_of!(EvConst, nl) == 256
+        && core::mem::offset_of!(EvConst, quote) == 288
+        && core::mem::offset_of!(EvConst, pidx) == 320
+        && core::mem::size_of::<EjRow>() == 128
+        && core::mem::offset_of!(EjRow, subv) == 32
+        && core::mem::size_of::<KindRow3>() == 64
+        && core::mem::offset_of!(KindRow3, maskv) == 16
+        && core::mem::offset_of!(KindRow3, pp) == 32
+        && core::mem::offset_of!(KindRow3, r4n) == 40
+        && core::mem::offset_of!(KindRow3, r4p) == 48
+        && core::mem::size_of::<TjRow>() == 512
+        && core::mem::offset_of!(TjRow, b) == 64
+        && core::mem::offset_of!(TjRow, c) == 128
+        && core::mem::offset_of!(TjRow, d) == 192
+        && core::mem::offset_of!(TjRow, e) == 256
+        && core::mem::offset_of!(TjRow, f) == 320
+        && core::mem::offset_of!(TjD, kmask2) == 32
+        && core::mem::offset_of!(TjD, kmask3) == 48
+        && core::mem::offset_of!(TjE, kmf) == 32
+        && core::mem::offset_of!(TjF, koff1) == 32
+        && core::mem::offset_of!(TjF, pmask) == 40
+        && core::mem::offset_of!(TjF, pmask3) == 48
+        && core::mem::offset_of!(TjF, koffe) == 56
+        && core::mem::offset_of!(TjB, w1) == 32
+        && core::mem::offset_of!(TjC, w3) == 32
+        && core::mem::offset_of!(TjA, base) == 32
+        && core::mem::size_of::<TailRow>() == 64
+        && core::mem::offset_of!(TailRow, m) == 4
+        && core::mem::offset_of!(TailRow, pat) == 8
+        && core::mem::offset_of!(TailRow, pp) == 24
+        && core::mem::size_of::<DateEnt>() == 32
+        && core::mem::offset_of!(EvBatch, ts) == 0
+        && core::mem::offset_of!(EvBatch, pp) == 512
+        && BATCH_ALIGN == 512
+        && TAIL_K == 72
+        && FB == 32
+        && NB == 64
+);
+const E_TJ: usize = core::mem::offset_of!(Tables, tj) - 2 * 512;
+const E_TAIL: usize = core::mem::offset_of!(Tables, tail);
+const E_PP: usize = core::mem::offset_of!(EvBatch, pp);
+const E_EID: usize = core::mem::offset_of!(EvBatch, eid);
+const E_UID: usize = core::mem::offset_of!(EvBatch, uid);
+const E_ING: usize = core::mem::offset_of!(EvBatch, ing);
+const E_SCR: usize = core::mem::offset_of!(EvBatch, scratch) - 512;
+const E_N: usize = core::mem::offset_of!(EvBatch, n) - 512;
+
+#[cold]
+#[inline(never)]
+unsafe extern "C" fn ev_redo<S: EventSink>(cx: *const Cx<EvBatch, S>, p: *const u8, s: *mut i64) -> Pair {
+    unsafe {
+        let mut w = s;
+        let k = ev_masks(p);
+        let np = ev_fast::<S, false>(&*cx, p, k, k.next(p), &mut w);
+        Pair(np as u64, w as u64)
+    }
+}
+
+macro_rules! ev_consts {
+    () => {
+        concat!(
+            "vmovdqa ymm15, ymmword ptr [rip + {EVC} + 224]\n",
+            "vmovdqa ymm14, ymmword ptr [rip + {EVC} + 256]\n",
+            "vmovdqa ymm13, ymmword ptr [rip + {EVC} + 288]\n",
+            "vmovdqa ymm11, ymmword ptr [rip + {EVC} + 320]\n",
+            "vpxor xmm12, xmm12, xmm12\n",
+            "vmovdqa64 ymm24, ymmword ptr [rip + {EVC} + 0]\n",
+            "vmovdqa64 ymm25, ymmword ptr [rip + {EVC} + 32]\n",
+            "vmovdqa64 ymm26, ymmword ptr [rip + {EVC} + 64]\n",
+            "vmovdqa64 ymm27, ymmword ptr [rip + {EVC} + 96]\n",
+            "vmovdqa64 ymm28, ymmword ptr [rip + {EVC} + 128]\n",
+            "vmovdqa64 ymm29, ymmword ptr [rip + {EVC} + 160]\n",
+            "vmovdqa64 ymm30, ymmword ptr [rip + {EVC} + 192]\n",
+            "xor r11d, r11d\n",
+            "mov eax, 0xffe\n",
+            "kmovd k5, eax\n",
+        )
+    };
+}
+macro_rules! ev_save_a {
+    () => {
+        concat!(
+            "kmovq qword ptr [rsp + 64], k1\n",
+            "kmovq qword ptr [rsp + 72], k2\n",
+            "vmovdqu64 ymmword ptr [rsp + 256], ymm10\n",
+            "vmovdqu64 ymmword ptr [rsp + 288], ymm20\n",
+            "vmovdqu64 ymmword ptr [rsp + 320], ymm21\n",
+            "vmovdqu64 ymmword ptr [rsp + 352], ymm22\n",
+            "vmovdqu64 ymmword ptr [rsp + 384], ymm23\n",
+            "vmovdqu64 ymmword ptr [rsp + 416], ymm31\n",
+        )
+    };
+}
+macro_rules! ev_restore_a {
+    () => {
+        concat!(
+            "kmovq k1, qword ptr [rsp + 64]\n",
+            "kmovq k2, qword ptr [rsp + 72]\n",
+            "vmovdqu64 ymm10, ymmword ptr [rsp + 256]\n",
+            "vmovdqu64 ymm20, ymmword ptr [rsp + 288]\n",
+            "vmovdqu64 ymm21, ymmword ptr [rsp + 320]\n",
+            "vmovdqu64 ymm22, ymmword ptr [rsp + 352]\n",
+            "vmovdqu64 ymm23, ymmword ptr [rsp + 384]\n",
+            "vmovdqu64 ymm31, ymmword ptr [rsp + 416]\n",
+            ev_consts!(),
+        )
+    };
+}
+macro_rules! ev_save_b {
+    () => {
+        concat!(
+            "mov qword ptr [rsp + 40], rcx\n",
+            "kmovq qword ptr [rsp + 80], k3\n",
+            "kmovq qword ptr [rsp + 88], k4\n",
+            "vmovdqu64 ymmword ptr [rsp + 128], ymm9\n",
+            "vmovdqu64 ymmword ptr [rsp + 160], ymm8\n",
+            "vmovdqu64 ymmword ptr [rsp + 192], ymm17\n",
+            "vmovdqu64 ymmword ptr [rsp + 224], ymm18\n",
+            "vmovdqu64 ymmword ptr [rsp + 352], ymm22\n",
+            "vmovdqu64 ymmword ptr [rsp + 384], ymm23\n",
+        )
+    };
+}
+macro_rules! ev_restore_b {
+    () => {
+        concat!(
+            "mov rcx, qword ptr [rsp + 40]\n",
+            "kmovq k3, qword ptr [rsp + 80]\n",
+            "kmovq k4, qword ptr [rsp + 88]\n",
+            "vmovdqu64 ymm9, ymmword ptr [rsp + 128]\n",
+            "vmovdqu64 ymm8, ymmword ptr [rsp + 160]\n",
+            "vmovdqu64 ymm17, ymmword ptr [rsp + 192]\n",
+            "vmovdqu64 ymm18, ymmword ptr [rsp + 224]\n",
+            "vmovdqu64 ymm22, ymmword ptr [rsp + 352]\n",
+            "vmovdqu64 ymm23, ymmword ptr [rsp + 384]\n",
+            ev_consts!(),
+        )
+    };
+}
+macro_rules! ev_next {
+    () => {
+        concat!(
+            "vpcmpeqb k0, ymm14, ymmword ptr [rdi + 32]\n",
+            "vpcmpeqb k6, ymm14, ymmword ptr [rdi + 64]\n",
+            "kunpckdq k0, k6, k0\n",
+            "kmovq rax, k0\n",
+            "tzcnt rax, rax\n",
+            "lea rdi, [rdi + rax + 33]\n",
+        )
+    };
+}
+macro_rules! ev_mk {
+    ($a:literal, $b:literal, $knin:literal, $kc:literal, $kn:literal) => {
+        concat!(
+            "kmovq rax, ", $knin, "\n",
+            "tzcnt rax, rax\n",
+            "lea ", $a, ", [", $b, " + rax + 33]\n",
+            "vmovdqu ymm0, ymmword ptr [", $a, " + 32]\n",
+            "vmovdqu ymm1, ymmword ptr [", $a, " + 64]\n",
+            "vpcmpeqb ", $kc, ", ymm15, ymmword ptr [", $a, "]\n",
+            "vpcmpeqb k0, ymm15, ymm0\n",
+            "kunpckdq ", $kc, ", k0, ", $kc, "\n",
+            "vpcmpeqb ", $kn, ", ymm14, ymm0\n",
+            "vpcmpeqb k6, ymm14, ymm1\n",
+            "kunpckdq ", $kn, ", k6, ", $kn, "\n",
+            "prefetcht0 byte ptr [", $a, " + {PFD}]\n",
+        )
+    };
+}
+macro_rules! ev_dec {
+    ($jo:literal, $x:literal, $d:literal, $b2:literal, $all:literal, $r:literal) => {
+        concat!(
+            "vpshufb ymm0, ", $x, ", ymmword ptr [{T} + ", $jo, " + {TJ}]\n",
+            "vpsubb ymm1, ymm0, ymmword ptr [{T} + ", $jo, " + {TJ} + 32]\n",
+            "vpmaddubsw ymm0, ymm1, ymmword ptr [{T} + ", $jo, " + {TJ} + 96]\n",
+            "vpmaddwd ymm2, ymm0, ymmword ptr [{T} + ", $jo, " + {TJ} + 128]\n",
+            "vpackusdw ymm0, ymm2, ymm2\n",
+            "vpmaddwd ymm0, ymm0, ymmword ptr [{T} + ", $jo, " + {TJ} + 160]\n",
+            "vpsubusb ", $all, ", ymm1, ymmword ptr [{T} + ", $jo, " + {TJ} + 64]\n",
+            "vpcmpgtd ymm2, ymm2, ymmword ptr [{T} + ", $jo, " + {TJ} + 192]\n",
+            "vpmuludq ymm5, ymm0, ymmword ptr [{T} + ", $jo, " + {TJ} + 256]\n",
+            "vpsrlq ymm0, ymm0, 32\n",
+            "vpmuldq ymm0, ymm0, ymmword ptr [{T} + ", $jo, " + {TJ} + 288]\n",
+            "vptestnmq k7, ymm1, ymmword ptr [{T} + ", $jo, " + {TJ} + 320]\n",
+            "vpsubq ymm0{{k7}}, ymm12, ymm0\n",
+            "vpaddq ymm5, ymm5, ", $d, "\n",
+            "vpaddq ", $r, ", ymm5, ymm0\n",
+            "vpternlogq ", $all, ", ymm2, ", $b2, ", 0xfe\n",
+        )
+    };
+}
+macro_rules! ev_st {
+    ($b:literal, $kc:literal, $jo:literal, $x:literal, $xx:literal, $d:literal, $b2:literal, $ids:literal, $fail:literal, $plab:literal, $pret:literal, $ppst:literal) => {
+        concat!(
+            "kmovq rcx, ", $kc, "\n",
+            "cmp rax, 63\n",
+            "ja ", $fail, "f\n",
+            "tzcnt r8, rcx\n",
+            "blsr rcx, rcx\n",
+            "tzcnt r9, rcx\n",
+            "blsr rcx, rcx\n",
+            "tzcnt rcx, rcx\n",
+            "cmp rcx, 62\n",
+            "ja ", $fail, "f\n",
+            "vmovdqu ymm3, ymmword ptr [", $b, " + r8 - 16]\n",
+            "shl r8, 6\n",
+            "add r8, r9\n",
+            "shl r8, 7\n",
+            "vpshufb ymm3, ymm3, ymmword ptr [{EJ} + r8]\n",
+            "vpsubb ymm3, ymm3, ymmword ptr [{EJ} + r8 + 32]\n",
+            "vpaddb ymm4, ymm3, ymm24\n",
+            "vpsubusb ymm4, ymm4, ymm26\n",
+            "vpsubusb ymm5, ymm3, ymm25\n",
+            "vpminub ymm5, ymm5, ymm4\n",
+            "vpaddb ymm4, ymm3, ymm27\n",
+            "vpminub ymm3, ymm3, ymm4\n",
+            "vpmaddubsw ymm3, ymm3, ymm28\n",
+            "vpmaddwd ymm3, ymm3, ymm29\n",
+            "vpmuludq ymm4, ymm3, ymm30\n",
+            "vpsrlq ymm3, ymm3, 32\n",
+            $ids,
+            "lea rsi, [", $b, " + rcx]\n",
+            "cmp byte ptr [rsi + 1], 34\n",
+            "sete r11b\n",
+            "sub rcx, r9\n",
+            "lea ", $jo, ", [r11 + rcx*2]\n",
+            "shl ", $jo, ", 9\n",
+            "lea rdx, [rsi + r11*2]\n",
+            "vmovdqu ymm6, ymmword ptr [", $b, " + rax]\n",
+            "add rax, ", $b, "\n",
+            "vpcmpeqb ymm7, ymm13, ymm6\n",
+            "vpmovmskb edi, ymm7\n",
+            "vpcmpeqb ymm6, ymm15, ymm6\n",
+            "vpmovmskb r10d, ymm6\n",
+            "lzcnt r9d, r10d\n",
+            "shlx r10d, r10d, r9d\n",
+            "add r10d, r10d\n",
+            "lzcnt r10d, r10d\n",
+            "sub rax, rdx\n",
+            "sub rax, r9\n",
+            "sub rax, r10\n",
+            "lea r10, [r10 + r10*8]\n",
+            "lea r9, [r9 + r10*8]\n",
+            "shl r9, 6\n",
+            "and edi, dword ptr [{T} + r9 + {TAIL} + 4]\n",
+            "pext r10d, edi, dword ptr [{T} + r9 + {TAIL}]\n",
+            "mov r8d, dword ptr [{T} + r9 + r10*4 + {TAIL} + 8]\n",
+            "cmp edi, r8d\n",
+            "jne ", $fail, "f\n",
+            "movzx edi, byte ptr [rdx + 23]\n",
+            "shl edi, 6\n",
+            "mov rcx, qword ptr [{K3} + rdi + 32]\n",
+            "or rcx, qword ptr [{T} + r9 + r10*8 + {TAIL} + 24]\n",
+            "vmovdqu xmm6, xmmword ptr [rdx + 21]\n",
+            "vpxor xmm6, xmm6, xmmword ptr [{K3} + rdi]\n",
+            "vpand xmm6, xmm6, xmmword ptr [{K3} + rdi + 16]\n",
+            "mov r8, qword ptr [{T} + ", $jo, " + {TJ} + 376]\n",
+            "add r8, rsi\n",
+            "movzx r9d, word ptr [r8 + 9]\n",
+            "pext r9, r9, qword ptr [{T} + ", $jo, " + {TJ} + 360]\n",
+            "shl r9d, 5\n",
+            "vmovdqa ymm2, ymmword ptr [r15 + r9 + {SCR}]\n",
+            "vpxor xmm3, xmm2, xmmword ptr [r8]\n",
+            "vpand xmm3, xmm3, xmmword ptr [{T} + ", $jo, " + {TJ} + 224]\n",
+            "movzx r10d, word ptr [rsi + r11 + 9]\n",
+            "pext r10, r10, qword ptr [{T} + ", $jo, " + {TJ} + 368]\n",
+            "shl r10d, 5\n",
+            "vmovdqa ymm4, ymmword ptr [r15 + r10 + {SCR}]\n",
+            "vpsubb xmm7{{k5}}{{z}}, xmm4, xmmword ptr [rsi + r11]\n",
+            "vpternlogq ymm7, ymm6, ymm5, 0xfe\n",
+            "vpord ", $b2, ", ymm7, ymm3\n",
+            "vmovdqu ", $xx, ", xmmword ptr [rsi - 16]\n",
+            "vinserti128 ", $x, ", ", $x, ", xmmword ptr [rdx + 5], 1\n",
+            "vshufi64x2 ", $d, ", ymm2, ymm4, 3\n",
+            "cmp rax, qword ptr [{K3} + rdi + 40]\n",
+            "jne ", $plab, "f\n",
+            $pret, ":\n",
+            $ppst,
+        )
+    };
+}
+macro_rules! ev_pur {
+    ($plab:literal, $pret:literal, $fail:literal, $a:literal, $b:literal, $save:ident, $restore:ident) => {
+        concat!(
+            $plab, ":\n",
+            "cmp rax, qword ptr [{K3} + rdi + 48]\n",
+            "jne ", $fail, "f\n",
+            $save!(),
+            "mov rdi, ", $b, "\n",
+            "mov rsi, ", $a, "\n",
+            "lea rdx, [rsp + 56 - {PP}]\n",
+            "vzeroupper\n",
+            "call {PUR}\n",
+            "mov qword ptr [rsp + 48], rax\n",
+            $restore!(),
+            "mov rcx, qword ptr [rsp + 56]\n",
+            "cmp byte ptr [rsp + 48], 0\n",
+            "je ", $fail, "f\n",
+            "jmp ", $pret, "b\n",
+        )
+    };
+}
+
+#[inline(never)]
+unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: *const Cx<EvBatch, S>, lim: *const u8, sink: *mut S) -> (u64, *const u8, *mut i64) {
+    let (code, np, nw): (u64, *const u8, *mut i64);
+    unsafe {
+        if (w as usize) & 8 != 0 {
+            let r = ev_redo::<S>(cx, p, w);
+            return (0, r.0 as *const u8, r.1 as *mut i64);
+        }
+        core::arch::asm!(
+            "push rbx",
+            "push rbp",
+            "mov rax, rsp",
+            "and rsp, -64",
+            "sub rsp, 512",
+            "mov qword ptr [rsp + 504], rax",
+            "mov qword ptr [rsp + 8], rcx",
+            "mov qword ptr [rsp + 24], r8",
+            "mov qword ptr [rsp + 32], r9",
+            "lea r15, [rdx + 512]",
+            "mov rbx, rsi",
+            "sub rbx, r15",
+            "mov rbp, rdi",
+            "mov qword ptr [rsp], rbp",
+            ev_consts!(),
+            "vmovdqu ymm0, ymmword ptr [rbp + 32]",
+            "vmovdqu ymm1, ymmword ptr [rbp + 64]",
+            "vpcmpeqb k1, ymm15, ymmword ptr [rbp]",
+            "vpcmpeqb k0, ymm15, ymm0",
+            "kunpckdq k1, k0, k1",
+            "vpcmpeqb k2, ymm14, ymm0",
+            "vpcmpeqb k6, ymm14, ymm1",
+            "kunpckdq k2, k6, k2",
+            ev_mk!("r12", "rbp", "k2", "k3", "k4"),
+            ev_st!("rbp", "k1", "r13", "ymm8", "xmm8", "ymm17", "ymm18",
+                "vpaddq ymm22, ymm3, ymm4\n", "72", "52", "53", ""),
+            "jmp 22f",
+            ".p2align 5",
+            "22:",
+            "mov qword ptr [r15 + rbx + {PP}], rcx",
+            ev_mk!("rbp", "r12", "k4", "k1", "k2"),
+            ev_dec!("r13", "ymm8", "ymm17", "ymm18", "ymm23", "ymm31"),
+            ev_st!("r12", "k3", "r14", "ymm10", "xmm10", "ymm20", "ymm21",
+                "vpaddq ymm3, ymm3, ymm4\nvpunpckhqdq ymm4, ymm22, ymm3\nvmovdqu xmmword ptr [r15 + rbx + {EID}], xmm4\nvextracti128 xmmword ptr [r15 + rbx + {UID}], ymm4, 1\n",
+                "73", "54", "55", "mov qword ptr [r15 + rbx + {PP} + 8], rcx\n"),
+            ev_mk!("r12", "rbp", "k2", "k3", "k4"),
+            ev_dec!("r14", "ymm10", "ymm20", "ymm21", "ymm9", "ymm4"),
+            "vpermt2q ymm31, ymm11, ymm4",
+            "vmovdqu64 xmmword ptr [r15 + rbx], xmm31",
+            "vextracti32x4 xmmword ptr [r15 + rbx + {ING}], ymm31, 1",
+            ev_st!("rbp", "k1", "r13", "ymm8", "xmm8", "ymm17", "ymm18",
+                "vpaddq ymm22, ymm3, ymm4\n", "74", "56", "57", ""),
+            "vpord ymm3, ymm9, ymm23",
+            "vptest ymm3, ymm3",
+            "jnz 75f",
+            "23:",
+            "mov qword ptr [rsp], rbp",
+            "add rbx, 16",
+            "jnz 22b",
+            ev_save_b!(),
+            "mov qword ptr [r15 + {NOFF}], 64",
+            "mov rdi, qword ptr [rsp + 32]",
+            "vzeroupper",
+            "call {FL}",
+            ev_restore_b!(),
+            "mov rbx, -512",
+            "cmp rbp, qword ptr [rsp + 24]",
+            "jbe 22b",
+            "mov rdi, rbp",
+            "lea rsi, [r15 - 512]",
+            "xor eax, eax",
+            "jmp 99f",
+            ev_pur!("52", "53", "72", "r12", "rbp", ev_save_b, ev_restore_b),
+            ev_pur!("54", "55", "73", "rbp", "r12", ev_save_a, ev_restore_a),
+            ev_pur!("56", "57", "74", "r12", "rbp", ev_save_b, ev_restore_b),
+            "72:",
+            "mov rdi, rbp",
+            "lea rsi, [r15 + rbx]",
+            "mov eax, 1",
+            "jmp 99f",
+            "73:",
+            "vmovdqa64 ymm0, ymm23",
+            "vptest ymm0, ymm0",
+            "jnz 78f",
+            "vmovhps qword ptr [r15 + rbx + {EID}], xmm22",
+            "vextracti32x4 xmm0, ymm22, 1",
+            "vmovhps qword ptr [r15 + rbx + {UID}], xmm0",
+            "vmovhps qword ptr [r15 + rbx], xmm31",
+            "vextracti32x4 xmm0, ymm31, 1",
+            "vmovq qword ptr [r15 + rbx + {ING}], xmm0",
+            "mov rdi, r12",
+            "lea rsi, [r15 + rbx + 8]",
+            "mov eax, 1",
+            "jmp 99f",
+            "78:",
+            "mov rdi, qword ptr [rsp]",
+            "lea rsi, [r15 + rbx]",
+            "mov eax, 1",
+            "jmp 99f",
+            "74:",
+            "vmovdqa64 ymm0, ymm23",
+            "vptest ymm0, ymm0",
+            "jnz 78b",
+            "vptest ymm9, ymm9",
+            "jnz 79f",
+            "mov rdi, rbp",
+            "lea rsi, [r15 + rbx + 16]",
+            "mov eax, 1",
+            "cmp rbx, -16",
+            "jne 99f",
+            "mov qword ptr [r15 + {NOFF}], 64",
+            "mov rdi, qword ptr [rsp + 32]",
+            "vzeroupper",
+            "call {FL}",
+            "mov rdi, rbp",
+            "lea rsi, [r15 - 512]",
+            "mov eax, 1",
+            "jmp 99f",
+            "79:",
+            "mov rdi, qword ptr [rsp]",
+            ev_next!(),
+            "lea rsi, [r15 + rbx + 8]",
+            "mov eax, 1",
+            "jmp 99f",
+            "75:",
+            ev_save_b!(),
+            "mov rdi, qword ptr [rsp]",
+            ev_next!(),
+            "mov qword ptr [rsp + 16], rdi",
+            "vmovdqa64 ymm0, ymm23",
+            "vptest ymm0, ymm0",
+            "jz 82f",
+            "mov rdi, qword ptr [rsp + 8]",
+            "mov rsi, qword ptr [rsp]",
+            "lea rdx, [r15 + rbx]",
+            "vzeroupper",
+            "call {REDO}",
+            "cmp rax, qword ptr [rsp + 16]",
+            "jne 84f",
+            "lea rcx, [r15 + rbx + 8]",
+            "cmp rdx, rcx",
+            "jne 84f",
+            "vmovdqu64 ymm0, ymmword ptr [rsp + 128]",
+            "vptest ymm0, ymm0",
+            "jz 83f",
+            "82:",
+            "mov rdi, qword ptr [rsp + 8]",
+            "mov rsi, qword ptr [rsp + 16]",
+            "lea rdx, [r15 + rbx + 8]",
+            "vzeroupper",
+            "call {REDO}",
+            "cmp rax, rbp",
+            "jne 84f",
+            "test dl, 8",
+            "jnz 84f",
+            "mov rbx, rdx",
+            "sub rbx, r15",
+            "cmp rbp, qword ptr [rsp + 24]",
+            "ja 85f",
+            "sub rbx, 16",
+            "83:",
+            ev_restore_b!(),
+            "jmp 23b",
+            "84:",
+            "mov rdi, rax",
+            "mov rsi, rdx",
+            "xor eax, eax",
+            "jmp 99f",
+            "85:",
+            "mov rdi, rbp",
+            "lea rsi, [r15 + rbx]",
+            "xor eax, eax",
+            "99:",
+            "mov rsp, qword ptr [rsp + 504]",
+            "pop rbp",
+            "pop rbx",
+            inout("rdi") p => np,
+            inout("rsi") w => nw,
+            inout("rdx") b => _,
+            inout("rcx") cx => _,
+            inout("r8") lim => _,
+            inout("r9") sink => _,
+            out("rax") code,
+            out("r10") _, out("r11") _, out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _, out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _, out("zmm12") _, out("zmm13") _, out("zmm14") _, out("zmm15") _,
+            out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
+            out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
+            out("k0") _, out("k1") _, out("k2") _, out("k3") _, out("k4") _, out("k5") _, out("k6") _, out("k7") _,
+            T = sym T, EVC = sym EVC, EJ = sym EJ, K3 = sym K3, PUR = sym ev_purchase, FL = sym flush_ev::<S>, REDO = sym ev_redo::<S>,
+            TJ = const E_TJ, TAIL = const E_TAIL,
+            PP = const E_PP, EID = const E_EID, UID = const E_UID, ING = const E_ING, SCR = const E_SCR, NOFF = const E_N, PFD = const PFD,
+        );
+    }
+    (code, np, nw)
+}
+
 
 
 #[repr(C, align(64))]
