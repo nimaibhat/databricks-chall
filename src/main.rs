@@ -221,8 +221,10 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     for s in 0..shards {
         all_keys.extend_from_slice(&shard_keys[s]);
     }
-    // Union-find with path halving. The root of a set is always its
-    // byte-wise smallest ID (the person's name), so no naming pass is needed.
+    // Union-find with path halving on the dense numbers alone: the smaller
+    // number becomes the root, so the pass touches only `parent` (a quarter
+    // of the memory the keys take). Which member names the person (the
+    // byte-wise smallest ID) is settled afterwards, on all threads.
     let mut parent: Vec<u32> = (0..nids as u32).collect();
     #[inline(always)]
     fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -251,19 +253,15 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     }
     for v in &ipairs {
         for (j, &(a, b)) in v.iter().enumerate() {
-            // serial and cache-bound: fetch the next pairs' entries early
-            // (most IDs are still their own root, so their keys too)
             if let Some(&(pa, pb)) = v.get(j + 12) {
                 prefetch(unsafe { parent.as_ptr().add(pa as usize) });
                 prefetch(unsafe { parent.as_ptr().add(pb as usize) });
-                prefetch(unsafe { all_keys.as_ptr().add(pa as usize) });
-                prefetch(unsafe { all_keys.as_ptr().add(pb as usize) });
             }
             let ra = find(&mut parent, a);
             let rb = find(&mut parent, b);
             if ra != rb {
                 nmoved += 1;
-                if key_cmp(all_keys[ra as usize], all_keys[rb as usize]) == std::cmp::Ordering::Less {
+                if ra < rb {
                     parent[rb as usize] = ra;
                 } else {
                     parent[ra as usize] = rb;
@@ -275,46 +273,96 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     });
     let uf_time = t_uf.elapsed();
     let t_union = t0.elapsed();
-    let t_name = t0.elapsed();
-    let tab = LinkTab::new(nmoved);
-    // the table holds only IDs that are not their own person's name
-    // Three steps per ID, 16 IDs apart, so that the loads each step needs
-    // (its parent's line, then its root's key and its table line) are
-    // already on their way: 32 ahead read the parent and ask for the
-    // parent's own entry, 16 ahead walk to the root and ask for the root's
-    // key and the ID's table line, then insert.
+    // From here the roots are fixed. `parent` and `best` are shared by the
+    // threads as atomics: a parent is only ever replaced by the set's root,
+    // and `best[root]` (0 = the root itself, else 1 + the number of the
+    // member with the smallest ID seen so far) only moves to smaller IDs.
+    use std::sync::atomic::AtomicU32;
+    let parent: &[AtomicU32] = unsafe { std::slice::from_raw_parts(parent.as_mut_ptr() as *const AtomicU32, nids) };
+    let best: Vec<AtomicU32> = unsafe { std::mem::transmute::<Vec<u32>, Vec<AtomicU32>>(vec![0u32; nids]) };
+    let root = |i: usize| -> usize {
+        let mut r = i;
+        loop {
+            let up = parent[r].load(Ordering::Relaxed) as usize;
+            if up == r {
+                return r;
+            }
+            r = up;
+        }
+    };
+    // Pass 1, per ID: point it straight at its root and offer its ID as the
+    // set's name. Three steps 16 IDs apart so the loads are on their way:
+    // read the parent and ask for the parent's entry; walk to the root and
+    // ask for the root's key and name slot; then compare.
     par_for(shards, threads, |_t, s| {
         let off = offs[s] as usize;
-        let ks = &shard_keys[s];
-        let n = ks.len();
-        let root = |i: usize| -> usize {
-            let mut r = i;
-            loop {
-                let up = parent[r] as usize;
-                if up == r {
-                    return r;
-                }
-                r = up;
-            }
-        };
+        let n = shard_keys[s].len();
         let mut ring = [0u32; 16];
         for (j, slot) in ring.iter_mut().enumerate().take(n) {
             *slot = root(off + j) as u32;
         }
         for j in 0..n {
             if j + 32 < n {
-                let p1 = parent[off + j + 32] as usize;
+                let p1 = parent[off + j + 32].load(Ordering::Relaxed) as usize;
                 prefetch(unsafe { parent.as_ptr().add(p1) });
             }
             let r = ring[j & 15] as usize;
             if j + 16 < n {
                 let r2 = root(off + j + 16);
                 prefetch(unsafe { all_keys.as_ptr().add(r2) });
-                tab.prefetch(hk(ks[j + 16]));
+                prefetch(unsafe { best.as_ptr().add(r2) });
                 ring[j & 15] = r2 as u32;
             }
-            if r != off + j {
-                tab.insert(ks[j], all_keys[r]);
+            let i = off + j;
+            if r != i {
+                parent[i].store(r as u32, Ordering::Relaxed);
+                let k = all_keys[i];
+                let mut cur = best[r].load(Ordering::Relaxed);
+                loop {
+                    let ci = if cur == 0 { r } else { cur as usize - 1 };
+                    if key_cmp(k, all_keys[ci]) != std::cmp::Ordering::Less {
+                        break;
+                    }
+                    match best[r].compare_exchange_weak(cur, i as u32 + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break,
+                        Err(now) => cur = now,
+                    }
+                }
+            }
+        }
+    });
+    let t_name = t0.elapsed();
+    let tab = LinkTab::new(nmoved);
+    // Pass 2: the table holds every ID that is not its own person's name.
+    // Every parent is a root now. 16 ahead ask for the root's name slot and
+    // the ID's table line, 8 ahead read the name and ask for its key.
+    par_for(shards, threads, |_t, s| {
+        let off = offs[s] as usize;
+        let ks = &shard_keys[s];
+        let n = ks.len();
+        let name_of = |i: usize| -> usize {
+            let r = parent[i].load(Ordering::Relaxed) as usize;
+            let b = best[r].load(Ordering::Relaxed);
+            if b == 0 { r } else { b as usize - 1 }
+        };
+        let mut ring = [0u32; 8];
+        for (j, slot) in ring.iter_mut().enumerate().take(n) {
+            *slot = name_of(off + j) as u32;
+        }
+        for j in 0..n {
+            if j + 16 < n {
+                let r = parent[off + j + 16].load(Ordering::Relaxed) as usize;
+                prefetch(unsafe { best.as_ptr().add(r) });
+                tab.prefetch(hk(ks[j + 16]));
+            }
+            let nm = ring[j & 7] as usize;
+            if j + 8 < n {
+                let nm2 = name_of(off + j + 8);
+                prefetch(unsafe { all_keys.as_ptr().add(nm2) });
+                ring[j & 7] = nm2 as u32;
+            }
+            if nm != off + j {
+                tab.insert(ks[j], all_keys[nm]);
             }
         }
     });
@@ -1390,4 +1438,97 @@ fn flush_user(
     }
     touched.clear();
     a.users.push(out::URow { person, day, sessions, events, revenue: rev, top });
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::Write;
+    /// `build_links` against the rule stated directly: IDs joined by any
+    /// chain of link lines are one person, named by the byte-wise smallest
+    /// ID among them. Random pairs over ID pools of several sizes (long
+    /// chains and large sets in the small pools), at 1, 2, 3 and 8 threads.
+    #[test]
+    fn links_match_reference() {
+        let mut x: u64 = 0x2545F4914F6CDD1D;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let arena = Arena::new(64 << 20, 64 << 20);
+        let header = b"user_id_a,user_id_b".to_vec();
+        for (round, &(pool, npairs)) in [(40usize, 30usize), (300, 400), (5000, 3000), (60000, 50000), (200000, 90000)].iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!("ss-links-test-{}-{}", std::process::id(), round));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("links")).unwrap();
+            let name = |i: u64| -> String {
+                // mixed lengths and cases, so byte order differs from numeric order
+                match i % 4 {
+                    0 => format!("u_{}", i),
+                    1 => format!("U{:05}", i),
+                    2 => format!("anon-{:x}", i * 2654435761 % 1000003),
+                    _ => format!("{}z", i),
+                }
+            };
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for f in 0..3 {
+                let mut out = std::fs::File::create(dir.join("links").join(format!("part-{:04}.csv", f))).unwrap();
+                out.write_all(&header).unwrap();
+                out.write_all(b"\n").unwrap();
+                for _ in 0..npairs / 3 {
+                    let a = name(rnd() % pool as u64);
+                    let b = if rnd() % 16 == 0 { a.clone() } else { name(rnd() % pool as u64) };
+                    writeln!(out, "{},{}", a, b).unwrap();
+                    pairs.push((a, b));
+                }
+            }
+            // reference: plain union-find over strings, then the smallest member
+            let mut idx: HashMap<String, usize> = HashMap::new();
+            let mut par: Vec<usize> = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            fn root(par: &[usize], mut i: usize) -> usize {
+                while par[i] != i {
+                    i = par[i];
+                }
+                i
+            }
+            for (a, b) in &pairs {
+                let mut id = |s: &String| -> usize {
+                    *idx.entry(s.clone()).or_insert_with(|| {
+                        par.push(par.len());
+                        names.push(s.clone());
+                        par.len() - 1
+                    })
+                };
+                let (ia, ib) = (id(a), id(b));
+                let (ra, rb) = (root(&par, ia), root(&par, ib));
+                if ra != rb {
+                    par[ra] = rb;
+                }
+            }
+            let mut smallest: HashMap<usize, String> = HashMap::new();
+            for i in 0..par.len() {
+                let r = root(&par, i);
+                let e = smallest.entry(r).or_insert_with(|| names[i].clone());
+                if names[i].as_bytes() < e.as_bytes() {
+                    *e = names[i].clone();
+                }
+            }
+            for threads in [1usize, 2, 3, 8] {
+                let tab = build_links(&dir, threads, &arena, 0);
+                for i in 0..par.len() {
+                    let k = pack(names[i].as_bytes());
+                    let want = pack(smallest[&root(&par, i)].as_bytes());
+                    assert_eq!(tab.person(k, hk(k)), want, "round {} threads {} id {}", round, threads, names[i]);
+                }
+                // an ID that is in no link line is its own person
+                let k = pack(b"never-linked");
+                assert_eq!(tab.person(k, hk(k)), k);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
