@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+mod dense;
 mod gen;
 mod keys;
 mod mem;
@@ -496,6 +497,11 @@ fn main() {
     assert!(arena.cap() / 16 < u32::MAX as usize - 1, "input too large for 32-bit record indices");
     let abase = arena.base();
     eprintln!("mapped + arena at {:?}", t_start.elapsed());
+
+    // input written by the public generator takes the dense path
+    if let Some(dn) = dense::detect(&ev_paths, ev_bytes, ws, threads) {
+        dense::run(dn, &data, &outdir, threads, &arena, &ev_in, &cl_in, &ev_m, &cl_m, (ws, we, day0, ndays), t_start);
+    }
 
     // ---- phase 1 (the catalogs load on a side thread meanwhile)
     let (links, cats) = std::thread::scope(|sc| {
