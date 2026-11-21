@@ -1,9 +1,4 @@
 # label|ref|build-args|env
-s10|origin/gate-s10-d1dc573||
-s11|origin/gate-s11-41635a8||
-s12io5|origin/gate-s12io5-de786be||IOMODE=5
-s13|origin/gate-s13-4b492ec||
-s13io5|origin/gate-s13io5-4b492ec||IOMODE=5
-s13io5c256|origin/gate-s13io5c256-4b492ec||IOMODE=5 CHUNKKB=256
+s13|origin/gate-s13-df1c41a||
+s14|origin/gate-s14-7500d79||
 vibhor|ext:Vibhor7-7/shopping-sessions||
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
