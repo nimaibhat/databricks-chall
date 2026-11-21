@@ -1,5 +1,7 @@
 # label|ref|build-args|env
 s1|origin/gate-s1-ab77b65||
-s4|origin/gate-s4-6c99487||
-s5|origin/gate-s5-102f998||
+s5|origin/gate-s5-068baf1||
+s6|origin/gate-s6-40e0519||
+s6io4|origin/gate-s6io4-40e0519||IOMODE=4
+s6io4m|origin/gate-s6io4m-40e0519||IOMODE=4 CHUNKKB=1024
 cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
