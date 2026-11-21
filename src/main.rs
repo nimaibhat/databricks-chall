@@ -459,12 +459,14 @@ fn main() {
     let sbl = PerThread::new(threads, || Scatter::<SRec>::new(1usize << p2_bits()));
     let cbl = PerThread::new(threads, || Scatter::<CRec>::new(1usize << p2_bits()));
     let iobufs = PerThread::new(threads, Vec::<u8>::new);
+    let rdbufs = PerThread::new(threads, IoBuf::new);
     par_for(chunks.len(), threads, |t, i| {
         let c = chunks[i];
         let buf = unsafe { iobufs.get(t) };
+        let rb = unsafe { rdbufs.get(t) };
         let bs = unsafe { blocks.get(t) };
         if c.kind == 0 {
-            let (d, s, e) = if io5 { ev_in.read(&c, buf) } else { chunk_data(&ev_m, c.file as usize, c.start, c.end, buf) };
+            let (d, s, e) = if io5 { ev_in.read(&c, rb) } else { chunk_data(&ev_m, c.file as usize, c.start, c.end, buf) };
             parse_events(&ctx, d, s, e, unsafe { ebl.get(t) }, unsafe { sbl.get(t) }, bs, abase);
             if !io5 {
                 chunk_done(&ev_m, c.file as usize, c.start, c.end);
@@ -473,7 +475,7 @@ fn main() {
             if diag_stage() != 0 {
                 return;
             }
-            let (d, s, e) = if io5 { cl_in.read(&c, buf) } else { chunk_data(&cl_m, c.file as usize, c.start, c.end, buf) };
+            let (d, s, e) = if io5 { cl_in.read(&c, rb) } else { chunk_data(&cl_m, c.file as usize, c.start, c.end, buf) };
             parse_clicks(&ctx, d, s, e, unsafe { cbl.get(t) }, bs);
             if !io5 {
                 chunk_done(&cl_m, c.file as usize, c.start, c.end);
@@ -481,6 +483,7 @@ fn main() {
         }
     });
     std::mem::forget(iobufs);
+    std::mem::forget(rdbufs);
     let eparts = PerThread::from_vec(transpose(ebl.into_inner().into_iter().map(|s| s.finish()).collect(), 1usize << p1_bits()));
     let cparts = transpose(cbl.into_inner().into_iter().map(|s| s.finish()).collect(), 1usize << p2_bits());
     eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
