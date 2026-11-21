@@ -6,17 +6,19 @@ Research-only notes for the optimizing session. Nothing here has been built or b
 
 ## Top five untried ideas (ranked by expected gain per unit of correctness risk)
 
+Re-ranked in iteration 14 against the x86 profile in `OVERNIGHT_LOG.md` (parse 1.28 of about 2.1 s in-process at 20M; 1,040 instructions per event line, of which scanner 490, ID packing and catalog 230, timestamps and price 230, record build 90).
+
 | # | Idea | Where | Expected gain | Risk to exactness | Entry |
 |---|---|---|---|---|---|
-| 1 | Look up the product category only for purchase rows (3% of events) | `parse_events`, `main.rs:632` | A competitor measured 3.01 to 2.94 s (-2.3%) for exactly this change at 20M | None: the category byte is read only when `price != 0` | [1.1](#11-product-lookup-only-for-purchases), [11.3](#113-measured-numbers-for-ideas-already-in-this-file) |
-| 2 | Dedup without a key table: two-bit counters find the few repeated ids and only those are sorted | `dedup_partition` pass 1, `main.rs:708-728` | Table shrinks from 2 to 4 MB to under 256 KB per partition; estimate 3 to 5% of wall, more at 60M. Five teams use a filter or sketch prepass | Low: same winner rule, pass 2 unchanged | [9.1](#91-two-bit-counters-instead-of-a-key-table) |
-| 3 | Sort 8-byte `(ts << 32) \| pc` keys per person instead of 16-byte `SRec`s | `process_partition`, `main.rs:814-830`, `:893-896` | A competitor measured 1.78 to 1.73 s (-2.8%) for the same change; three teams do it | None: `person` is constant within a group and equal-`ts` order affects no output | [7.1](#71-sort-8-byte-keys-per-person) |
-| 4 | `pread` in 512 KB units instead of mapping the input (`IOMODE=4` with smaller chunks) | `chunks_of` call at `main.rs:411-412`, `chunk_data` | A competitor measured sys time halved and total -10% going to 512 KB units; another measured mmap +7.5% slower on a VM. `/data` on the scorer is reported to be tmpfs. Three teams measured mmap faster, so this needs an A/B | Low to medium: more chunk seams | [1.5](#15-pread-in-l2-sized-blocks), [11.2](#112-what-the-scorer-facts-change) |
-| 5 | Software write-combining with non-temporal stores for the 512-way scatters | `BList::push`, `mem.rs:128` | Mixed since iteration 11: -12% on Ice Lake for one team, "no gain" for two others. The scorer is reported to be Cascade Lake, where nobody has published a number | Low | [1.2](#12-write-combining-buffers-with-non-temporal-stores), [6.1](#61-stage-size-start-at-4-cache-lines-per-partition-sweep-2), [11.3](#113-measured-numbers-for-ideas-already-in-this-file) |
+| 1 | Line-at-a-time splitter fed by block masks computed once per 64 bytes; quote validity and field offsets from two mask words, no `pos` index, no quote ring | `scan_lines`, `parse.rs:486-654` | The scanner is 490 of 1,040 instructions per line and 27% of `perf` self time (19.5% plus the 7.7% quote loop). Estimate 130 to 170 instructions per line after, so 10 to 15% of wall. The algorithm is model-checked | Medium: this routine decides which lines are malformed. The model check and `fuzz_scan` are the net | [14.1](#141-a-line-at-a-time-splitter-that-scans-each-byte-once) |
+| 2 | Narrow dedup side stream with tombstones, **keeping** partition-by-user and the per-partition resolve | `parse_events`, `dedup_partition`, `resolve_partition` | Removes dedup pass 2 and its second scatter; with two-bit counters the dedup table drops from megabytes to under 256 KB. Estimate 6 to 10% of wall | Medium | [14.2](#142-do-the-tombstone-dedup-without-moving-person-resolution-into-the-parse-loop), [1.3](#13-dedup-that-marks-losers-in-place), [9.1](#91-two-bit-counters-instead-of-a-key-table) |
+| 3 | Nibble-table and multiply-add ID packing, two IDs per line in one 256-bit operation | `pack_fast`, `keys.rs:73-97` | `pack_fast`'s loop is 5.8% of `perf` self time; estimate 3 to 5% of wall. Model-checked against `pack` including `-` | Low: bit-exact in the model; `pack_long` path unchanged | [14.3](#143-simd-id-packing-that-matches-this-repos-key-format) |
+| 4 | Product category only for purchase rows; sort 8-byte keys per person | `main.rs:632`; `process_partition` | Measured by a competitor at -2.3% and -2.8% | None | [1.1](#11-product-lookup-only-for-purchases), [7.1](#71-sort-8-byte-keys-per-person), [11.3](#113-measured-numbers-for-ideas-already-in-this-file) |
+| 5 | Known-date table for timestamps | `civil_swar`, `parse_ingest_s` | Timestamps and price are 230 instructions per line; a hit replaces digit checks, range checks and `days_from_civil` for both timestamps. Estimate 3 to 5% of parse | Low | [1.4](#14-known-date-table-for-timestamps) |
 
-Runners-up, in order: known-date table for timestamps ([1.4](#14-known-date-table-for-timestamps); five teams ship one, and a last-date cache was measured missing 93% of the time, so it must be keyed by date); routing valid events straight to their user partition and marking dedup losers in place ([1.3](#13-dedup-that-marks-losers-in-place), after 9.1); catalog load off the serial path ([8.1](#81-catalog-load-is-about-60m-serial-instructions-before-anything-parallel-starts)); splitting each line from its own masks ([2.1](#21-split-each-line-from-its-own-masks)); sessions from 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)); one-multiply hash ([1.7](#17-one-multiply-hash)); smaller Parquet ([1.8](#18-smaller-parquet-output)).
+Runners-up, in order: `pread` in 512 KB units ([1.5](#15-pread-in-l2-sized-blocks), [11.2](#112-what-the-scorer-facts-change); needs an x86 A/B, sign unknown); write-combining ([1.2](#12-write-combining-buffers-with-non-temporal-stores); `BList::push` is only 3.1% of self time on the EPYC runner and results elsewhere are mixed, see 11.3); catalog load off the serial path ([8.1](#81-catalog-load-is-about-60m-serial-instructions-before-anything-parallel-starts)); 16-byte click records ([13.2](#132-16-byte-click-records-inside-a-person-group)); link shards without self-named IDs ([13.1](#131-leave-self-named-ids-out-of-the-link-shards)); 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)); smaller Parquet ([1.8](#18-smaller-parquet-output)).
 
-Closed since iteration 11: everything for a cold page cache (1.9, 3.1), because `/data` on the scorer is reported to be tmpfs.
+Closed: everything for a cold page cache (1.9, 3.1), because `/data` on the scorer is reported to be tmpfs.
 
 ## A finding to act on before trusting the TSBL toggle
 
@@ -136,7 +138,7 @@ These are in `speedups.md` already; the numbers are new.
 
 ### Not worth pursuing, from this iteration
 
-- **PEXT ID packing.** Vibhor7-7 experiment 2 measured -8.6%, but against a byte loop. `pack_fast` already removes the serial chain, and the audit prices both packs at about 10 ns per line. cherylaurelia's two-IDs-in-one-256-bit-op version gained about 2% (`e3bdd51`).
+- **PEXT ID packing** (reversed in [14.3](#143-simd-id-packing-that-matches-this-repos-key-format) after the x86 profile). Vibhor7-7 experiment 2 measured -8.6%, but against a byte loop. `pack_fast` already removes the serial chain, and the audit prices both packs at about 10 ns per line. cherylaurelia's two-IDs-in-one-256-bit-op version gained about 2% (`e3bdd51`).
 - **Zero-page IPIs.** cherylaurelia `c166174` cut TLB IPIs from 8,400 to 2,000 per run by filling tables with real writes instead of `vec![0; n]`. Here `KMap` writes `EMPTY` into every slot and `Acc.camp` is first touched by a write, so the pattern (first read of an untouched page, then a write, while other threads run) does not occur.
 - **Wider link table.** Vibhor7-7 experiment 7: twice the slots was 1.3% slower; building it cost more than the lookups saved.
 - **Scanner batch size.** micah-andelman swept 2 to 64 KB and found it flat; `SEG` here is 2 KiB.
@@ -567,8 +569,74 @@ Sources: [axhiao README](https://github.com/axhiao/Shopping-Sessions/blob/1d1fa1
 - enkyuan/polaris (board 1.41 s) tried an interleaved two-bit dedup bitmap against separate "seen" and "repeated" bitmaps and found no repeatable difference. Either layout of entry 9.1's counters is fine.
 - sonalrajapaksha `0695a92`: "Drop the prefetched link table and the no-free change: both measured worse". niranjankumarnk `3fcf2f2` writes dictionary pages with RLE indices (entry 5.2). toM0dots and SsjRaz are C++ entries without scores or measurements in their logs.
 
+---
+
+## Iteration 14 (2026-11-21): the scanner, against the first x86 profile
+
+`OVERNIGHT_LOG.md` appeared at 00:19 with an x86 profile of `1c4fa8e`. It changes the ranking: the scanner, not the decode, is the largest single cost (490 of 1,040 instructions per event line), and `cherylaurelia`'s build, whose scanner is the line-at-a-time design, runs the same 20M set in 1.38 s against 2.32 s.
+
+### 14.1 A line-at-a-time splitter that scans each byte once
+
+- **Idea.** Keep computing comma, quote and newline masks once per 64-byte block (as `masks64` does), but stop flattening them into `pos`, `nl` and the quote ring. For the line starting at byte `p`, take a 128-bit window of each mask stream at bit offset `p`, find the newline with one `tzcnt`, mask the comma and quote windows below it, and derive validity and all N field (offset, length) pairs from those two words with the arithmetic of entry 2.1.
+- **Why not copy cherylaurelia's loop exactly.** Their `scan_lines` calls `masks64` at every line start, so a 77-byte line costs two 64-byte classifications (128 bytes scanned per 77 consumed). Shifting windows out of block masks computed once scans each byte once and is otherwise the same algorithm.
+- **Sources.** [cherylaurelia `fast_split`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs) lines 1352 to 1380 (entry 2.1); explorer-skp's measurement that an index-building scanner was 6% slower than a per-delimiter one (`333fd23`); jklein07 `d1036a8` "Per-line 128-byte SIMD splitter" and `a592edd` "Split quoted lines with whole-line masks instead of a per-field quote loop" (board 1.66 to 1.44 s with two other changes); arnabxero `4868fc8` "Line-at-a-time SIMD row scanner"; AbhirajTiwari12 returning to line-at-a-time three times (entry 2.1). Against: micah-andelman's two-stage scanner, and arnabxero listing a "block-structured scanner" as tried with no gain.
+- **Algorithm** (per chunk; `cs`, `qs`, `ns` are the block masks, with two zero blocks appended):
+
+  ```
+  win(ms, p):  b = p >> 6; o = p & 63
+               o == 0 ? (ms[b], ms[b+1])
+                      : ((ms[b] >> o) | (ms[b+1] << (64-o)), (ms[b+1] >> o) | (ms[b+2] << (64-o)))
+  loop:
+    (n0, n1) = win(ns, p)
+    e = n0 != 0 ? tzcnt(n0) : n1 != 0 ? 64 + tzcnt(n1) : -> scalar `split` on the line, continue
+    (c0, c1) = win(cs, p); (q0, q1) = win(qs, p); clear all bits at and above e
+    if popcnt(c0) + popcnt(c1) == N-1:
+      b = c | (1 << e)                      # delimiters incl. the newline, as a 128-bit value
+      s = (b << 1) | 1;  ends = b >> 1      # field starts, field last bytes
+      x = q & s;  y = (q << 1) & b          # opening quotes; closing quotes moved onto their delimiter
+      ok = (q & !(s | ends)) | (x & ends) | ((y - x) & b) == 0      # 128-bit subtract with borrow
+      if ok:
+        commas = byte-packed offsets of the N-1 comma bits (tzcnt/blsr on c0 and c1, merged)
+        end_k  = commas with e appended;  start_k = end_{k-1} + 1 (0 for k = 0)
+        quoted = pdep(pext(x0, s0) | pext(x1, s1) << popcnt(s0), 0x0101010101010101)
+        at_k = start_k + quoted_k;  len_k = end_k - at_k - quoted_k
+        call f with the N slices
+    p += e + 1
+  ```
+
+  Because the three mask streams are only read through `win`, a chunk needs no ring and no carry between segments; compute the masks for a few KB at a time (micah-andelman found 4 to 8 KB batches best, flat from 2 to 64 KB) to stay in L1.
+- **Model check.** A Python model of exactly this algorithm, including the window shifts, the 128-bit borrow, the scalar fallback for lines of 128 bytes or more and an unterminated last line, matched a line-by-line `split` reference on 6,000 random buffers for N = 2, 4 and 7 (quoted fields, stray quotes, lone-quote fields, wrong field counts, `\r`, spaces, empty lines, fields up to 90 bytes): 0 mismatches. Script: `/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/chk2/split.py`. This checks the logic only; the Rust must be fuzzed again.
+- **Instruction estimate.** Classification 22 instructions per 64 bytes, so about 27 per line; three windows about 30; newline, masking and popcounts about 15; validity about 20; comma offsets about 50 for N = 7; quoted, `at` and `len` about 15. Roughly 130 to 170 per line against 490 now. These are counts by hand, not measurements.
+- **Here.** `scan_lines::<N>` keeps its signature, so `parse_events`, `parse_clicks`, `build_links` and the microbench do not change. `fields[i]` becomes `from_raw_parts(base + p + at_i, len_i)`. Lines of 128 bytes or more, and the tail after the last newline, go to `split` as they do today (`parse.rs:595-601`, `:648-653`).
+- **Expected gain.** 10 to 15% of wall.
+- **Risk.** Medium. Before trusting it: extend `fuzz_scan` (`parse.rs:675`) to N = 7 and to lines that straddle offsets 64 and 128, and keep the old scanner behind a toggle for one A/B.
+
+### 14.2 Do the tombstone dedup without moving person resolution into the parse loop
+
+- The log's first queued idea couples two things: (a) a narrow dedup side stream with tombstones, and (b) resolving the person at parse time through a global link table with a prefetch ring. They are separable, and the evidence for them differs.
+- **For (a):** six teams (cherylaurelia, explorer-skp, Vibhor7-7, axhiao, toM0dots "deduplicate by reference", enkyuan "deduplicate event versions in place"); entries 1.3, 9.1, 13.3.
+- **On (b) the evidence is split.** For: cherylaurelia (1.38 s on the log's runner), axhiao (two-stage prefetch). Against: this repo's own history (`b3c1d38` moved resolution out of the parse loop; the audit measured about 120 ns per line for the lookup against a 64 MB map); TejasviniChawla's global-table restructure scored 2.17 s against 1.79 s and was reverted, with the note that cross-runner CI had made it look faster; sonalrajapaksha dropped a prefetched link table as "measured worse"; explorer-skp went the other way and groups records by link-table slice so lookups stay in cache. The scorer shares each 1 MB L2 between two hyperthreads, and the log measures hyperthreads adding 60% CPU time for the same work, which is the regime where a 64 MB random-access table hurts most.
+- **Suggested order.** Ship (a) alone first: at parse, push the `SRec` into the user-hash partition and a 16-byte `(eid, ingest, loc)` record into the eid partition; dedup marks losers; `resolve_partition` drops tombstones in its existing `compact` closure. That keeps every table probe partition-local and still deletes dedup pass 2. Then A/B (b) on top if wanted. Vibhor7-7 (1.59 s on the same runner, board 0.82 s) does (a) without a parse-time global lookup of this kind.
+- **Record address.** `loc` must survive until dedup. `BList` blocks never move, so block pointer plus index works; Vibhor7-7 uses a global 32-bit record index over slabs (`src/pool.rs`). If write-combining stages are added later, a record's final address is known at push time even while its bytes are still in the stage (cherylaurelia's stream comment, `src/main.rs` lines 345 to 350), but dedup must run only after the stages are flushed.
+
+### 14.3 SIMD ID packing that matches this repo's key format
+
+- **Correction to iteration 1.** "PEXT ID packing" was listed as not worth pursuing on the audit's microbench figure. The log's `perf` profile puts `pack_fast`'s loop at 5.8% of self time (`keys.rs:87-88`), so it is worth doing.
+- **Source.** [cherylaurelia `pack_at` and `pack2_at`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs), lines 133 to 212: classify 16 bytes with two `pshufb` nibble lookups, subtract a per-row offset to get 6-bit codes, combine pairs with `pmaddubsw` (multiplier `0x0140`) and quads with `pmaddwd` (`0x0001_1000`), then assemble three 24-bit groups with shifts. `pack2_at` does both IDs of a line in the two halves of one 256-bit register (A/B ratio about 0.98 on top of the single version; `9a37097` 0.93 to 0.96 for the single version with the scanner change). Vibhor7-7 experiment 2 and micah-andelman `3a12af8` use nibble tables with PEXT instead.
+- **Adapting it.** Their alphabet has no `-` and no length nibble. This repo's codes are `-` = 0, `0-9` = 1 to 10, `A-Z` = 11 to 36, `_` = 37, `a-z` = 38 to 63, which equal theirs for the 63 shared symbols. Add row 2 to the tables: `HI[2] = 32`, `LO[0xD] |= 0x20` (so `0x2A`), `OFF[2] = 45`. The result `k` holds the first character at bits 54 to 59; this repo's key is `(k << 4) | n` after clearing the places past `n`.
+- **Model check.** A Python model of those exact table values and multiply-adds equals `keys.rs` `pack` for every byte value at every position for lengths 0 to 11 and for 400,000 random strings with stray bytes, including the reject-to-`pack_long` decision: 0 mismatches. Script: `/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/chk2/pack.py`.
+- **Here.** Replace the 10-iteration loop in `pack_fast` (`keys.rs:79-93`); the `p + 16 <= ceil` guard already exists. For the two IDs of an event line use the 256-bit form in `parse_events` (`main.rs:608`, `:631`); note `person` is only needed for valid lines, but computing both unconditionally is cheaper than a second call.
+- **Expected gain.** 3 to 5% of wall.
+- **Risk.** Low. Keep `keys::tests::order` and add the exhaustive byte-by-position test from the model (micah-andelman's commit lists the same test plan: every byte value by position by length, plus random ids at page-straddling offsets).
+
+### 14.4 Other readings of the profile
+
+- **Hash-map probes are 5.2% of self time** (`keys.rs:206`, `:228`). Those are `get_h` in resolve and click grouping and `entry_h` in dedup and person grouping. Entry 9.1 removes the dedup share; entry 13.1 shortens the resolve share; the person-grouping `gmap` in `process_partition` is partition-local and small.
+- **`BList::push` is 3.1%** and kernel page zeroing 2.2% on the EPYC runner. Write-combining can at best remove part of the first; on that CPU Vibhor7-7 measured -1% to -6% for it. Its value on Cascade Lake is still unknown.
+- **Yardstick.** By the log, board time is roughly 0.52 to 0.6 of the runner's time, and this build is at 2.32 s there. Items 1 to 5 in the table sum to roughly 25 to 35% if their estimates hold and add up, which would land near Vibhor7-7's 1.59 s; reaching cherylaurelia's 1.38 s also needs the structural change in 14.2.
+
 ## Next iteration
 
-- Re-read `OVERNIGHT_LOG.md` if it exists (absent through iteration 12) and drop anything it marks tried.
+- Re-read `OVERNIGHT_LOG.md` (first seen in iteration 14; experiments table had only the baseline) and drop anything it marks tried.
 - Pull the competitor clones again for new commits and new scorer reports.
 - Still unread: enkyuan/polaris `OPTIMIZATION_RESEARCH.md` and `PERFORMANCE.md`, toM0dots logs, SsjRaz.
