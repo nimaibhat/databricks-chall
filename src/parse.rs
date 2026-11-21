@@ -393,7 +393,16 @@ pub fn read_small_csv(path: &Path) -> Vec<Vec<Vec<u8>>> {
 /// Bitmasks of ',', '"', '\n' over 64 bytes at p (bit i = byte i).
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    {
+        use std::arch::x86_64::*;
+        let v = _mm512_loadu_si512(p as *const _);
+        let c = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8));
+        let q = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
+        let n = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+        return (c, q, n);
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
     {
         use std::arch::x86_64::*;
         let a = _mm256_loadu_si256(p as *const __m256i);
