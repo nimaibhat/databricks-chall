@@ -1,4 +1,2 @@
 # label|ref|build-args|env
-main|origin/gate-main-0e964c1||
-xkp|origin/gate-xkp-c196f76||
-xkp_off|origin/gate-xkp_off-c196f76||SS512=0
+main|origin/gate-main-eaa2a89||
