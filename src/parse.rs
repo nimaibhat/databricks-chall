@@ -1116,19 +1116,25 @@ impl DateMemo {
 
 /// Seconds of day of `HH:MM:SS` at p (8 readable bytes); None unless it is
 /// exactly two digits, a colon, two digits, a colon, two digits, in range.
+///
+/// XOR with "00:00:00" turns a digit into 0..=9 and a colon into 0. Adding
+/// 0x7F minus each byte's largest allowed value (2 for the tens of hours, 5
+/// for the tens of minutes and seconds, 9 for the other digits, 0 for the
+/// colons) sets a byte's top bit exactly when it is too large, and a byte
+/// that was 0x80 or more before already has it set; no carry leaves a byte
+/// that is in range. That leaves only "hour at most 23" to test.
 #[inline(always)]
 fn tod_checked(p: *const u8) -> Option<i64> {
-    const SEP: u64 = 0x0000_FF00_00FF_0000;
-    let w = ld8(p);
-    let w2 = (w & !SEP) | 0x0000_3000_0030_0000;
-    if (w & SEP) != 0x0000_3A00_003A_0000 || !digits8(w2) {
+    let x = ld8(p) ^ 0x3030_3A30_303A_3030;
+    if (x | x.wrapping_add(0x767A_7F76_7A7F_767D)) & 0x8080_8080_8080_8080 != 0 {
         return None;
     }
-    let pa = pairs(w2);
+    // byte 2k of `x * 2561 >> 8` is 10 * digit(2k) + digit(2k+1)
+    let pa = x.wrapping_mul(2561) >> 8;
     let h = pa & 0xFF;
-    let mi = (pairs(w2 >> 8) >> 16) & 0xFF;
+    let mi = ((x >> 8).wrapping_mul(2561) >> 24) & 0xFF;
     let sec = (pa >> 48) & 0xFF;
-    if h > 23 || mi > 59 || sec > 59 {
+    if h > 23 {
         return None;
     }
     Some((h * 3600 + mi * 60 + sec) as i64)
@@ -1296,6 +1302,60 @@ mod swar_tests {
         }
         assert!(hits > 100_000);
         assert!(hits_memo > 1_000_000, "memo hits {hits_memo}");
+    }
+    /// The time-of-day check against a plain reading of the same rule.
+    #[test]
+    fn tod_matches_scalar() {
+        fn scalar(s: &[u8]) -> Option<i64> {
+            let d = |i: usize| -> Option<i64> { if s[i].is_ascii_digit() { Some((s[i] - b'0') as i64) } else { None } };
+            if s[2] != b':' || s[5] != b':' {
+                return None;
+            }
+            let (h, m, sec) = (d(0)? * 10 + d(1)?, d(3)? * 10 + d(4)?, d(6)? * 10 + d(7)?);
+            if h > 23 || m > 59 || sec > 59 {
+                return None;
+            }
+            Some(h * 3600 + m * 60 + sec)
+        }
+        // every valid-looking time, including out-of-range ones
+        let mut hits = 0;
+        for h in 0..100 {
+            for m in 0..100 {
+                for sec in (0..100).step_by(7).chain([59, 60, 99]) {
+                    let s = format!("{h:02}:{m:02}:{sec:02}");
+                    let r = tod_checked(s.as_ptr());
+                    assert_eq!(r, scalar(s.as_bytes()), "{s}");
+                    hits += r.is_some() as u32;
+                }
+            }
+        }
+        assert!(hits > 10_000);
+        // every byte value at every position of a valid time
+        for base in [b"23:59:59", b"00:00:00", b"12:34:56"] {
+            for pos in 0..8 {
+                for v in 0..=255u8 {
+                    let mut s = *base;
+                    s[pos] = v;
+                    assert_eq!(tod_checked(s.as_ptr()), scalar(&s), "{:?}", s);
+                }
+            }
+        }
+        // random bytes
+        let mut x: u64 = 0xA5A5_5A5A_1234_4321;
+        for _ in 0..2_000_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut s = x.to_le_bytes();
+            if x >> 60 < 12 {
+                // mostly near-valid: digits and colons with one random byte
+                let t = format!("{:02}:{:02}:{:02}", (x >> 8) % 30, (x >> 16) % 70, (x >> 24) % 70);
+                let keep = s[7];
+                s.copy_from_slice(t.as_bytes());
+                s[(x % 8) as usize] = if x >> 59 & 1 == 0 { keep } else { s[(x % 8) as usize] };
+            }
+            assert_eq!(tod_checked(s.as_ptr()), scalar(&s), "{:?}", s);
+        }
     }
     #[test]
     fn civil_swar_hits() {

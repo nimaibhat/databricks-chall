@@ -664,13 +664,22 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<
             if ts < ws || ts >= we || (ingest as i64 + ws_s) * 1000 - ts > DAY_MS {
                 break 'v;
             }
-            let price = match f[4] {
-                b"view" | b"cart" => 0,
-                b"purchase" => match parse_price(f[6]) {
+            // event type by length and one word compare (the field's own
+            // bytes: 4 or 8 of them, so the loads stay inside it)
+            let ty = f[4];
+            let price = if ty.len() == 4 {
+                let w = u32::from_le_bytes([ty[0], ty[1], ty[2], ty[3]]);
+                if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
+                    break 'v;
+                }
+                0
+            } else if ty.len() == 8 && u64::from_le_bytes([ty[0], ty[1], ty[2], ty[3], ty[4], ty[5], ty[6], ty[7]]) == u64::from_le_bytes(*b"purchase") {
+                match parse_price(f[6]) {
                     Some(p) => p,
                     None => break 'v,
-                },
-                _ => break 'v,
+                }
+            } else {
+                break 'v;
             };
             // the category is read only for purchases (price > 0)
             let pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
