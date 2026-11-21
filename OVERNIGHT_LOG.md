@@ -1,6 +1,6 @@
 # OVERNIGHT_LOG.md
 
-**SUBMIT THIS: `a88caa3`** (adds the cache-line link table and the inlined per-line callback to the dictionary-output build). x86 runner, full `docker run` wall, median of 7 (20M) and 5 (60M), EPYC 9V45 4 vCPU, same run: 20M 1.188 s against 1.212 s for its parent; 60M 3.263 s against 3.345 s. The fastest public build (cherylaurelia) takes 0.917 / 2.516 s in that run, so we are now about 1.3 times its time (2.4 times at the start of the night, in-process). Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); 15 unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets; output files read identically with polars, pyarrow, duckdb and fastparquet.
+**SUBMIT THIS: `204cb19`** (adds pread-only input as the default). x86 runner, full `docker run` wall, median of 7 (20M) and 5 (60M), Xeon 6975P-C 4 vCPU, same run: 20M 1.310 s against 1.362 s for the previous pick `ae9c1ba`'s tree; 60M 3.630 s against 3.816 s. The fastest public build (cherylaurelia) takes 1.047 / 2.997 s in that run: we are at 1.25 and 1.21 times its time. Passed the full gate on arm64 and on the x86-64-v3 build, in both I/O modes (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets; output files read identically with polars, pyarrow, duckdb and fastparquet.
 
 **If you would rather not rely on dictionary-encoded Parquet with an unknown scorer reader, submit `0f7f014` instead** (PLAIN pages, INT32 counts, without tonight's last two speedups: 1.725 / 5.038 s on an EPYC 7763 run where the dictionary build took 1.699 / 4.795 s). Dictionary pages are what pyarrow, Spark, polars and duckdb write by default, so the risk is small, but it is the one change tonight that alters the file format rather than the speed of producing it.
 
@@ -53,6 +53,8 @@ Before/after pairs come from one x86 run each; absolute times differ between run
 | 20 | `50b8e52` | Link table: 4 keys + 4 people per cache line, vector compare, `select_unpredictable` | 1.662 / 1.663 (7763) | 4.607 / 4.554 | 0.528 / 0.505 (noisy) | neutral at 20M, -1.2% at 60M inside the range; kept only as the base of #21 |
 | 21 | `a88caa3` | Scanner: single call site so the per-line callback is inlined | 1.212 / 1.188 (9V45; ranges 1.172-1.313 / 1.155-1.194) | 3.345 / 3.263 (3.325-3.505 / 3.243-3.329) | parse 1.250 / 1.191 at one thread | kept (-2.0%, -2.5%) |
 | 22 | not committed | Scanner field ends through a small array from two 64-bit words, quote test by byte | not run | not run | parse 1.194 / 1.237 at one thread | rejected on the Mac (slower); not taken to x86 |
+| 23 | `204cb19` | pread-only input as the default, after fixing its 4K-aliasing copy (page-aligned reads into a page-aligned buffer, 256 KiB ranges) | 1.362 / 1.310 (Xeon 6975P-C; ranges 1.347-1.372 / 1.307-1.322); run before 1.348 / 1.305 | 3.816 / 3.630 ; 3.825 / 3.627 | 0.462 / 0.456 | kept (-3.8%, -4.9%). Before the fix the same mode was +17% (experiment 18): `_copy_to_iter` took 21% of CPU |
+| 24 | not merged | Global allocator that puts allocations of 1 MiB and more on huge pages, phase scratch sized to qualify (Vibhor7-7 measured -3.7% for theirs) | 1.317 / 1.310 | 3.620 / 3.630 | 0.462 / 0.456 | rejected: no difference on x86 (sessions phase 0.238 both) |
 
 ## Current phase profile (`a88caa3`)
 
@@ -85,9 +87,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Find why pread-only input costs 1.5 s of kernel time at 20M where pread of a mapped file costs 0.3 s (toggles and a kernel-side `perf` profile are in the run in flight). A working pread path also removes the mapped input from exit teardown.
-2. Scanner instruction diet from the cachegrind line table (the scanner body is about 315 instructions per line; the fast public builds report about 100).
-3. The time after exit: `revenue_cents` is half of the remaining output; delta or dictionary encoding would cut the file by another third. Then half-hour bins in the sessions phase.
+1. `revenue_cents` as a dictionary column (built, passes the gate with four readers; output 35 -> 22 MB at 20M, 101 -> 63 MB at 60M): x86 A/B next, to see what it does to the time after exit.
+2. Scanner instruction diet from the cachegrind line table (the scanner body is about 315 instructions per line).
+3. Sessions phase (19% of CPU with its sorts): half-hour bins instead of the per-person sort; then the links phase (prefetch in the pair translation).
 
 ## Setup notes
 
