@@ -67,9 +67,14 @@ fi
 if [ -n "${IO_REF:-}" ]; then
   cd "$GITHUB_WORKSPACE"; rm -rf /tmp/t3; git worktree prune; git worktree add -f /tmp/t3 "$IO_REF" 2>&1 | tail -1; cd /tmp/t3
   RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static" cargo build --release 2>&1 | tail -1
-  for rep in 1 2; do for m in 3 4 5; do for ds in d20; do
-    rm -rf /tmp/o; mkdir /tmp/o
-    IOMODE=$m NCPU=$N DATA_DIR=$HOME/$ds OUTPUT_DIR=/tmp/o ./target/release/sessions 2>&1 | grep -E "^(phase2|rusage|done)" | tr '\n' ' ' | sed "s/^/IO mode=$m $ds : /"; echo
-  done; done; done
-  IOMODE=5 NCPU=$N DATA_DIR=$HOME/d20 OUTPUT_DIR=/tmp/o strace -f -c -o /tmp/st.txt ./target/release/sessions >/dev/null 2>&1; head -12 /tmp/st.txt | sed 's/^/IOS /'
+  run() { rm -rf /tmp/o; mkdir /tmp/o; env "$@" NCPU=$N DATA_DIR=$HOME/d20 OUTPUT_DIR=/tmp/o ./target/release/sessions 2>&1 | grep -E "^(phase2|rusage)" | sed -E 's/\(parse only//; s/rusage: //' | tr '\n' ' ' | sed "s/^/IO [$*] /"; echo; }
+  for rep in 1 2; do
+    run IOMODE=3; run IOMODE=4; run IOMODE=4 CHUNKKB=512; run IOMODE=5; run IOMODE=5 CHUNKKB=64; run IOMODE=5 IO5MAP=1; run IOMODE=5 IO5MAP=1 IO5RA=1
+  done
+  PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); [ -z "$PERF" ] && PERF=perf
+  sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
+  rm -rf /tmp/o; mkdir /tmp/o
+  sudo $PERF record -q -F 2000 -g -o /tmp/perf5.data env IOMODE=5 NCPU=$N DATA_DIR=$HOME/d20 OUTPUT_DIR=/tmp/o ./target/release/sessions >/dev/null 2>&1
+  sudo $PERF report -i /tmp/perf5.data --no-children --stdio --sort sym 2>/dev/null | grep -E "^ +[0-9]" | head -30 | sed 's/^/IOP /'
+  sudo $PERF report -i /tmp/perf5.data --no-children --stdio --sort sym -G 2>/dev/null | grep -A14 -E "^ +[0-9.]+%.*\[k\]" | head -90 | sed 's/^/IOG /'
 fi
