@@ -513,6 +513,9 @@ fn main() {
 
     // ---- phase 5: output
     out::write_all(&outdir, &ctx, accs);
+    if env("AREL", "0") == "1" {
+        arena.release_parallel(threads);
+    }
     eprintln!("done {:?} {}", t_start.elapsed(), cpu());
     eprintln!("epoch_done {:.6}", epoch());
     unsafe {
@@ -523,9 +526,6 @@ fn main() {
             ru.ru_utime.tv_sec, ru.ru_utime.tv_usec, ru.ru_stime.tv_sec, ru.ru_stime.tv_usec,
             ru.ru_minflt, ru.ru_majflt, ru.ru_maxrss, threads
         );
-    }
-    if env("AREL", "0") == "1" {
-        arena.release_parallel(threads);
     }
     // everything is leaked to the kernel: no destructor walks
     std::process::exit(0);
