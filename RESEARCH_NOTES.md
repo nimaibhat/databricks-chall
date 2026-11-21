@@ -1793,6 +1793,34 @@ Nothing here is a 30% idea on its own. The entry is level with ours on AMD, so i
 - **Expected gain.** None by itself; it is the measurement that tells which phase is 30% slower on the scorer than the runners predict, at 20M on the real machine. Four probes (parse, sessions, links, total) take two hours of slots.
 - **Risk.** None to exactness (the output is written before the sleep). The probe commits must never be left as the chosen commit for the final; the best score stays `73f8661`'s unless a later real submission beats it.
 
+## Iteration 51 (2026-11-21, 09:40): the optimizer found a structural path; what the competitors' probes add
+
+### 51.1 New pick `e0cf672`: the dense path (experiment 63)
+
+- `OVERNIGHT_LOG.md` experiment 63: the generator writes every ID as a prefix letter plus base 36 of `scramble(number, key)`, a bijection on 40 bits (`generator/src/text.rs`). `src/gen.rs` recovers the keys from a sample and turns IDs back into small dense numbers; `src/dense.rs` places events by number (dedup is the smallest ingest per slot; a user's events are a run of slots in time order, so no table and no sort). Anything that is not in the generator's form goes through the previous pipeline, and the whole run can restart on it. Measured -7% at 20M and 60M on Zen 4. Parse is unchanged at 0.59 s: "what is left is the line scanner and timestamp decoding, not the IDs".
+- This is the first change of the kind the board's top needs: it uses what the input is, with an exact way out. It also fits the leader's history as far as its commit titles show without reading the code ("add fast path with generic fallback", then repeated "cut parse" commits).
+- **Limit to keep.** The data is a pure function of the seed (`generator/src/random.rs`: one SplitMix64 stream per `(seed, stream, index)`), so in principle rows could be predicted instead of parsed. That would only be exact if every line were still checked byte for byte, which costs what parsing costs; without the check it is an answer for the generator, not for the input, and the rules say the answer must hold for any input. Not proposed.
+
+### 51.2 Scorer facts from Th3r0n's second probe
+
+- [Th3r0n `BENCH.md` at `14b4668`](https://github.com/Th3r0n/shopping-sessions/blob/14b4668/BENCH.md), probe P2 (score 9.04 s, decoded as base + 8): **the CPU limit is a cgroup quota, transparent huge pages work, the page cache is warm, and affinity is at most 8**. So `MADV_HUGEPAGE` on the arena is honoured on the scorer, and first-touch cost there is the 2 MiB zeroing, not 4 KiB faults.
+- A quota (not only a cpuset) means more runnable threads than 8 are throttled, never faster: `NCPU` threads is right (39.2 stands).
+- Their own measurement: parse storing into fresh arenas 0.41 s, into already faulted ones 0.31 s, not storing 0.30 s on a host with no huge pages; on the scorer, with huge pages, "this cost is much smaller". That lowers the value of the smaller-records item for the scorer (rank 4 in the table): zeroing is cheaper there than iteration 49 assumed.
+
+### 51.3 Other new commits
+
+- Vibhor7-7 `252674a` scored **0.69 s** (`SUBMISSIONS.md`, experiments 30 to 38 over the 0.76 s commit). It would be 14th on the 06:54 board.
+- anthonyteti `eb3c963`: "fused pipeline: parallel union-find, events routed to person partitions at parse, dedup only marks dead copies", this repo's design since experiment 19. Th3r0n `14b4668`: sessions from 30-minute aggregates without a sort (rejected here, experiment 54).
+
+### 51.4 Where the parse can still use the generator's form
+
+Read from `generator/src/text.rs`; nothing here is measured.
+
+- **Timestamps come in three exact shapes**: F1 is always 20 bytes (`YYYY-MM-DDTHH:MM:SSZ`), F2 always 25, F3 the decimal milliseconds, 13 digits for any window from 2025 to 2028 (the generator never writes leading zeros). So the field's length alone selects the decoder: 20, 25 or 13 bytes, plus 2 if quoted, and everything else is the general path. With the dense path already knowing the window, an F3 value needs only its low digits checked against the window's range.
+- **`ingest_ts` is always F1** (rules) and is needed only to choose among copies of one event; in the dense path a slot that receives a single copy never reads it. Decoding `ingest_ts` lazily, only when a slot is hit twice, removes a 20-byte decode from about 96% of event lines. The line still has to be well formed, which the scanner's masks already establish without decoding the field.
+- **`price_cents` and `product_id` matter only for purchases** (3% of events); `product_id` only has to be non-empty otherwise. Already done for the product lookup (experiment 2); the same laziness applies to the price digits.
+- **Risk.** Low for the length dispatch (any other length falls through to today's code). Lazy `ingest_ts` is exact only if the field is decoded whenever a second copy of the event exists, including copies that arrive in another thread's range: the dense slot must keep the bytes' location or the decoded value from the first copy. Medium.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
