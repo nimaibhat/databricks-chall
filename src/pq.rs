@@ -7,6 +7,7 @@ pub enum Data {
     /// strings as concatenated bytes + end offsets; `def` = Some(levels) for optional
     Str { bytes: Vec<u8>, ends: Vec<u32>, def: Option<Vec<bool>> },
     Date(Vec<i32>),
+    I32(Vec<i32>),
     I64(Vec<i64>),
 }
 
@@ -117,7 +118,16 @@ fn rle_levels(def: &[bool], out: &mut Vec<u8>) {
 }
 
 pub fn write(path: &std::path::Path, cols: &[Column], rows: usize) -> std::io::Result<()> {
-    let mut file: Vec<u8> = Vec::new();
+    // everything is built in one buffer of known size and written once
+    let est: usize = cols
+        .iter()
+        .map(|c| match &c.data {
+            Data::Str { bytes, ends, .. } => bytes.len() + ends.len() * 4 + ends.len() / 8 + 64,
+            Data::Date(v) | Data::I32(v) => v.len() * 4 + 64,
+            Data::I64(v) => v.len() * 8 + 64,
+        })
+        .sum();
+    let mut file: Vec<u8> = Vec::with_capacity(est + 4096);
     file.extend_from_slice(b"PAR1");
     struct Meta {
         offset: i64,
@@ -142,7 +152,7 @@ pub fn write(path: &std::path::Path, cols: &[Column], rows: usize) -> std::io::R
                 }
                 TYPE_BYTE_ARRAY
             }
-            Data::Date(v) => {
+            Data::Date(v) | Data::I32(v) => {
                 page.reserve(v.len() * 4);
                 for x in v {
                     page.extend_from_slice(&x.to_le_bytes());
@@ -187,6 +197,7 @@ pub fn write(path: &std::path::Path, cols: &[Column], rows: usize) -> std::io::R
         let (ty, rep, conv, logical) = match &c.data {
             Data::Str { def, .. } => (TYPE_BYTE_ARRAY, if def.is_some() { 1 } else { 0 }, Some(0), Some(1)),
             Data::Date(_) => (TYPE_INT32, 0, Some(6), Some(6)),
+            Data::I32(_) => (TYPE_INT32, 0, None, None),
             Data::I64(_) => (TYPE_INT64, 0, None, None),
         };
         t.i32(1, ty);
