@@ -635,6 +635,42 @@ Sources: [axhiao README](https://github.com/axhiao/Shopping-Sessions/blob/1d1fa1
 - **`BList::push` is 3.1%** and kernel page zeroing 2.2% on the EPYC runner. Write-combining can at best remove part of the first; on that CPU Vibhor7-7 measured -1% to -6% for it. Its value on Cascade Lake is still unknown.
 - **Yardstick.** By the log, board time is roughly 0.52 to 0.6 of the runner's time, and this build is at 2.32 s there. Items 1 to 5 in the table sum to roughly 25 to 35% if their estimates hold and add up, which would land near Vibhor7-7's 1.59 s; reaching cherylaurelia's 1.38 s also needs the structural change in 14.2.
 
+---
+
+## Iteration 15 (2026-11-21): the timestamp path in detail (230 instructions per line with price)
+
+Source: [cherylaurelia `src/main.rs`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs) lines 984 to 1135 (`civil_at`, `ts_at`, `ts_memo`), read in full. This makes entry 1.4 concrete and adds two cheaper building blocks that help even without the table.
+
+### 15.1 Validate digits and separators in one expression per word
+
+- **Idea.** XOR the 8-byte word with the pattern it should match, written with `0` for digit places (for example `"00:00:00"`). A valid digit byte becomes 0 to 9 and a matching separator becomes 0. Add `0x76` to digit places and `0x7F` to separator places: the high bit of a byte is then set exactly when that byte was out of range. The test is `((x + ADD) | x) & 0x8080808080808080 == 0`. A carry out of a byte can only come from a byte whose own high bit was already set, and `| x` catches that byte, so carries cannot hide an error.
+- **Here.** `civil_swar` (`parse.rs:772-785`) spends three mask-and-fill steps, a separate separator XOR and three `digits8` calls (about 7 operations each) on the same job. This form is 4 operations per word.
+- **Risk.** Low; `civil_swar_fuzz` covers it unchanged.
+
+### 15.2 Hour, minute and second from one word and one multiply
+
+- **Idea.** Load the 8 bytes `HH:MM:SS` at `p + 11`, XOR with `"00:00:00"`, and compute `pb = x * 10 + (x >> 8)`. Then `h = pb & 0xFF`, `mi = (pb >> 24) & 0xFF`, `sec = (pb >> 48) & 0xFF`. The separator bytes are zero after the XOR, so the neighbouring digits do not mix.
+- **Here.** `civil_swar` calls `pairs()` five times across three overlapping words (`parse.rs:786-796`) to get year, month, day, hour, minute and second. With the date coming from the table (15.3), the time of day needs only this one word.
+
+### 15.3 The date table, concretely
+
+- **Design.** A per-thread `[Day; 32]` where `Day = { a: u64 (bytes 0..8), b: u32 (bytes 8..11, i.e. "DDT"), midnight: i64 }`, indexed by `((b & 15) * 10 + ((b >> 8) & 15)) & 31`, which is the day of month. An unused slot holds a `b` that no input can equal.
+  - Shape test first: length 20 with `Z` at 19, or length 25 with `+`/`-` at 19 and `:` at 22; anything else goes to the existing paths.
+  - Hit (`a` and `b` equal): validate and decode the time of day as in 15.1 and 15.2, add `midnight`, apply the offset for F2.
+  - Miss: run the full checked parser. If it returns a value, store `(a, b, midnight of that date)`; if it rejects, store nothing.
+- **Why it is exact.** A stored entry proves that those 11 bytes are a valid date with `T`. Whether the whole timestamp is valid then depends only on the time-of-day bytes and the zone, which the hit path checks in full. A date whose first sighting had a bad time of day is simply not stored yet.
+- **Model check.** A Python model of this table against an exact F1/F2 reference, sharing one table across 1,500,000 random timestamps: years 2026 to 2028, months including 0, 2 and 13, days 0 to 31 (so February 29 in leap and non-leap years and February 30 collide in the same slot), hours to 25, minutes and seconds to 61, offsets to `+25:61`, and up to two corrupted bytes from an alphabet with `t`, `z`, space, `\r`, comma and quote. 0 mismatches. Script: `/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/chk2/ts.py`.
+- **Hit rate.** The generator writes `ingest_ts` minutes after `ts` (entry 7.6), and a 14-day window plus 7 days of clicks plus 5 days of late ingest spans at most about 27 dates, so day-of-month collisions are rare and nearly every lookup after the first few hundred lines hits. joch44's month-keyed 16-slot cache is the same idea; its last-date cache missed 93% of the time.
+- **Here.** `parse_ts_fast` F1 and F2 branches (`parse.rs:922-941`) and `parse_ingest_s` (`parse.rs:889-912`). For `ingest_ts` the miss path must go through the checked `parse_ts`, not the current unchecked arithmetic, so that only validated dates are stored; after that its hit path is as cheap as today's unchecked one and also validates the time of day. The table lives in the per-thread state passed to `parse_events` and `parse_clicks` (one more `&mut` next to `bs`).
+- **Expected gain.** By hand count a hit is about 25 instructions against roughly 65 to 80 for `civil_swar` and about 40 for the unchecked ingest path, so 50 to 70 instructions per event line of 1,040: 5 to 7% of parse, 3 to 4% of wall.
+- **Risk.** Low, for the reasons above. Extend `civil_swar_fuzz` and `ts_fuzz` to run every case twice against one shared table.
+
+### 15.4 F3 for any length up to 16 without reading backwards
+
+- **Idea.** Load 16 bytes at the field start as a `u128`, shift left by `8 * (16 - len)` so the digits are right-aligned, OR in ASCII zeros below, validate both halves with 15.1's test and convert with two 8-digit SWAR steps.
+- **Here.** `parse_ts_fast` handles 9 to 16 digits by loading the 16 bytes that end at the field end, which needs the `floor` guard and leaves 1 to 8 digits to the scalar loop (`parse.rs:942-953`). Generated F3 values are 13 digits, so this matters only for uniformity: one path, one guard (`p + 16 <= ceil`).
+- **Expected gain.** None on generated data. Listed so the F3 branch is not rewritten twice if `parse_ts_fast` is restructured for 15.3.
+
 ## Next iteration
 
 - Re-read `OVERNIGHT_LOG.md` (first seen in iteration 14; experiments table had only the baseline) and drop anything it marks tried.
