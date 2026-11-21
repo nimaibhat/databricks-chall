@@ -99,6 +99,14 @@ impl Arena {
     pub fn used(&self) -> usize {
         self.off.load(Ordering::Relaxed)
     }
+    /// `bytes` of fresh, zeroed, 64-byte aligned memory that is never
+    /// handed out again (rounded up to whole blocks).
+    pub fn alloc(&self, bytes: usize) -> *mut u8 {
+        let len = bytes.div_ceil(BLK).max(1) * BLK;
+        let o = self.off.fetch_add(len, Ordering::Relaxed);
+        assert!(o + len <= self.cap, "arena exhausted");
+        unsafe { self.base.add(o) }
+    }
     /// A fresh block (never handed out before).
     #[inline]
     pub fn block(&self) -> *mut u8 {
@@ -190,7 +198,11 @@ pub const STG: usize = 128;
 /// into the cache (software write-combining). Elsewhere records are written
 /// directly. `finish` writes out the partial stages and returns the lists.
 pub struct Scatter<T: Copy> {
-    cur: Vec<*mut T>,
+    /// per partition: where its next record goes; in the arena, so on huge
+    /// pages like the stages (both are hit at random by every push)
+    cur: *mut *mut T,
+    parts: usize,
+    #[allow(dead_code)]
     stage: *mut u8,
     blocks: Vec<Vec<*mut T>>,
 }
@@ -198,10 +210,12 @@ unsafe impl<T: Copy + Send> Send for Scatter<T> {}
 
 impl<T: Copy> Scatter<T> {
     const SZ: usize = std::mem::size_of::<T>();
-    pub fn new(parts: usize) -> Self {
+    pub fn new(parts: usize, arena: &Arena) -> Self {
         assert!(STG % Self::SZ == 0 && BLK % STG == 0);
-        let stage = unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(parts * STG, 64).unwrap()) };
-        Scatter { cur: vec![std::ptr::null_mut(); parts], stage, blocks: (0..parts).map(|_| Vec::new()).collect() }
+        // fresh arena memory is zero: every cursor starts as null
+        let cur = arena.alloc(parts * std::mem::size_of::<*mut T>()) as *mut *mut T;
+        let stage = arena.alloc(parts * STG);
+        Scatter { cur, parts, stage, blocks: (0..parts).map(|_| Vec::new()).collect() }
     }
     #[cold]
     #[inline(never)]
@@ -215,7 +229,7 @@ impl<T: Copy> Scatter<T> {
     #[inline(always)]
     pub fn push(&mut self, p: usize, x: T, src: &mut Blocks) -> *mut T {
         unsafe {
-            let mut at = *self.cur.get_unchecked(p);
+            let mut at = *self.cur.add(p);
             if (at as usize) & (BLK - 1) == 0 {
                 // no block yet, or the current one is full
                 at = self.new_block(p, src);
@@ -226,7 +240,7 @@ impl<T: Copy> Scatter<T> {
                 let st = self.stage.add(p * STG);
                 (st.add(off) as *mut T).write(x);
                 let next = at.add(1);
-                *self.cur.get_unchecked_mut(p) = next;
+                *self.cur.add(p) = next;
                 if (next as usize) & (STG - 1) == 0 {
                     use std::arch::x86_64::*;
                     let dst = (next as *mut u8).sub(STG);
@@ -241,7 +255,7 @@ impl<T: Copy> Scatter<T> {
             #[cfg(not(target_arch = "x86_64"))]
             {
                 at.write(x);
-                *self.cur.get_unchecked_mut(p) = at.add(1);
+                *self.cur.add(p) = at.add(1);
             }
             at
         }
@@ -256,10 +270,10 @@ impl<T: Copy> Scatter<T> {
     }
     /// Writes out the partial stages and returns one list per partition.
     pub fn finish(mut self) -> Vec<BList<T>> {
-        let parts = self.cur.len();
+        let parts = self.parts;
         let mut out = Vec::with_capacity(parts);
         for p in 0..parts {
-            let cur = self.cur[p];
+            let cur = unsafe { *self.cur.add(p) };
             let blocks = std::mem::take(&mut self.blocks[p]);
             if blocks.is_empty() {
                 out.push(BList::new());
@@ -275,7 +289,6 @@ impl<T: Copy> Scatter<T> {
             let len = (blocks.len() - 1) * BList::<T>::PER + used;
             out.push(BList { blocks, cur, left: BList::<T>::PER - used, len });
         }
-        unsafe { std::alloc::dealloc(self.stage, std::alloc::Layout::from_size_align(parts * STG, 64).unwrap()) };
         out
     }
 }
@@ -297,8 +310,8 @@ mod tests {
         };
         for &(parts, n) in &[(1usize, 0usize), (1, 1), (4, 7), (8, 5000), (64, 300_000), (512, 100_000), (3, 70_000)] {
             let mut bs = Blocks::new(&arena);
-            let mut s16 = Scatter::<[u64; 2]>::new(parts);
-            let mut s32 = Scatter::<[u64; 4]>::new(parts);
+            let mut s16 = Scatter::<[u64; 2]>::new(parts, &arena);
+            let mut s32 = Scatter::<[u64; 4]>::new(parts, &arena);
             let mut want16: Vec<Vec<[u64; 2]>> = vec![Vec::new(); parts];
             let mut want32: Vec<Vec<[u64; 4]>> = vec![Vec::new(); parts];
             let mut addrs = Vec::new();

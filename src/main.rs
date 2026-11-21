@@ -278,19 +278,43 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     let t_name = t0.elapsed();
     let tab = LinkTab::new(nmoved);
     // the table holds only IDs that are not their own person's name
+    // Three steps per ID, 16 IDs apart, so that the loads each step needs
+    // (its parent's line, then its root's key and its table line) are
+    // already on their way: 32 ahead read the parent and ask for the
+    // parent's own entry, 16 ahead walk to the root and ask for the root's
+    // key and the ID's table line, then insert.
     par_for(shards, threads, |_t, s| {
         let off = offs[s] as usize;
-        for (j, &k) in shard_keys[s].iter().enumerate() {
-            let mut r = off + j;
+        let ks = &shard_keys[s];
+        let n = ks.len();
+        let root = |i: usize| -> usize {
+            let mut r = i;
             loop {
                 let up = parent[r] as usize;
                 if up == r {
-                    break;
+                    return r;
                 }
                 r = up;
             }
+        };
+        let mut ring = [0u32; 16];
+        for (j, slot) in ring.iter_mut().enumerate().take(n) {
+            *slot = root(off + j) as u32;
+        }
+        for j in 0..n {
+            if j + 32 < n {
+                let p1 = parent[off + j + 32] as usize;
+                prefetch(unsafe { parent.as_ptr().add(p1) });
+            }
+            let r = ring[j & 15] as usize;
+            if j + 16 < n {
+                let r2 = root(off + j + 16);
+                prefetch(unsafe { all_keys.as_ptr().add(r2) });
+                tab.prefetch(hk(ks[j + 16]));
+                ring[j & 15] = r2 as u32;
+            }
             if r != off + j {
-                tab.insert(k, all_keys[r]);
+                tab.insert(ks[j], all_keys[r]);
             }
         }
     });
@@ -464,7 +488,8 @@ fn main() {
     // valid click line makes 32 bytes and is at least 20 bytes for any window
     // after 2001, 8 bytes in the extreme, hence four times the click bytes.
     // Plus one partial block per list. The reservation is address space only.
-    let partial = ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * BLK;
+    // one partial block per list, plus each scatter's stages and cursors
+    let partial = ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * (BLK + STG + 8) + 6 * threads * BLK;
     let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + partial * 2 + (256 << 20);
     let arena = Arena::new(2 * ev_bytes + 4 * cl_bytes + partial + (64 << 20), est * 3 / 2);
     assert!(arena.cap() / 16 < u32::MAX as usize - 1, "input too large for 32-bit record indices");
@@ -524,9 +549,9 @@ fn main() {
         chunks_of(1, &cl_m, chunk_kb << 10, &mut chunks);
     }
     let blocks = PerThread::new(threads, || Blocks::new(&arena));
-    let ebl = PerThread::new(threads, || Scatter::<DRec>::new(1usize << p1_bits()));
-    let sbl = PerThread::new(threads, || Scatter::<SRec>::new(1usize << p2_bits()));
-    let cbl = PerThread::new(threads, || Scatter::<CRec>::new(1usize << p2_bits()));
+    let ebl = PerThread::new(threads, || Scatter::<DRec>::new(1usize << p1_bits(), &arena));
+    let sbl = PerThread::new(threads, || Scatter::<SRec>::new(1usize << p2_bits(), &arena));
+    let cbl = PerThread::new(threads, || Scatter::<CRec>::new(1usize << p2_bits(), &arena));
     let iobufs = PerThread::new(threads, Vec::<u8>::new);
     let rdbufs = PerThread::new(threads, IoBuf::new);
     par_for(chunks.len(), threads, |t, i| {
@@ -1001,7 +1026,7 @@ mod dedup_tests {
             let mut recs: Vec<SRec> = (0..n).map(|i| SRec { person: i as u64, ts: i as u32, pc: 7 }).collect();
             let abase = recs.as_mut_ptr() as usize;
             let mut bs = Blocks::new(&arena);
-            let mut sc = Scatter::<DRec>::new(3);
+            let mut sc = Scatter::<DRec>::new(3, &arena);
             let mut all = Vec::new();
             for i in 0..n {
                 let eid = pack(format!("e{}", rnd() % idspace).as_bytes());
