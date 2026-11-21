@@ -34,5 +34,5 @@ jobs:
         run: |
           git fetch -q origin "refs/heads/gate-*:refs/remotes/origin/gate-*" || true
           bash bench/gha_bench.sh
-      - name: perf-skip
-        run: "true"
+      - name: scenarios
+        run: bash bench/scen.sh
