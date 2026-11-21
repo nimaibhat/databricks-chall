@@ -10,7 +10,7 @@ Re-ranked in iteration 14 against the x86 profile in `OVERNIGHT_LOG.md` (parse 1
 
 | # | Idea | Where | Expected gain | Risk to exactness | Entry |
 |---|---|---|---|---|---|
-| 1 | Line-at-a-time splitter fed by block masks computed once per 64 bytes; quote validity and field offsets from two mask words, no `pos` index, no quote ring | `scan_lines`, `parse.rs:486-654` | The scanner is 490 of 1,040 instructions per line and 27% of `perf` self time (19.5% plus the 7.7% quote loop). Estimate 130 to 170 instructions per line after, so 10 to 15% of wall. The algorithm is model-checked | Medium: this routine decides which lines are malformed. The model check and `fuzz_scan` are the net | [14.1](#141-a-line-at-a-time-splitter-that-scans-each-byte-once) |
+| 1 | Scanner. Step A (low risk, measured): keep the separator index and split all fields of a line at once from the 4 bytes around each delimiter. Step B: line-at-a-time splitter fed by block masks, no `pos` index, no quote ring | `scan_lines`, `parse.rs:486-654`; step A is only `:621-635` | Step A measured by a competitor at -4.4% of total, -5.9% of parse (145 to 60 instructions per line). Step B targets the rest of the scanner's 490 of 1,040 instructions per line: estimate 10 to 15% of wall in all; another team measured per-line 128-byte masks faster than a block scanner (20.2 against 22.9 ns per line) | A: low to medium. B: medium; model-checked, `fuzz_scan` is the net | [19.1](#191-keep-the-separator-index-split-all-fields-of-a-line-at-once-around-its-delimiters), [22.1](#221-the-vector-field-split-is-now-measured--44), [14.1](#141-a-line-at-a-time-splitter-that-scans-each-byte-once) |
 | 2 | Narrow dedup side stream with tombstones, **keeping** partition-by-user and the per-partition resolve | `parse_events`, `dedup_partition`, `resolve_partition` | Removes dedup pass 2 and its second scatter; with two-bit counters the dedup table drops from megabytes to under 256 KB. Estimate 6 to 10% of wall | Medium | [14.2](#142-do-the-tombstone-dedup-without-moving-person-resolution-into-the-parse-loop), [1.3](#13-dedup-that-marks-losers-in-place), [9.1](#91-two-bit-counters-instead-of-a-key-table) |
 | 3 | Nibble-table and multiply-add ID packing, two IDs per line in one 256-bit operation | `pack_fast`, `keys.rs:73-97` | `pack_fast`'s loop is 5.8% of `perf` self time; estimate 3 to 5% of wall. Model-checked against `pack` including `-` | Low: bit-exact in the model; `pack_long` path unchanged | [14.3](#143-simd-id-packing-that-matches-this-repos-key-format) |
 | 4 | Sort 8-byte `(ts << 32) \| pc` keys per person | `process_partition`, `main.rs:814-830`, `:893-896` | Measured by a competitor at -2.8% for the same change; three teams do it | None | [7.1](#71-sort-8-byte-keys-per-person), [11.3](#113-measured-numbers-for-ideas-already-in-this-file) |
@@ -884,6 +884,46 @@ For the `pread` A/B (entry 1.5, now a runner-up). Source: [Vibhor7-7 `src/reader
 - **What it removes.** All `madvise` calls, all 4 KiB PTE setup for 1.9 GB (20M) or 5.5 GB (60M) of file pages, and their teardown at exit; what it adds is one copy of the input through L2.
 - **Expected gain.** Still unknown in sign (entry 11.2: TejasviniChawla -10% and sys time halved, Vibhor7-7 "mmap 11 to 17% slower on a virtual machine" in its README, against three teams that preferred mappings). The log's one-thread run shows sys time at only 0.27 s of 5.0 s on the EPYC runner, so the kernel share is small there; it may be larger on the scorer's VM.
 - **Risk.** Low to medium. The scanner sees buffers whose first line start and last line end are arbitrary, which `scan_lines` already supports through `start`/`end`; the new part is the ownership rule at range edges. A test with ranges of a few bytes (Vibhor7-7 and Th3r0n both fuzz with chunk sizes down to 1 byte) exercises every edge.
+
+---
+
+## Iteration 22 (2026-11-21, 00:50): new measurements from the two most methodical competitor logs
+
+Sources: [Vibhor7-7 `BENCH.md` at `f245e54`](https://github.com/Vibhor7-7/shopping-sessions/blob/f245e54/BENCH.md) (experiments 22 to 25 and four measurement rows) and [TejasviniChawla `docs/NOTES.md` at `8ff776b`](https://github.com/TejasviniChawla/shopping-sessions/blob/8ff776b/docs/NOTES.md). No new `src/` commits in this repo since `e7a116f`.
+
+### 22.1 The vector field split is now measured: -4.4%
+
+- Vibhor7-7 experiment 22 (`7a5ddaf`, the code described in entry 19.1): total 999 to 955 ms (-4.4%) and parse 702 to 660 ms (-5.9%) on a Zen 4 runner with 4 threads, repeated at 1003 to 959. "The compiled loop spent about 145 of its 650 instructions a line on seven rounds of 'is this field wrapped'; now about 60." On one thread there was no change (2510 to 2521 ms): fewer instructions paid only when two threads shared a core, which is the scorer's situation.
+- TejasviniChawla, isolated bench on Zen 3: "Block-based scanner prototype is NOT faster than the per-line 128-byte masks (22.9 vs 20.2 ns/line realistic): dropped"; a `u64`-halves splitter was worth only 1 ns per line.
+- **Reading.** Entry 19.1 has a measured number and is the cheapest scanner step. Entry 14.1's direction (per-line masks) is supported over block-structured alternatives, but its margin over a good index scanner may be smaller than its instruction estimate suggests; do 19.1 first and re-profile before committing to 14.1.
+
+### 22.2 Where a fast build's parse time goes
+
+- Vibhor7-7, parse cut short at each stage, 20M, 4 threads on Zen 4, cumulative ms: read 49, delimiter scan 136, line walk 155, fields into values (unquote, keys, timestamps, validation) 503, link lookup 570, event records 670, everything 720. "48% of parse is turning fields into values, 21% is writing the two record streams, 12% is the scan, 9% the link lookup, 7% `read()`."
+- Same log, callgrind on 1M: about 1,000 instructions per line for the **whole run**, about 680 of them in parse. This repo's parse alone is 1,040 (`OVERNIGHT_LOG.md`), of which the scanner is 490 against roughly 100 there (scan plus line walk are 15% of 680).
+- TejasviniChawla, isolated ns per line on Zen 3: scan 20, split 19, ts 10, ingest 5, keys 8, type and hash 8, push 15: 85 ns in all.
+- **Reading.** The gap to these builds is the scanner first (about 390 instructions per line), then timestamps and keys. It confirms the order of the top five.
+
+### 22.3 Prefetch the partition's write head a few lines before the push
+
+- **Idea.** A sampled profile showed 10% of Vibhor7-7's whole run "on the first touch of each push: loading the partition's state and writing into its buffer. A thousand partitions' states and buffers do not fit the first cache level, and with 500 instructions to a line the CPU sees no further ahead than the line it is on." Experiment 24 (`86b8dce`) computes the partition early, prefetches its state and buffer, and writes the record 4 lines later.
+- **Measured.** One thread: 3025 to 2935 ms (-3.0%), parse -4.6%. Four threads on 2 cores: -0.6% and "nothing" on the repeat. At 60M with 2^11 partitions: -2.2% and -1.5%. Their reading: "a stall hurts less when a second thread can use the core meanwhile", so the value on the scorer's hyperthreads is at the low end.
+- **Here.** `BList::push` is 3.1% of self time on the runner (`mem.rs:129-139`), and each list's state (`cur`, `left`, `len`, the `blocks` vector header) is 48 bytes, so 512 lists are 24 KB of state plus 512 write heads: the same shape. The eid partition is known as soon as `eid` is packed (`main.rs:608`), which is before both timestamps are parsed, so a `prefetchw` of `eb[idx]` and of its `cur` pointer there gives the store about half a line of lead without any ring. A ring of 4 pending records gives more.
+- **Expected gain.** 0 to 2% of wall on hyperthreads. Cheap to try; overlaps with write-combining (entry 1.2), which removes the same miss differently, so do one or the other.
+- **Risk.** None for the prefetch alone; a ring needs a drain at chunk end.
+
+### 22.4 Container overhead and output bytes, measured under Docker: nothing to gain
+
+- Vibhor7-7 "overhead" row at 20M: "per `docker run`: 115 to 129 ms before `main`, 1226 to 1260 ms in the process, 59 to 73 ms after it; the same with output on tmpfs, without limits, or pinned with a cpuset ... about 190 ms outside the process at 20M, as at 60M. Nothing we write changes it." TejasviniChawla measures 0.10 s for its image on CI.
+- This is a second measurement that output on a bind mount costs nothing extra after exit (their output is 78 MB), consistent with entry 20.5 and against TejasviniChawla's earlier +0.15 s. Entry 20.1 stays "unproven"; the Parquet size work stays closed unless this repo's own bench shows otherwise.
+- TejasviniChawla also reports the same code scoring 1.62 s and then 1.88 s for a build that was 5% faster in same-runner A/B, with a queue wait of 524 ms: "Practice board is noisy; the final retimes. Choose by same-runner A/B."
+
+### 22.5 Smaller measured items
+
+- **`ingest_ts` with predictable branches** (Vibhor7-7 experiment 23): -1.7% and -1.3% on Ice Lake 8370C, parse -2.4%, by replacing "a dozen flag instructions" with compare-and-branch, since the form of `ingest_ts` never varies. This repo's `parse_ingest_s` (`parse.rs:889`) is already one predictable branch followed by unchecked arithmetic, so there is nothing to take, but it is a warning for entry 15.3: keep the ingest hit path branchy and short instead of folding checks into flags.
+- **Catalog lookups by number** (experiment 25): -0.9% and -1.2%. This repo's dense `Catalog` already does this (`3e5cebd`, `1c4fa8e`).
+- **Dedup probes in table order** (TejasviniChawla `37d9e08`, `8e4b489`, both reverted): inserting slot-sorted candidates into a linear-probing table "is quadratic (pass3 15 s)". If entry 9.1's suspects are ever put into a table instead of sorted, do not order them by slot.
+- **Run-based Parquet dictionary and radix sort for large person slices** (TejasviniChawla `8ff776b`), **sparse time buckets and skipping click sorts for single-session people** (SsjRaz `e299544`): no numbers recorded. The second is a small exact shortcut for this repo too: a person with one session needs only the latest click at or before the start and the set of campaigns within 7 days, neither of which needs a full sort of their clicks; with about 8 clicks per person it saves little.
 
 ## Next iteration
 
