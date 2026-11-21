@@ -1,2 +1,7 @@
 # label|ref|build-args|env
-pgo|origin/gate-pgo-7b57153||
+main|origin/gate-main-c4aa745||
+dnp|origin/gate-dnp-056216d||
+dnp_t1|origin/gate-dnp_t1-056216d||NCPU=1
+dnp_t2|origin/gate-dnp_t2-056216d||NCPU=2
+dnp_t8|origin/gate-dnp_t8-056216d||NCPU=8
+dnp_ab|origin/gate-dnp_ab-056216d||DENSE_ABANDON=1
