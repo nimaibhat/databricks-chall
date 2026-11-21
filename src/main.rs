@@ -329,7 +329,7 @@ fn main() {
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
-    assert!(we - ws < (1i64 << 32), "window too long for u32 offsets");
+    assert!(we - ws + WEEK_MS < (1i64 << 32), "window too long for u32 offsets");
     let day0 = ws.div_euclid(DAY_MS);
     let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1).max(1) as usize;
 
@@ -447,10 +447,20 @@ fn main() {
     // ---- phase 4: per person partition
     let ncamp = ctx.camp_names.len();
     let ncat = ctx.cat_names.len();
-    let acc = PerThread::new(threads, || out::Acc::new(ncamp + 1, ndays));
+    // about 0.1 user-day rows per event; threads take uneven shares
+    let nev: usize = sparts.iter().map(|ls| ls.iter().map(|l| l.len).sum::<usize>()).sum();
+    let acc = PerThread::new(threads, || {
+        let mut a = out::Acc::new(ncamp + 1, ndays);
+        a.users.reserve(nev / 4 / threads + 1024);
+        a
+    });
     let pscr = PerThread::new(threads, Scratch::default);
     let ptimes = std::sync::Mutex::new(Vec::new());
-    par_for(1usize << p2_bits(), threads, |t, p| {
+    // largest partitions first, so a whale's partition is never the last one running alone
+    let mut order: Vec<usize> = (0..1usize << p2_bits()).collect();
+    order.sort_by_key(|&p| std::cmp::Reverse(sparts[p].iter().map(|l| l.len).sum::<usize>()));
+    par_for(order.len(), threads, |t, i| {
+        let p = order[i];
         let a = unsafe { acc.get(t) };
         let sc = unsafe { pscr.get(t) };
         let t0 = Instant::now();
@@ -709,6 +719,15 @@ fn dedup_partition(lists: &mut [BList<DRec>], mp: &mut KMap<u64>, bs: &mut Block
     }
 }
 
+/// A click inside a person group: time relative to the click window start.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct CSort {
+    cid: Key,
+    ts: u32,
+    camp: u32,
+}
+
 #[derive(Default)]
 struct Scratch {
     gmap: Option<KMap<u32>>,
@@ -717,15 +736,16 @@ struct Scratch {
     off: Vec<u32>,
     pos: Vec<u32>,
     gid: Vec<u32>,
-    ev: Vec<SRec>,
+    ev: Vec<u64>,
     ccounts: Vec<u32>,
     coff: Vec<u32>,
     cgid: Vec<u32>,
-    cl: Vec<CRec>,
+    cl: Vec<CSort>,
     cat_rev: Vec<u64>,
     touched: Vec<u16>,
     acnt: Vec<u32>,
     apos: Vec<u32>,
+    since: Vec<u32>,
     active: Vec<u32>,
 }
 
@@ -744,7 +764,7 @@ fn process_partition(
     }
     let gmap = sc.gmap.get_or_insert_with(|| KMap::<u32>::with_capacity(16));
     gmap.reset(n / 4 + 16);
-    // group events by person (counting sort)
+    // group events by person (counting sort); copies that lost dedup are skipped
     let gkeys = &mut sc.gkeys;
     let counts = &mut sc.counts;
     let gid = &mut sc.gid;
@@ -779,6 +799,8 @@ fn process_partition(
     let pos = &mut sc.pos;
     pos.clear();
     pos.extend_from_slice(&off[..ng]);
+    // an event inside its group is one word: ts << 32 | pc, so sorting the
+    // words sorts by time (the order among equal times does not matter)
     let ev = &mut sc.ev;
     ev.clear();
     ev.reserve(n);
@@ -792,7 +814,7 @@ fn process_partition(
                         continue;
                     }
                     let g = gid[i] as usize;
-                    unsafe { *ev.get_unchecked_mut(pos[g] as usize) = *r };
+                    unsafe { *ev.get_unchecked_mut(pos[g] as usize) = ((r.ts as u64) << 32) | r.pc as u64 };
                     pos[g] += 1;
                     i += 1;
                 }
@@ -830,6 +852,7 @@ fn process_partition(
     cl.clear();
     cl.reserve(ncl);
     unsafe { cl.set_len(ncl) };
+    let cws = ctx.ws - WEEK_MS;
     {
         let mut j = 0;
         for l in clists {
@@ -837,7 +860,9 @@ fn process_partition(
                 for r in sl {
                     let g = cgid[j];
                     if g != u32::MAX {
-                        unsafe { *cl.get_unchecked_mut(pos[g as usize] as usize) = *r };
+                        // a valid click is inside [window_start - 7 d, window_end)
+                        let c = CSort { cid: r.cid, ts: (r.ts - cws) as u32, camp: r.camp };
+                        unsafe { *cl.get_unchecked_mut(pos[g as usize] as usize) = c };
                         pos[g as usize] += 1;
                     }
                     j += 1;
@@ -853,17 +878,20 @@ fn process_partition(
     if sc.acnt.len() < ctx.camp_names.len() + 1 {
         sc.acnt = vec![0; ctx.camp_names.len() + 1];
         sc.apos = vec![0; ctx.camp_names.len() + 1];
+        sc.since = vec![0; ctx.camp_names.len() + 1];
     }
     let acnt = &mut sc.acnt;
     let apos = &mut sc.apos;
+    let since = &mut sc.since;
     let active = &mut sc.active;
     let organic = ctx.camp_names.len() as u32;
     let ws = ctx.ws;
+    const WEEK: u64 = WEEK_MS as u64;
 
     for g in 0..ng {
         let evs = &mut ev[off[g] as usize..off[g + 1] as usize];
         if evs.len() > 1 {
-            evs.sort_unstable_by_key(|r| r.ts);
+            evs.sort_unstable();
         }
         let cls = &mut cl[coff[g] as usize..coff[g + 1] as usize];
         if cls.len() > 1 {
@@ -871,6 +899,7 @@ fn process_partition(
         }
         let person = gkeys[g];
         let mut cur_day: i32 = i32::MIN;
+        // sessions, events, revenue of the current day so far
         let mut d_sess = 0u32;
         let mut d_events = 0u32;
         let mut d_rev = 0u64;
@@ -880,7 +909,7 @@ fn process_partition(
         let mut k = 0usize;
         let ne = evs.len();
         while k < ne {
-            let start_off = evs[k].ts;
+            let start_off = (evs[k] >> 32) as u32;
             let start = ws + start_off as i64;
             let mut last = start_off;
             let mut cnt = 0u32;
@@ -889,6 +918,13 @@ fn process_partition(
             let day = start.div_euclid(DAY_MS) as i32;
             if day != cur_day {
                 if cur_day != i32::MIN {
+                    // the day ends: every campaign still in the window assisted
+                    // the day's sessions since it entered (or since the day began)
+                    let pd = (cur_day as i64 - ctx.day0) as usize;
+                    for &c in active.iter() {
+                        a.camp_cell(c as usize, pd)[3] += (d_sess - since[c as usize]) as u64;
+                        since[c as usize] = 0;
+                    }
                     flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
                 }
                 cur_day = day;
@@ -896,15 +932,15 @@ fn process_partition(
                 d_events = 0;
                 d_rev = 0;
             }
-            while k < ne && evs[k].ts - last <= GAP_MS as u32 {
-                let r = &evs[k];
-                last = r.ts;
+            while k < ne && ((evs[k] >> 32) as u32) - last <= GAP_MS as u32 {
+                let r = evs[k];
+                last = (r >> 32) as u32;
                 cnt += 1;
-                let price = r.pc >> 8;
+                let price = (r as u32) >> 8;
                 if price != 0 {
                     purchase = true;
                     rev += price as u64;
-                    let c = (r.pc & 0xFF) as usize;
+                    let c = (r & 0xFF) as usize;
                     if cat_rev[c] == 0 {
                         touched.push(c as u16);
                     }
@@ -912,24 +948,31 @@ fn process_partition(
                 }
                 k += 1;
             }
-            d_sess += 1;
-            d_events += cnt;
-            d_rev += rev;
-            // clicks in [start - 7d, start] form the window: credit picks the
-            // latest, every distinct campaign in it assists
-            while cj < cls.len() && cls[cj].ts <= start {
+            let di = (day as i64 - ctx.day0) as usize;
+            // Clicks in [start - 7d, start] form the window: credit picks the
+            // latest, every distinct campaign in it assists. Click times are
+            // relative to window_start - 7d, so a click is at or before the
+            // start iff ts <= start_off + 7d, and older than 7 days iff
+            // ts < start_off. Assists are counted by intervals: a campaign
+            // that enters the window notes how many sessions the day had
+            // (`since`), and is paid for the sessions since then when it
+            // leaves, when the day ends, or when the person ends.
+            while cj < cls.len() && cls[cj].ts as u64 <= start_off as u64 + WEEK {
                 let c = cls[cj].camp as usize;
                 if acnt[c] == 0 {
                     apos[c] = active.len() as u32;
                     active.push(c as u32);
+                    since[c] = d_sess;
                 }
                 acnt[c] += 1;
                 cj += 1;
             }
-            while wlo < cj && cls[wlo].ts < start - WEEK_MS {
+            while wlo < cj && cls[wlo].ts < start_off {
                 let c = cls[wlo].camp as usize;
                 acnt[c] -= 1;
                 if acnt[c] == 0 {
+                    // it assisted the sessions before this one
+                    a.camp_cell(c, di)[3] += (d_sess - since[c]) as u64;
                     let i = apos[c] as usize;
                     let last = active.pop().unwrap();
                     if last as usize != c {
@@ -942,7 +985,7 @@ fn process_partition(
             let mut camp = organic;
             if cj > 0 {
                 let lt = cls[cj - 1].ts;
-                if start - lt <= WEEK_MS {
+                if lt >= start_off {
                     let mut q = cj - 1;
                     while q > 0 && cls[q - 1].ts == lt {
                         q -= 1;
@@ -950,21 +993,21 @@ fn process_partition(
                     camp = cls[q].camp;
                 }
             }
-            let di = (day as i64 - ctx.day0) as usize;
             let cell = a.camp_cell(camp as usize, di);
             cell[0] += 1;
             cell[1] += purchase as u64;
             cell[2] += rev;
-            for &c in active.iter() {
-                a.camp_cell(c as usize, di)[3] += 1;
-            }
+            d_sess += 1;
+            d_events += cnt;
+            d_rev += rev;
         }
-        flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
-
+        let pd = (cur_day as i64 - ctx.day0) as usize;
         for &c in active.iter() {
+            a.camp_cell(c as usize, pd)[3] += (d_sess - since[c as usize]) as u64;
             acnt[c as usize] = 0;
         }
         active.clear();
+        flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
     }
 }
 
