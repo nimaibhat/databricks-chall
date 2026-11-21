@@ -129,19 +129,20 @@ pub struct Ctx {
 fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> LinkTab {
     let t0 = Instant::now();
     let paths = list_csv(&data.join("links"));
-    let m = Mapped::open(&paths);
+    // read like the events: page-aligned preads into a per-thread buffer
+    let inp = Inputs::open(&paths);
     let mut chunks = Vec::new();
-    chunks_of(0, &m, 1 << 20, &mut chunks);
+    inp.chunks(0, 256 << 10, &mut chunks);
+    let rbufs = PerThread::new(threads, IoBuf::new);
     let shard_bits: u32 = p2_bits();
     let shards: usize = 1 << shard_bits;
     let shift = 64 - shard_bits;
     // sized up front (a link line is about 20 bytes) so the lists do not regrow
-    let lines = m.maps.iter().map(|x| x.len()).sum::<usize>() / 18;
+    let lines = inp.bytes() / 18;
     let pairs = PerThread::new(threads, || Vec::<(Key, Key)>::with_capacity(lines / threads * 3 / 2 + 1024));
     let skeys = PerThread::new(threads, || (0..shards).map(|_| Vec::<Key>::with_capacity(2 * lines / shards / threads * 3 / 2 + 64)).collect::<Vec<_>>());
     par_for(chunks.len(), threads, |t, i| {
-        let c = chunks[i];
-        let d: &[u8] = &m.maps[c.file as usize];
+        let (d, start, end) = inp.read(&chunks[i], unsafe { rbufs.get(t) });
         let p = unsafe { pairs.get(t) };
         let sk = unsafe { skeys.get(t) };
         let mut sink = FnSink::<2, _>(|f: &[&[u8]; 2]| {
@@ -157,8 +158,9 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
             sk[(hk(a) >> shift) as usize].push(a);
             sk[(hk(b) >> shift) as usize].push(b);
         });
-        scan_lines::<2, _>(d, c.start, c.end, &mut sink);
+        scan_lines::<2, _>(d, start, end, &mut sink);
     });
+    std::mem::forget(rbufs);
     let t_parse = t0.elapsed();
     let pairs = pairs.into_inner();
     let skeys = skeys.into_inner();
