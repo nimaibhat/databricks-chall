@@ -243,7 +243,9 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     let stop = std::sync::atomic::AtomicBool::new(false);
     let pf_next = AtomicUsize::new(0);
     let mut nmoved = 0usize; // IDs that are not a root = unions made
-    std::thread::scope(|sc| {
+    // (the pre-fault threads keep going through the naming passes below
+    // until their target is reached: the union pass alone is too short)
+    let (uf_time, t_union, t_name, tab) = std::thread::scope(|sc| {
     if prefault > 0 {
         for _ in 1..threads {
             sc.spawn(|| {
@@ -269,8 +271,6 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
             }
         }
     }
-    stop.store(true, Ordering::Relaxed);
-    });
     let uf_time = t_uf.elapsed();
     let t_union = t0.elapsed();
     // From here the roots are fixed. `parent` and `best` are shared by the
@@ -365,6 +365,9 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
                 tab.insert(ks[j], all_keys[nm]);
             }
         }
+    });
+    stop.store(true, Ordering::Relaxed);
+    (uf_time, t_union, t_name, tab)
     });
     eprintln!(
         "links: {} pairs, {} ids, {} mapped, uf {:?}, total {:?} (parse {:?} intern {:?} xlate {:?} union {:?} name {:?})",
