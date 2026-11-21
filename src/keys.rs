@@ -66,33 +66,81 @@ pub fn pack(s: &[u8]) -> Key {
     pack_long(s)
 }
 
+/// Low-nibble and high-nibble classes for the key alphabet: a byte is in
+/// `-0-9A-Z_a-z` iff `LO_CLASS[b & 15] & HI_CLASS[b >> 4] != 0`. One bit per
+/// row of the ASCII table: 0x2_ (only `-`), 0x3_ (digits), 0x4_ (A-O),
+/// 0x5_ (P-Z and `_`), 0x6_ (a-o), 0x7_ (p-z).
+static LO_CLASS: [u8; 16] = [0x2A, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3C, 0x14, 0x14, 0x15, 0x14, 0x1C];
+static HI_CLASS: [u8; 16] = [0, 0, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0, 0, 0, 0, 0, 0, 0, 0];
+/// Added to a byte to get its 6-bit code, by high nibble (`_` needs 4 less).
+static HI_OFFSET: [u8; 16] = [0, 0, 211, 209, 202, 202, 197, 197, 0, 0, 0, 0, 0, 0, 0, 0];
+/// `KEEP[16 - n..]` = n bytes of 0xFF then zeros.
+static KEEP: [u8; 32] = [
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// The 6-bit codes of the first `n` (<= 10) bytes at `p` as two little-endian
+/// words (bytes past `n` are code 0), or None if a byte is outside the
+/// alphabet. Reads 16 bytes at `p`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn codes16(p: *const u8, n: usize) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    let keep = _mm_loadu_si128(KEEP.as_ptr().add(16 - n) as *const __m128i);
+    let dash = _mm_set1_epi8(b'-' as i8);
+    // bytes past the ID become '-', which is valid and has code 0
+    let v = _mm_or_si128(_mm_and_si128(_mm_loadu_si128(p as *const __m128i), keep), _mm_andnot_si128(keep, dash));
+    let nib = _mm_set1_epi8(0x0F);
+    let lo = _mm_and_si128(v, nib);
+    let hi = _mm_and_si128(_mm_srli_epi16(v, 4), nib);
+    let cls = _mm_and_si128(
+        _mm_shuffle_epi8(_mm_loadu_si128(LO_CLASS.as_ptr() as *const __m128i), lo),
+        _mm_shuffle_epi8(_mm_loadu_si128(HI_CLASS.as_ptr() as *const __m128i), hi),
+    );
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(cls, _mm_setzero_si128())) != 0 {
+        return None;
+    }
+    let off = _mm_shuffle_epi8(_mm_loadu_si128(HI_OFFSET.as_ptr() as *const __m128i), hi);
+    let und = _mm_and_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8)), _mm_set1_epi8(-4));
+    let c = _mm_add_epi8(_mm_add_epi8(v, off), und);
+    Some((_mm_cvtsi128_si64(c) as u64, _mm_extract_epi64(c, 1) as u64))
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn codes16(p: *const u8, n: usize) -> Option<(u64, u64)> {
+    use std::arch::aarch64::*;
+    let keep = vld1q_u8(KEEP.as_ptr().add(16 - n));
+    let v = vbslq_u8(keep, vld1q_u8(p), vdupq_n_u8(b'-'));
+    let lo = vandq_u8(v, vdupq_n_u8(0x0F));
+    let hi = vshrq_n_u8(v, 4);
+    let cls = vandq_u8(vqtbl1q_u8(vld1q_u8(LO_CLASS.as_ptr()), lo), vqtbl1q_u8(vld1q_u8(HI_CLASS.as_ptr()), hi));
+    if vminvq_u8(cls) == 0 {
+        return None;
+    }
+    let off = vqtbl1q_u8(vld1q_u8(HI_OFFSET.as_ptr()), hi);
+    let und = vandq_u8(vceqq_u8(v, vdupq_n_u8(b'_')), vdupq_n_u8(252));
+    let c = vreinterpretq_u64_u8(vaddq_u8(vaddq_u8(v, off), und));
+    Some((vgetq_lane_u64(c, 0), vgetq_lane_u64(c, 1)))
+}
+
 /// Same as `pack`; `ceil` = one past the last readable byte after `s`.
-/// Codes of up to 10 bytes are looked up independently and combined in
-/// parallel instead of a serial shift chain.
+/// The bytes are classified and turned into 6-bit codes 16 at a time, then
+/// the codes are squeezed together with shifts.
 #[inline(always)]
 pub fn pack_fast(s: &[u8], ceil: *const u8) -> Key {
     let n = s.len();
     let p = s.as_ptr();
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if n <= 10 && (p as usize) + 16 <= ceil as usize {
-        let lo = u64::from_le(unsafe { (p as *const u64).read_unaligned() });
-        let hi = u64::from_le(unsafe { (p.add(8) as *const u64).read_unaligned() });
-        let mut v: u64 = 0;
-        let mut bad: u8 = 0;
-        let mut i = 0;
-        while i < 10 {
-            let b = if i < 8 { (lo >> (8 * i)) as u8 } else { (hi >> (8 * (i - 8))) as u8 };
-            let c = unsafe { *CODE.get_unchecked(b as usize) };
-            let m = if i < n { 0xFFu8 } else { 0 };
-            let c = c & m;
-            bad |= c;
-            v |= ((c & 63) as u64) << (58 - 6 * i);
-            i += 1;
-        }
-        if bad & 0x80 == 0 {
-            return v | n as u64;
-        }
-        return pack_long(s);
+        let Some((lo, hi)) = (unsafe { codes16(p, n) }) else { return pack_long(s) };
+        // first byte to the top, then 8 -> 6 bits per code in three merges
+        let x = lo.swap_bytes();
+        let x = ((x & 0x3F00_3F00_3F00_3F00) >> 2) | (x & 0x003F_003F_003F_003F);
+        let x = ((x & 0x0FFF_0000_0FFF_0000) >> 4) | (x & 0x0000_0FFF_0000_0FFF);
+        let x = ((x & 0x00FF_FFFF_0000_0000) >> 8) | (x & 0x0000_0000_00FF_FFFF);
+        return (x << 16) | ((hi & 0x3F) << 10) | ((hi & 0x3F00) >> 4) | n as u64;
     }
+    let _ = ceil;
     pack(s)
 }
 
@@ -151,6 +199,80 @@ pub fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+}
+
+/// Global user -> person table. Holds only IDs whose person differs from
+/// themselves, so a miss means "this ID is its own person". Buckets of four
+/// 16-byte slots (one cache line), key 0 = empty (no ID packs to 0 except the
+/// empty string, which is never looked up). Inserts are lock-free so the table
+/// is filled in parallel; lookups happen only after the build.
+pub struct LinkTab {
+    base: *mut [u64; 2],
+    nb_mask: usize,
+    shift: u32,
+}
+unsafe impl Sync for LinkTab {}
+unsafe impl Send for LinkTab {}
+
+impl LinkTab {
+    pub fn new(n: usize) -> LinkTab {
+        let slots = (n * 2).next_power_of_two().max(64);
+        let bytes = slots * 16;
+        let base = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "link table mmap");
+            #[cfg(target_os = "linux")]
+            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+            p as *mut [u64; 2]
+        };
+        let nb = slots / 4;
+        LinkTab { base, nb_mask: nb - 1, shift: 64 - nb.trailing_zeros() }
+    }
+    #[inline(always)]
+    pub fn prefetch(&self, h: u64) {
+        prefetch(unsafe { self.base.add(((h >> self.shift) as usize) * 4) });
+    }
+    /// Concurrent insert of a key that is not in the table yet.
+    pub fn insert(&self, k: Key, v: Key) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        assert!(k != 0);
+        let mut b = (hk(k) >> self.shift) as usize;
+        loop {
+            for i in 0..4 {
+                let slot = unsafe { self.base.add(b * 4 + i) };
+                let key = unsafe { &*(slot as *const AtomicU64) };
+                if key.load(Ordering::Relaxed) == 0 && key.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    unsafe { (*(slot as *const [AtomicU64; 2]))[1].store(v, Ordering::Relaxed) };
+                    return;
+                }
+            }
+            b = (b + 1) & self.nb_mask;
+        }
+    }
+    /// The person of `k` if it differs from `k`. `h` = hk(k).
+    #[inline(always)]
+    pub fn get(&self, k: Key, h: u64) -> Option<Key> {
+        let mut b = (h >> self.shift) as usize;
+        loop {
+            for i in 0..4 {
+                let s = unsafe { *self.base.add(b * 4 + i) };
+                if s[0] == k {
+                    return Some(s[1]);
+                }
+                if s[0] == 0 {
+                    return None;
+                }
+            }
+            b = (b + 1) & self.nb_mask;
+        }
     }
 }
 
@@ -268,6 +390,89 @@ impl<V: Copy + Default> KMap<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn linktab_matches_hashmap() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for &n in &[0usize, 1, 3, 31, 32, 33, 1000, 50_000] {
+            let mut m: HashMap<u64, u64> = HashMap::new();
+            while m.len() < n {
+                // clustered keys too, to force bucket overflow
+                let k = if rnd() % 4 == 0 { 1 + rnd() % 64 } else { rnd() | 1 };
+                let v = rnd();
+                m.entry(k).or_insert(v);
+            }
+            let t = LinkTab::new(n);
+            let items: Vec<(u64, u64)> = m.iter().map(|(a, b)| (*a, *b)).collect();
+            std::thread::scope(|s| {
+                for part in items.chunks(items.len() / 4 + 1) {
+                    let t = &t;
+                    s.spawn(move || {
+                        for &(k, v) in part {
+                            t.insert(k, v);
+                        }
+                    });
+                }
+            });
+            for (&k, &v) in &m {
+                assert_eq!(t.get(k, hk(k)), Some(v));
+            }
+            for _ in 0..20_000 {
+                let k = if rnd() % 2 == 0 { 1 + rnd() % 200 } else { rnd() | 1 };
+                assert_eq!(t.get(k, hk(k)), m.get(&k).copied(), "n {n} k {k}");
+            }
+        }
+    }
+    /// `pack_fast` against `pack`: every length 0..=11 with every byte value
+    /// at every position, IDs at every distance from the buffer end, and
+    /// random IDs over the alphabet and over all bytes.
+    #[test]
+    fn pack_fast_matches_pack() {
+        let fast = |id: &[u8], slack: usize| -> Key {
+            let mut buf = vec![0xEEu8; 7];
+            buf.extend_from_slice(id);
+            buf.extend(std::iter::repeat(b'z').take(slack));
+            pack_fast(&buf[7..7 + id.len()], unsafe { buf.as_ptr().add(buf.len()) })
+        };
+        let mut hits = 0u32;
+        for n in 0..=11usize {
+            let base: Vec<u8> = (0..n).map(|i| ALPHA[(i * 7 + 3) % 64]).collect();
+            for slack in [0usize, 1, 5, 6, 15, 16, 17, 40] {
+                assert_eq!(fast(&base, slack), pack(&base), "{:?} slack {slack}", base);
+            }
+            for pos in 0..n {
+                for b in 0..=255u8 {
+                    let mut id = base.clone();
+                    id[pos] = b;
+                    let (f, r) = (fast(&id, 20), pack(&id));
+                    assert_eq!(f, r, "{:?}", id);
+                    hits += !is_long(f) as u32;
+                }
+            }
+        }
+        assert!(hits > 3000);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..2_000_000u32 {
+            let n = (rnd() % 12) as usize;
+            let id: Vec<u8> = (0..n).map(|_| if i % 5 == 0 { rnd() as u8 } else { ALPHA[(rnd() % 64) as usize] }).collect();
+            let (f, r) = (fast(&id, (rnd() % 24) as usize), pack(&id));
+            assert_eq!(f, r, "{:?}", id);
+            let mut o = Vec::new();
+            key_bytes(f, &mut o);
+            assert_eq!(o, id);
+        }
+    }
     #[test]
     fn order() {
         let words: Vec<&[u8]> = vec![
