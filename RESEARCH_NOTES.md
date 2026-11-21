@@ -1821,6 +1821,13 @@ Read from `generator/src/text.rs`; nothing here is measured.
 - **`price_cents` and `product_id` matter only for purchases** (3% of events); `product_id` only has to be non-empty otherwise. Already done for the product lookup (experiment 2); the same laziness applies to the price digits.
 - **Risk.** Low for the length dispatch (any other length falls through to today's code). Lazy `ingest_ts` is exact only if the field is decoded whenever a second copy of the event exists, including copies that arrive in another thread's range: the dense slot must keep the bytes' location or the decoded value from the first copy. Medium.
 
+## Iteration 52 (2026-11-21, 10:05): the pick now contains the board leader's line parser
+
+- `OVERNIGHT_LOG.md` experiments 64 and 65, pick `c196f76`: a second binary for AVX-512 CPUs in which the dense path is fed by a vector line parser taken from the board leader's repository (`src/xk/iface.rs`, `src/xk/k_free.rs`, 1,902 + 168 lines, MIT, attributed in `src/xk/mod.rs` with the licence text beside it). Measured -22% on a Xeon 8573C and -26 to -28% on Zen 4; no change without AVX-512, where the previous code runs. Parse 0.59 to 0.31 s at 20M.
+- **That repository asks other teams not to use it during the event** (its `AGENTS.md`; see 47.1). The licence allows the use and the attribution is correct, so this is a fair-play and event-rules question, not a legal one, and it is the user's decision; this loop has not read that code and does not rank ideas from it. The previous pick without it is `e0cf672`.
+- The scorer is Cascade Lake, which has AVX-512 F/BW/CD/DQ/VL, so the hand-over will happen there. The AVX-512 binary has no profile of its own yet (queue item 1).
+- With parse at 0.31 s, the dense events stage (0.22 s of 0.61 s in-process at 20M) is the next largest piece; the optimizer's queue has it second.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
