@@ -11,8 +11,6 @@ path = "src/main.rs"
 memchr = "2.7"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
-parquet = { version = "60", default-features = false }
-bytes = "1"
 libc = "0.2"
 
 [profile.release]
