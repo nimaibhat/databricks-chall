@@ -404,12 +404,6 @@ fn popr() -> bool {
 - 3.2: the VM runs kernel 7.0 like the scorer, and the tmpfs baseline is 11.5 ms slower in parse than ext4 (146.3 against 157.8). The whole run takes 9,640 page faults on ext4 against 28,762 in parse alone on tmpfs, so on ext4 the input is being mapped in units much larger than 64 KiB. Tune on tmpfs only; ext4 numbers flatter the mapped path.
 - 7: the knob table is closed by experiment 2, except `XL_ENDREL` and `XL_RGREL`, which were not in it and are now row 1.
 
-## Next passes (in this order)
-
-1. `pqw.rs` encoders: the write stage is 65 thread-ms of encoding for 2.25M rows (log).
-2. `links.rs` `bucket_a`/`sort_users`: `st2b_pass2=113.2` and `st2b_sort=53.4` thread-ms inside parse (log).
-3. `events.rs` `walk_runs`: `runs=155.3` thread-ms, the largest part of ev3a (log).
-
 ## Iteration 10 (2026-11-21): `walk_runs` read; nothing to propose
 
 Read `events.rs:1599-1734`. The log's `runs=155.3` thread-ms is 233 ns per user run (666,655 runs), 7.4 ns per event.
@@ -431,3 +425,13 @@ Read `events.rs:1599-1734`. The log's `runs=155.3` thread-ms is 233 ns per user 
 ### 11.2 Considered and not proposed: a smaller event record
 
 5.1 closed "drop a field". I also looked at re-encoding: within one bucket of 2^15 event indices there are at most 2^15 users, so 16 bits of the user index would do if stage 3 rebuilt the rest; ingest time could be stored relative to the event time. That gets a non-purchase record to about 76 bits, so 12 bytes at best, a quarter less arena (about 84 MB, **my estimate** 3 ms of clearing and store traffic). It would change the record layout that `ev_vec`, `push_many`, `scatter_chunk` and the 512-bit compaction in `stage3a` all share, break the 64-byte staging lines (records would no longer divide a cache line), and need an escape for late rows. That is the most row-sensitive code in the program for 1.5%. **Not proposed.**
+
+### 11.3 Write stage: closed
+
+The log's profile lists every function above 1.1% of samples and none is in `pqw.rs` or `out.rs`; the write stage's 74.9 busy thread-ms (4.8% of the run's CPU) is spread over the encoders with only 9.18 thread-ms inside `write` calls. I read the bit-packer (`pqw.rs:195-291`): it packs 8 values per step with shifts into one 64- or 128-bit word, about two instructions per value. There is no single slow pass to fix. **Closed** unless a profile of the write stage alone shows a concentration.
+
+## Next passes
+
+Waiting on four results, in the order they are cheapest to get: row 1 (`XL_REL=0 XL_RGREL=0 XL_ENDREL=2`), row 2 (`XL_CKIX=1`, `XL_CKIX=2`), 11.1's one-thread-per-core run, row 3 (`XL_BB=14` build). Meanwhile:
+1. `links.rs` `sort_users` and the sorting networks: `st2b_sort=53.4` thread-ms (log).
+2. `parse.rs` `ev_vec` and `push_many` once more with the log's 10.5% share for `ev_batch` in hand.
