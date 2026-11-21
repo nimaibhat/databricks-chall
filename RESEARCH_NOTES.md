@@ -211,6 +211,8 @@ Sources were opened by a research agent and are linked per claim. Items it could
 
 ### 3.4 Huge pages for the arena
 
+*Corrected by [12.1](#121-correction-to-34-mimalloc-v3-advises-huge-pages-by-default): the mimalloc heap is also advised, so the second sentence of the first bullet below is wrong for this build.*
+
 - GKE documents `madvise` as the default THP mode ([LinuxNodeConfig reference](https://docs.cloud.google.com/python/docs/reference/container/latest/google.cloud.container_v1.types.LinuxNodeConfig.TransparentHugepageEnabled)); upstream defaults to `always`. `Arena::new` (`mem.rs:32`) already calls `MADV_HUGEPAGE`, so both cases are covered. The vectors outside the arena (`Scratch`, `Acc.users`, the Parquet buffers, `KMap` slots) come from mimalloc and get huge pages only under `always`.
 - No action unless the output buffers move into the arena, which the queued "reserve or stream Parquet buffers" item would make unnecessary.
 
@@ -536,6 +538,34 @@ Opened by a research agent, with the mimalloc claim checked against the vendored
 - Thread spawn is about 5 µs ([Bendersky](https://eli.thegreenplace.net/2018/launching-linux-threads-and-processes-with-clone/)); eight `par_for` phases of 8 threads cost about 0.3 ms. A persistent pool is not worth writing.
 - Pinning: no measurement for an 8-vCPU VM. TejasviniChawla included pinning in a batch that was 3 to 10% faster overall, without isolating it.
 - `available_parallelism` honours cgroup quota and affinity ([std docs](https://doc.rust-lang.org/std/thread/fn.available_parallelism.html)); `main.rs:331-335` reads `NCPU` first, which the scorer sets to 8.
+
+---
+
+## Iteration 13 (2026-11-21): remaining competitor notes, and two small derived ideas
+
+Sources: [axhiao README](https://github.com/axhiao/Shopping-Sessions/blob/1d1fa1c/README.md), [enkyuan/polaris `PERFORMANCE.md`](https://github.com/enkyuan/polaris/blob/9f20a22/PERFORMANCE.md), commit logs of niranjankumarnk, sonalrajapaksha, toM0dots and SsjRaz.
+
+### 13.1 Leave self-named IDs out of the link shards
+
+- **Idea.** A link shard maps every linked ID to its person's name, including the IDs that are their own name. `Ctx::person_h` and `resolve_partition` already treat a miss as "unchanged" (`main.rs:136`, `:678`), so those entries carry no information. Dropping them shrinks the shards and turns their lookups into early misses.
+- **Sources.** axhiao: "A 2 MB bit filter marks the IDs whose person is not themselves, so most rows never probe the table" (README, step 2; commit `a1c934b`). enkyuan/polaris: "The bitmap contains every noncanonical alias. A clear bit proves the ID is absent" (measured 1.08 to 1.07 s, inside its noise). The audit's microbench on the 20M set counts 60.6% of event rows with a user in the link map and 39.2% actually rewritten, so about a third of the hits are self-named.
+- **Here.** In the last step of `build_links` (`main.rs:258-268`) the slots are rewritten in place from index to name. Instead, build each shard's final map from only the slots where `name != key`. Shards get smaller by the share of linked IDs that are roots, and `resolve_partition` gets the same answer through the existing miss path.
+- **Expected gain.** Resolve is about 8% of wall and its shards are already cache-local, so perhaps 10 to 20% of that phase: about 1% of wall. Smaller than the filters above because this repo probes per partition, not from the parse loop.
+- **Risk.** None to exactness: a miss and a hit that returns the key itself are handled identically today.
+
+### 13.2 16-byte click records inside a person group
+
+- **Idea.** The click analogue of 7.1. Inside a group `person` is constant, so a click needs only `ts` (as a 32-bit offset from `window_start - 7 days`), `camp` and `cid`: 16 bytes instead of the 32-byte `CRec`. The sort key `(ts, cid)` is then the high 96 bits of one `u128`, so `sort_unstable` on plain integers replaces the comparator closure at `main.rs:899`.
+- **Sources.** axhiao `1d1fa1c`: "packed click keys with side arrays"; niranjankumarnk `c53fa98`: "24-byte click records: time and campaign share one word" and `644e32c`: "order each person's clicks through keys"; joch44 v20 kept 32-byte clicks and gained 2.8% from the event half alone.
+- **Here.** `Scratch.cl` becomes `Vec<u128>` (or a `#[repr(C)]` pair of `u64`s); the scatter at `main.rs:862-876` packs `((ts - cws) as u128) << 96 | (cid as u128) << 32 | camp as u128`. Integer order on `cid` equals `key_cmp` only for packed keys, so if any `cid` in the group `is_long`, keep the current comparator for that group (generated data never has one). The click window offset fits 32 bits because the event window already must (`main.rs:344`) and 7 days adds 6.05e8 ms; assert that `we - ws + WEEK_MS < 2^32` and fall back otherwise.
+- **Expected gain.** About 1% of wall: clicks are a quarter as many as events, but their comparator is the expensive one and whales have about 100,000 of them.
+- **Risk.** Low. The credit tie-break depends on this order (`main.rs:973-980`: first of the equal-`ts` run), so test with the fixtures that pair clicks at the same millisecond and add a unit test that the `u128` order equals `(ts, key_cmp(cid))` on random packed keys.
+
+### 13.3 Confirmations, no new ideas
+
+- axhiao implements idea 1.3 in full: a 16-byte dedup record (id fingerprint, ingest seconds, payload location) per copy, a 24-byte payload per valid copy written straight to its person partition, losers "marked dead in place in the payload buffers", with write-combining buffers on the partition writes. That is a sixth independent instance of the design; its reported time is 1.15 s at 20M under Docker on a Threadripper, so it is not evidence of a top score.
+- enkyuan/polaris (board 1.41 s) tried an interleaved two-bit dedup bitmap against separate "seen" and "repeated" bitmaps and found no repeatable difference. Either layout of entry 9.1's counters is fine.
+- sonalrajapaksha `0695a92`: "Drop the prefetched link table and the no-free change: both measured worse". niranjankumarnk `3fcf2f2` writes dictionary pages with RLE indices (entry 5.2). toM0dots and SsjRaz are C++ entries without scores or measurements in their logs.
 
 ## Next iteration
 
