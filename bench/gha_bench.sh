@@ -1,77 +1,95 @@
 #!/bin/bash
-# Variants from bench/variants.txt, one per line:  label|ref|build-args|env-flags
-# Runs are interleaved across variants (R rounds) so machine drift cancels.
-# Output of every variant is compared with the first one (sorted rows, duckdb).
+# Variants (bench/variants.txt): label|ref|build-args|env-flags ; ref may be ext:owner/repo[@sha]
+# Interleaved rounds per dataset; full container start-to-exit wall; output equality vs first variant (duckdb).
 set -u
-DATA=~/data
+source bench/config.env
 N=$(nproc)
-R=${R:-1}
 pip install -q duckdb >/dev/null 2>&1
 mapfile -t V < <(grep -v '^#' bench/variants.txt | grep -v '^$')
-declare -A IMG
 for v in "${V[@]}"; do
   IFS='|' read -r label ref bargs envs <<< "$v"
-  sha=$(git rev-parse --short "$ref")
-  tag="sut:${label}"
-  rm -rf /tmp/src; git worktree prune; git worktree add -f /tmp/src "$ref" -q
+  rm -rf /tmp/src; git worktree prune
+  if [[ "$ref" == ext:* ]]; then
+    r=${ref#ext:}; repo=${r%@*}; sha=""; [[ "$r" == *@* ]] && sha=${r#*@}
+    git clone -q https://github.com/$repo /tmp/src && [ -n "$sha" ] && git -C /tmp/src checkout -q $sha
+    desc="$repo $(git -C /tmp/src rev-parse --short HEAD)"
+  else
+    git worktree add -f /tmp/src "$ref" -q; desc="$(git rev-parse --short $ref) $(git log -1 --format=%s $ref | cut -c1-70)"
+  fi
   ba=""; for b in $bargs; do ba="$ba --build-arg $b"; done
-  docker build -q $ba -t "$tag" /tmp/src >/dev/null || echo "BUILD FAILED $label"
-  git worktree remove --force /tmp/src
-  echo "built $label = $sha $(git log -1 --format=%s $ref) [$bargs] [$envs]"
+  docker build -q $ba -t "sut:$label" /tmp/src >/dev/null 2>/tmp/build.err || { echo "BUILD FAILED $label"; tail -5 /tmp/build.err; }
+  [[ "$ref" == ext:* ]] && rm -rf /tmp/src || git worktree remove --force /tmp/src
+  echo "built $label = $desc [$bargs] [$envs]"
 done
-runone() { # label envs keep_out
-  label=$1; envs=$2; keep=${3:-}
+runone() { # ds label envs keep
+  ds=$1; label=$2; envs=$3; keep=${4:-}
   out=$(mktemp -d); scr=$(mktemp -d); chmod 777 $out $scr
   ef=""; for e in $envs; do ef="$ef -e $e"; done
   t0=$(date +%s.%N)
   docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
     --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus $N --memory 14g --memory-swap 14g \
-    --user 1000:1000 -v $DATA:/data:ro -v $out:/output -v $scr:/scratch \
+    --user 1000:1000 -v $HOME/$ds:/data:ro -v $out:/output -v $scr:/scratch \
     -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=$N -e MEM_GB=24 $ef "sut:$label" \
-    2> $out.err
+    2> $out.err >/dev/null
   rc=$?
   t1=$(date +%s.%N)
   w=$(echo "$t1 - $t0" | bc)
-  d=$(grep -oE '^done [0-9.]+m?s' $out.err | awk '{print $2}')
-  ph=$(grep -E '^(phase2|phase3 |phase3b|phase4 s|done)' $out.err | sed -E 's/\[[^]]*\]//; s/arena.*//; s/\(parse only[^)]*\)//; s/phase//' | awk '{print $NF}' | tr '\n' ' ')
-  echo "$label rc=$rc wall=$w done=$d | $ph" >> /tmp/results.txt
-  if [ -n "$keep" ]; then sudo chmod -R a+rwX $out; mv $out /tmp/out_$label; else sudo rm -rf $out; fi
+  ph=$(grep -E '^(phase1|phase2|phase3 |phase3b|phase4 s|done)' $out.err | sed -E 's/\[[^]]*\]//; s/arena.*//; s/\(parse only[^)]*\)//' | awk '{print $NF}' | tr '\n' ' ')
+  echo "$ds $label rc=$rc wall=$w | $ph" >> /tmp/results.txt
+  if [ -n "$keep" ]; then sudo chmod -R a+rwX $out; rm -rf /tmp/out_${ds}_$label; mv $out /tmp/out_${ds}_$label; else sudo rm -rf $out; fi
   sudo rm -rf $scr $out.err
 }
 : > /tmp/results.txt
-for v in "${V[@]}"; do IFS='|' read -r label ref bargs envs <<< "$v"; runone "$label" "$envs" keep; done   # warmup + keep output
-for r in $(seq 1 $R); do for v in "${V[@]}"; do IFS='|' read -r label ref bargs envs <<< "$v"; runone "$label" "$envs"; done; done
+for ds in d20 d60; do
+  R=$R20; [ $ds = d60 ] && R=$R60
+  [ "$R" -gt 0 ] || continue
+  cat $HOME/$ds/*/*.csv > /dev/null
+  for v in "${V[@]}"; do IFS='|' read -r label ref bargs envs <<< "$v"; runone $ds "$label" "$envs" keep; done
+  for r in $(seq 1 $R); do for v in "${V[@]}"; do IFS='|' read -r label ref bargs envs <<< "$v"; runone $ds "$label" "$envs"; done; done
+done
 echo "=== raw"; cat /tmp/results.txt
-echo "=== summary (excluding warmup): label  median_wall  median_done  min_done"
+echo "=== summary (warmup excluded): ds label n | wall med min max | phase medians (links parse dedup resolve sess out)"
 python3 - <<'PY'
 import re,collections,statistics
-rows=collections.defaultdict(list)
-seen=set()
+rows=collections.defaultdict(list); seen=set()
+def sec(s):
+    m=re.match(r'([0-9.]+)(ms|s|µs|us)',s)
+    if not m: return float('nan')
+    return float(m.group(1))*{'s':1,'ms':1e-3,'µs':1e-6,'us':1e-6}[m.group(2)]
 for l in open('/tmp/results.txt'):
-    lab=l.split()[0]
-    if lab not in seen: seen.add(lab); continue
+    p=l.split(); key=(p[0],p[1])
+    if key not in seen: seen.add(key); continue
     w=float(re.search(r'wall=([0-9.]+)',l).group(1))
-    m=re.search(r'done=([0-9.]+)(m?s)',l)
-    d=float(m.group(1))/(1000 if m.group(2)=='ms' else 1) if m else -1
-    rows[lab].append((w,d))
-for lab,v in rows.items():
-    print(f"{lab:24s} {statistics.median([x[0] for x in v]):.3f} {statistics.median([x[1] for x in v]):.3f} {min(x[1] for x in v):.3f}")
+    st=[sec(x) for x in l.split('|')[1].split()]
+    ph=[st[0]]+[st[i]-st[i-1] for i in range(1,len(st))] if len(st)==6 else []
+    rows[key].append((w,ph))
+for (ds,lab),v in rows.items():
+    ws=[x[0] for x in v]
+    pm=' '.join('%.3f'%statistics.median(x[1][i] for x in v) for i in range(6)) if all(len(x[1])==6 for x in v) else '-'
+    print(f"SUM {ds} {lab:22s} n={len(ws)} | {statistics.median(ws):.3f} {min(ws):.3f} {max(ws):.3f} | {pm}")
 PY
 echo "=== output equality vs first variant"
 first=$(echo "${V[0]}" | cut -d'|' -f1)
-for v in "${V[@]}"; do
+for ds in d20 d60; do
+ for v in "${V[@]}"; do
   label=$(echo "$v" | cut -d'|' -f1)
-  python3 - "$first" "$label" <<'PY'
+  [ -d /tmp/out_${ds}_$label ] || continue
+  python3 - "$ds" "$first" "$label" <<'PY'
 import duckdb,sys
-a,b=sys.argv[1],sys.argv[2]
+ds,a,b=sys.argv[1:]
 ok=True
 for t in ["user_daily","campaign_daily"]:
-    q=lambda x: f"select * from read_parquet('/tmp/out_{x}/{t}/*.parquet')"
-    n1=duckdb.sql(f"select count(*) from ({q(a)} except all {q(b)})").fetchall()[0][0]
-    n2=duckdb.sql(f"select count(*) from ({q(b)} except all {q(a)})").fetchall()[0][0]
-    c=duckdb.sql(f"select count(*) from ({q(b)})").fetchall()[0][0]
+    cols = "user_id,day,sessions,events,revenue_cents,top_category" if t=="user_daily" else "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions"
+    q=lambda x: f"select {cols} from read_parquet('/tmp/out_{ds}_{x}/{t}/*.parquet')"
+    try:
+        n1=duckdb.sql(f"select count(*) from ({q(a)} except all {q(b)})").fetchall()[0][0]
+        n2=duckdb.sql(f"select count(*) from ({q(b)} except all {q(a)})").fetchall()[0][0]
+        c=duckdb.sql(f"select count(*) from ({q(b)})").fetchall()[0][0]
+    except Exception as e:
+        print("  ERR",b,t,str(e)[:200]); ok=False; continue
     ok = ok and n1==0 and n2==0
-    print(f"  {b} {t}: rows {c}, diff {n1}/{n2}")
-print(f"  {b}: {'SAME' if ok else 'DIFFERENT'} as {a}")
+    print(f"  {ds} {b} {t}: rows {c}, diff {n1}/{n2}")
+print(f"EQ {ds} {b}: {'SAME' if ok else 'DIFFERENT'} as {a}")
 PY
+ done
 done

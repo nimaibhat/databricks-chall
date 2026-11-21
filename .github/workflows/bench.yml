@@ -6,33 +6,39 @@ on:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: machine
         run: |
-          lscpu | head -20; nproc; free -g
+          lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|L1d|L2|L3"; free -g | head -2
           cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
-          df -hT . /tmp; uname -a; docker version --format '{{.Server.Version}}'
+          df -hT . | tail -1; uname -r
       - name: generator
         run: |
+          source bench/config.env
           mkdir -p ~/gen && cd ~/gen
           curl -sSfL -o generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
           unzip -q generator.zip
           d=$(dirname $(find . -name Cargo.toml | head -1)); cd $d && cargo build --release -q
-          time ./target/release/generate --seed 7 --events ${EVENTS:-20000000} --clicks ${CLICKS:-5000000} --output ~/data
-          du -sh ~/data
-      - name: x86 gate tests
+          [ "${R20:-0}" -gt 0 ] && ./target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output ~/d20
+          [ "${R60:-0}" -gt 0 ] && ./target/release/generate --seed 11 --events 60000000 --clicks 15000000 --output ~/d60
+          du -sh ~/d20 ~/d60 2>/dev/null || true
+      - name: tests
         run: |
           git fetch -q origin "refs/heads/gate-*:refs/remotes/origin/gate-*" || true
-          ref=$(grep -v '^#' bench/variants.txt | tail -1 | cut -d'|' -f2)
-          rm -rf /tmp/t && git worktree add -f /tmp/t "$ref" -q && cd /tmp/t
-          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release 2>&1 | grep -E "^test |test result"
+          source bench/config.env
+          [ -z "${TEST_REF:-}" ] && exit 0
+          rm -rf /tmp/t && git worktree add -f /tmp/t "$TEST_REF" -q && cd /tmp/t
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release 2>&1 | grep -E "^test |test result|FAILED|panicked"
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q 2>&1 | tail -1
+          pip install -q polars pyarrow >/dev/null 2>&1
+          python3 scripts/run_fixtures.py fixtures -- ./target/release/sessions 2>&1 | tail -1 | sed 's/^/X86FIX /'
       - name: bench
-        run: |
-          git fetch -q origin "refs/heads/gate-*:refs/remotes/origin/gate-*" || true
-          bash bench/gha_bench.sh
-      - name: scenarios
-        run: bash bench/scen.sh
+        run: bash bench/gha_bench.sh
+      - name: perf
+        run: bash bench/perf.sh
+      - name: extra
+        run: bash bench/extra.sh

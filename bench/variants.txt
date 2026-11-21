@@ -1,2 +1,7 @@
 # label|ref|build-args|env
 main|main||
+micah|ext:micah-andelman/shopping-sessions||
+vibhor|ext:Vibhor7-7/shopping-sessions||
+cheryl|ext:cherylaurelia/builders-hackathon||
+skp|ext:explorer-skp/buildathon-shopping-sessions||
+theron|ext:Th3r0n/shopping-sessions||
