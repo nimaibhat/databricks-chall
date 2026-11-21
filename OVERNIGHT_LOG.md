@@ -50,6 +50,18 @@ Experiment 14 (research row 1, 14.1): which part of experiment 9 costs time on l
 
 Result: the research reading is right, it is the bucket size alone. Bucket 2^14 saves about 3.5 ms of ev3a at 20M and costs nothing in parse there; at 30M it costs parse 9 and saves ev3a 5.5 (net +4.6 at the minimum, level at the median); at 40M parse +21, ev3a -6 (net +15). The crossover is near 25M events. Chunk and prefetch are neutral to slightly good at every size. Main stays on 801982c (best at 20M, the reported size); `safe-constants` is the pick if the hidden set is thought to be 30M or more. The host is noisy today (maxima to 254), so the 20M minimums carry the comparison.
 
+Experiment 15: upstream pipeline. `jason-scheffel/express-lane` has three pipeline commits after the one this tree was taken from (15ee5c1 "cut memory use, input release and work per event", b7be207 "cut work per click line", f122b64 "fall back on a fault signal"); its newest commit d7ebc13 is a probe harness and was not taken. `src/` is now f122b64's `src/` (commit 1da4866; note 0be66c0 before it is incomplete, it lacks `parse.rs` and `k_free.rs`, do not use it). Upstream has bucket 2^15, chunk 8192 KiB, prefetch 1024. Gate clean: 36/36, dev and seed 20 match.
+
+| Set | cand 801982c | up (f122b64) | ups (up + 64 MiB chunk + prefetch 512) | upb (ups + bucket 2^14) |
+|---|---|---|---|---|
+| 20M seed 20 | 212.8 / 215.1 | 202.7 / 204.3; again 201.9 / 204.8 | 200.7 / 204.2 | 207.2 / 209.5 |
+| 20M seed 7 | 212.6 / 217.9 | 204.6 / 208.5; again 205.5 / 208.6 | 203.6 / 207.5 | 210.5 / 213.9 |
+| 30M seed 6 | 319.5 / 323.7 | 305.9 / 309.2; again 305.2 / 309.6 | 306.1 / 309.4 | 309.3 / 315.2 |
+
+Stage minimums at 20M seed 20, cand against up: parse 162.3 to 155.2, ev3a 33.1 to 33.9, write 9.9 to 7.3. Kept: about 10 ms (4.7%) at 20M, 13 ms at 30M.
+
+On the new parser the smaller bucket is a loss even at 20M (parse +8, ev3a -3.5), so it is dropped. Chunk and prefetch are worth 1.2 to 1.9 ms at the 20M minimum and nothing at 30M: under the usual bar, kept because the sign matches experiments 9 and 14 on both seeds and it costs nothing at larger sizes (commit a77c66d; gate clean, outputs equal to 941879e's at NCPU 8, 2 and 1 on seeds 7 and 3). All line numbers in the research notes are stale after this change.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
