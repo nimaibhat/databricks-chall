@@ -859,6 +859,11 @@ Opened by a research agent (kernel `master`, not the 7.0 tag the scorer is repor
 - **Mitigations other than fewer bytes do not help.** Background writeback will not start by itself within a run of a few seconds (30 s expiry, 5 s flusher interval); `sync_file_range` only pays if something later waits; `posix_fadvise(DONTNEED)` does not drop dirty pages ([sync_file_range(2)](https://man7.org/linux/man-pages/man2/sync_file_range.2.html), [posix_fadvise(2)](https://man7.org/linux/man-pages/man2/posix_fadvise.2.html)).
 - **Net.** On an ext4 bind mount with an empty directory, the sources give no reason for output bytes to cost time after exit, which fits Vibhor7-7's 35 ms for 222 MB. TejasviniChawla's +0.15 s is most likely one of the three conditional cases. The measurement in 20.1 is still the way to know for the runner; for the scorer only a submission can tell.
 
+### 20.6 The x86 bench already avoids the pitfall, and already holds the answer to 20.1
+
+- Read from `origin/bench:bench/gha_bench.sh` and `bench/overhead.sh` (not run): every timed `docker run` gets a fresh `mktemp -d` bind-mounted as `/output`, so the ext4 truncate-flush of 20.5 cannot occur there. `overhead.sh` also times an empty container (the binary exits at once on a missing manifest).
+- So the test in 20.1 needs no new experiment on that runner, only arithmetic on numbers the bench already prints: for one build, `wall - "done" stamp - empty-container wall` is everything paid after the last phase (process exit, output flush, teardown). In the log's first run that is about 2.32 - 2.09 - (empty wall); the log calls the whole difference "about 0.2 s" of container start and exit. If the empty container alone is about 0.2 s there, output bytes cost nothing measurable on that runner and the Parquet size work stays closed for it. The scorer may still differ.
+
 ### 20.2 Other new commits
 
 - [Vibhor7-7 `80df6c5`](https://github.com/Vibhor7-7/shopping-sessions/commit/80df6c5) (experiment 23, no number yet): `ingest_ts` validity checked with ordinary compare-and-branch instead of a folded flag, because unlike `ts` its form is always F1 and the branches predict; its whole seconds come straight from the parse "instead of from multiplying by 1000 and dividing again". This repo already keeps ingest in seconds (`parse_ingest_s`).
