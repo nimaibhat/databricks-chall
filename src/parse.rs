@@ -225,7 +225,8 @@ pub struct Mapped {
 }
 
 /// I/O strategy, from env IOMODE: 0 none, 1 whole-file WILLNEED at open,
-/// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread.
+/// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread
+/// of a mapped file, 5 pread only (events and clicks are never mapped).
 pub fn io_mode() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
@@ -337,6 +338,120 @@ pub fn background_readahead(ms: &[&Mapped]) {
         });
     }
     let _ = ms;
+}
+
+/// Input files read with `pread`, never mapped (IOMODE=5).
+pub struct Inputs {
+    pub files: Vec<File>,
+    pub sizes: Vec<usize>,
+}
+
+impl Inputs {
+    pub fn open(paths: &[PathBuf]) -> Inputs {
+        let mut files = Vec::new();
+        let mut sizes = Vec::new();
+        for p in paths {
+            let f = File::open(p).expect("open");
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+            if len == 0 {
+                continue;
+            }
+            files.push(f);
+            sizes.push(len);
+        }
+        Inputs { files, sizes }
+    }
+    pub fn bytes(&self) -> usize {
+        self.sizes.iter().sum()
+    }
+    /// Cuts every file into ranges of `target` bytes. A range owns the lines
+    /// whose first byte lies in it (the header line is owned by nobody).
+    pub fn chunks(&self, kind: u8, target: usize, out: &mut Vec<Chunk>) {
+        for (fi, &size) in self.sizes.iter().enumerate() {
+            let mut s = 0;
+            while s < size {
+                let e = (s + target).min(size);
+                out.push(Chunk { kind, file: fi as u32, start: s, end: e });
+                s = e;
+            }
+        }
+    }
+    /// Appends file bytes [from + buf.len(), upto) to `buf`.
+    fn fill(&self, file: usize, from: usize, upto: usize, buf: &mut Vec<u8>) {
+        use std::os::unix::fs::FileExt;
+        let have = buf.len();
+        let want = upto - from;
+        if want <= have {
+            return;
+        }
+        buf.reserve(want - have);
+        unsafe { buf.set_len(want) };
+        let mut got = have;
+        while got < want {
+            let r = self.files[file].read_at(&mut buf[got..want], (from + got) as u64).expect("pread");
+            if r == 0 {
+                break; // the file shrank: treat the rest as absent
+            }
+            got += r;
+        }
+        buf.truncate(got);
+    }
+    /// Reads the lines a range owns into `buf`; returns (data, start, end)
+    /// for `scan_lines`. A few bytes before the first line are kept so that
+    /// backward word loads stay inside the buffer.
+    pub fn read<'a>(&self, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8], usize, usize) {
+        const PRE: usize = 16;
+        const STEP: usize = 64 << 10;
+        let file = c.file as usize;
+        let size = self.sizes[file];
+        let rs = c.start.saturating_sub(PRE);
+        let mut re = (c.end + 512).min(size);
+        buf.clear();
+        self.fill(file, rs, re, buf);
+        // first newline at or after buffer offset `from`, reading on as needed
+        let mut newline_from = |buf: &mut Vec<u8>, mut from: usize| -> Option<usize> {
+            loop {
+                if let Some(p) = memchr::memchr(b'\n', &buf[from.min(buf.len())..]) {
+                    return Some(from.min(buf.len()) + p);
+                }
+                if re >= size || buf.len() < re - rs {
+                    return None;
+                }
+                from = buf.len();
+                re = (re + STEP).min(size);
+                self.fill(file, rs, re, buf);
+            }
+        };
+        // where the first owned line starts
+        let s = if c.start == 0 {
+            match newline_from(buf, 0) {
+                Some(p) => p + 1, // after the header
+                None => return (&buf[..], 0, 0),
+            }
+        } else if buf.get(c.start - 1 - rs) == Some(&b'\n') {
+            c.start - rs
+        } else {
+            match newline_from(buf, c.start - rs) {
+                Some(p) => p + 1,
+                None => return (&buf[..], 0, 0),
+            }
+        };
+        // where the first line owned by the next range starts
+        let e = if c.end >= size {
+            buf.len()
+        } else if buf.get(c.end - 1 - rs) == Some(&b'\n') {
+            c.end - rs
+        } else {
+            match newline_from(buf, c.end - rs) {
+                Some(p) => p + 1,
+                None => buf.len(),
+            }
+        };
+        if s >= e {
+            return (&buf[..], 0, 0);
+        }
+        (&buf[..], s, e)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -738,6 +853,75 @@ mod tests {
                 check::<3>(&d);
             }
         }
+    }
+    /// Reading a file in byte ranges with `Inputs` yields exactly the lines
+    /// after the header, once each, whatever the range size.
+    #[test]
+    fn pread_ranges_match_whole_file() {
+        let mut rnd = xs(0xFACE);
+        let dir = std::env::temp_dir().join(format!("ss_pread_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for case in 0..300 {
+            let mut d = Vec::new();
+            let nlines = rnd(40);
+            for li in 0..=nlines {
+                // line 0 is the header; some lines are long, some empty
+                let len = match rnd(8) {
+                    0 => 0,
+                    1 => 200 + rnd(3000),
+                    _ => rnd(60),
+                };
+                for _ in 0..len {
+                    d.push(b"abc,\"1 "[rnd(7) as usize]);
+                }
+                if li < nlines || rnd(2) == 0 {
+                    d.push(b'\n');
+                }
+            }
+            let path = dir.join(format!("f{case}.csv"));
+            std::fs::write(&path, &d).unwrap();
+            let want: Vec<Vec<u8>> = {
+                let mut v = Vec::new();
+                let mut first = true;
+                let mut start = 0;
+                let mut push = |l: &[u8]| {
+                    if first {
+                        first = false;
+                    } else {
+                        v.push(l.to_vec());
+                    }
+                };
+                for nl in memchr::memchr_iter(b'\n', &d) {
+                    push(&d[start..nl]);
+                    start = nl + 1;
+                }
+                if start < d.len() {
+                    push(&d[start..]);
+                }
+                v
+            };
+            let inp = Inputs::open(&[path.clone()]);
+            for target in [1usize, 2, 3, 7, 16, 17, 64, 100, 1000, 5000, 1 << 20] {
+                let mut chunks = Vec::new();
+                inp.chunks(0, target, &mut chunks);
+                let mut got: Vec<Vec<u8>> = Vec::new();
+                let mut buf = Vec::new();
+                for c in &chunks {
+                    let (data, s, e) = inp.read(c, &mut buf);
+                    let mut start = s;
+                    for nl in memchr::memchr_iter(b'\n', &data[s..e]) {
+                        got.push(data[start..s + nl].to_vec());
+                        start = s + nl + 1;
+                    }
+                    if start < e {
+                        got.push(data[start..e].to_vec());
+                    }
+                }
+                assert_eq!(got, want, "case {case} target {target} file {:?}", String::from_utf8_lossy(&d));
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+        let _ = std::fs::remove_dir(&dir);
     }
     /// A scan of a sub-range must not look at bytes outside it, wherever the
     /// range starts and ends relative to the 64-byte blocks and the buffer end.

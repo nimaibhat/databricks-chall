@@ -388,11 +388,16 @@ fn main() {
     let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1).max(1) as usize;
 
     // map the inputs early so the arena can be sized
-    let ev_m = Mapped::open(&list_csv(&data.join("events")));
-    let cl_m = Mapped::open(&list_csv(&data.join("clicks")));
+    let io5 = io_mode() == 5; // pread only: events and clicks are never mapped
+    let ev_paths = list_csv(&data.join("events"));
+    let cl_paths = list_csv(&data.join("clicks"));
+    let ev_in = Inputs::open(if io5 { &ev_paths } else { &[] });
+    let cl_in = Inputs::open(if io5 { &cl_paths } else { &[] });
+    let ev_m = Mapped::open(if io5 { &[] } else { &ev_paths });
+    let cl_m = Mapped::open(if io5 { &[] } else { &cl_paths });
     background_readahead(&[&ev_m, &cl_m]);
-    let ev_bytes: usize = ev_m.maps.iter().map(|m| m.len()).sum();
-    let cl_bytes: usize = cl_m.maps.iter().map(|m| m.len()).sum();
+    let ev_bytes: usize = ev_m.maps.iter().map(|m| m.len()).sum::<usize>() + ev_in.bytes();
+    let cl_bytes: usize = cl_m.maps.iter().map(|m| m.len()).sum::<usize>() + cl_in.bytes();
     // Records are never larger than twice the input (a valid event line of
     // >= 35 bytes makes 32 bytes, an invalid one of >= 8 bytes makes 16, a
     // valid click line of >= 20 bytes makes 32), plus one partial block per
@@ -431,9 +436,20 @@ fn main() {
     let t_parse = Instant::now();
     let mut chunks = Vec::new();
     // chunk size: 4 MiB for mapped input; a pread buffer should stay in L2
-    let chunk_kb: usize = env("CHUNKKB", if io_mode() == 4 { "256" } else { "4096" }).parse().unwrap_or(4096);
-    chunks_of(0, &ev_m, chunk_kb << 10, &mut chunks);
-    chunks_of(1, &cl_m, chunk_kb << 10, &mut chunks);
+    let chunk_kb: usize = env("CHUNKKB", match io_mode() {
+        4 => "256",
+        5 => "512",
+        _ => "4096",
+    })
+    .parse()
+    .unwrap_or(4096);
+    if io5 {
+        ev_in.chunks(0, chunk_kb << 10, &mut chunks);
+        cl_in.chunks(1, chunk_kb << 10, &mut chunks);
+    } else {
+        chunks_of(0, &ev_m, chunk_kb << 10, &mut chunks);
+        chunks_of(1, &cl_m, chunk_kb << 10, &mut chunks);
+    }
     let blocks = PerThread::new(threads, || Blocks::new(&arena));
     let ebl = PerThread::new(threads, || Scatter::<DRec>::new(1usize << p1_bits()));
     let sbl = PerThread::new(threads, || Scatter::<SRec>::new(1usize << p2_bits()));
@@ -444,16 +460,20 @@ fn main() {
         let buf = unsafe { iobufs.get(t) };
         let bs = unsafe { blocks.get(t) };
         if c.kind == 0 {
-            let (d, s, e) = chunk_data(&ev_m, c.file as usize, c.start, c.end, buf);
+            let (d, s, e) = if io5 { ev_in.read(&c, buf) } else { chunk_data(&ev_m, c.file as usize, c.start, c.end, buf) };
             parse_events(&ctx, d, s, e, unsafe { ebl.get(t) }, unsafe { sbl.get(t) }, bs, abase);
-            chunk_done(&ev_m, c.file as usize, c.start, c.end);
+            if !io5 {
+                chunk_done(&ev_m, c.file as usize, c.start, c.end);
+            }
         } else {
             if diag_stage() != 0 {
                 return;
             }
-            let (d, s, e) = chunk_data(&cl_m, c.file as usize, c.start, c.end, buf);
+            let (d, s, e) = if io5 { cl_in.read(&c, buf) } else { chunk_data(&cl_m, c.file as usize, c.start, c.end, buf) };
             parse_clicks(&ctx, d, s, e, unsafe { cbl.get(t) }, bs);
-            chunk_done(&cl_m, c.file as usize, c.start, c.end);
+            if !io5 {
+                chunk_done(&cl_m, c.file as usize, c.start, c.end);
+            }
         }
     });
     std::mem::forget(iobufs);
