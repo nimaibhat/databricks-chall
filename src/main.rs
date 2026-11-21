@@ -146,11 +146,11 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
     let m = Mapped::open(&paths);
     let mut chunks = Vec::new();
     chunks_of(0, &m, 1 << 20, &mut chunks);
-    const SHARD_BITS: u32 = P2_BITS;
-    const SHARDS: usize = 1 << SHARD_BITS;
-    let shift = 64 - SHARD_BITS;
+    let shard_bits: u32 = p2_bits();
+    let shards: usize = 1 << shard_bits;
+    let shift = 64 - shard_bits;
     let pairs = PerThread::new(threads, Vec::<(Key, Key)>::new);
-    let skeys = PerThread::new(threads, || vec![Vec::<Key>::new(); SHARDS]);
+    let skeys = PerThread::new(threads, || vec![Vec::<Key>::new(); shards]);
     par_for(chunks.len(), threads, |t, i| {
         let c = chunks[i];
         let d: &[u8] = &m.maps[c.file as usize];
@@ -177,9 +177,9 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
         return (Vec::new(), shift);
     }
     // shard maps: key -> local index (temporarily stored as the value)
-    let maps = PerThread::new(SHARDS, || KMap::<Key>::with_capacity(16));
-    let shard_keys = PerThread::new(SHARDS, Vec::<Key>::new);
-    par_for(SHARDS, threads, |_t, s| {
+    let maps = PerThread::new(shards, || KMap::<Key>::with_capacity(16));
+    let shard_keys = PerThread::new(shards, Vec::<Key>::new);
+    par_for(shards, threads, |_t, s| {
         let n: usize = skeys.iter().map(|v| v[s].len()).sum();
         let mut mp = KMap::<Key>::with_capacity(n * 3 / 4 + 16);
         let ks = unsafe { shard_keys.get(s) };
@@ -196,11 +196,11 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
     drop(skeys);
     let maps = maps.into_inner();
     let shard_keys = shard_keys.into_inner();
-    let mut offs = vec![0u32; SHARDS + 1];
-    for s in 0..SHARDS {
+    let mut offs = vec![0u32; shards + 1];
+    for s in 0..shards {
         offs[s + 1] = offs[s] + shard_keys[s].len() as u32;
     }
-    let nids = offs[SHARDS] as usize;
+    let nids = offs[shards] as usize;
     let gidx = |k: Key| -> u32 {
         let h = hk(k);
         let s = (h >> shift) as usize;
@@ -242,7 +242,7 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
         }
     }
     let mut all_keys: Vec<Key> = Vec::with_capacity(nids);
-    for s in 0..SHARDS {
+    for s in 0..shards {
         all_keys.extend_from_slice(&shard_keys[s]);
     }
     let mut name: Vec<Key> = vec![EMPTY; nids];
@@ -256,7 +256,7 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
     }
     let uf_time = t_uf.elapsed();
     let maps_pt = PerThread::from_vec(maps);
-    par_for(SHARDS, threads, |_t, s| {
+    par_for(shards, threads, |_t, s| {
         let mp: &mut KMap<Key> = unsafe { maps_pt.get(s) };
         let off = offs[s] as usize;
         for slot in mp.slots.iter_mut() {
@@ -300,12 +300,17 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     parse_ts(rest[..q2].as_bytes()).expect("manifest ts")
 }
 
-const P1_BITS: u32 = 9;
-const P1: usize = 1 << P1_BITS;
-const P1_SHIFT: u32 = 64 - P1_BITS;
-const P2_BITS: u32 = 9;
-const P2: usize = 1 << P2_BITS;
-const P2_SHIFT: u32 = 64 - P2_BITS;
+// Partition counts (bits), from env P1BITS / P2BITS, set once at start.
+static P1_BITS_V: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(9);
+static P2_BITS_V: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(9);
+#[inline(always)]
+fn p1_bits() -> u32 {
+    P1_BITS_V.load(Ordering::Relaxed)
+}
+#[inline(always)]
+fn p2_bits() -> u32 {
+    P2_BITS_V.load(Ordering::Relaxed)
+}
 const LAG: usize = 16;
 
 /// [thread][partition] -> [partition][thread]
@@ -331,6 +336,8 @@ fn main() {
     };
 
     // ---- phase 0
+    P1_BITS_V.store(env("P1BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
+    P2_BITS_V.store(env("P2BITS", "9").parse().unwrap_or(9), Ordering::Relaxed);
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
@@ -372,7 +379,7 @@ fn main() {
     let ev_bytes: usize = ev_m.maps.iter().map(|m| m.len()).sum();
     let cl_bytes: usize = cl_m.maps.iter().map(|m| m.len()).sum();
     // ERec 32 B per ~78 B line, CRec 32 B per ~45 B line, plus partial blocks
-    let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + (P1 + 2 * P2) * threads * BLK * 2 + (256 << 20);
+    let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * BLK * 2 + (256 << 20);
     let arena = Arena::new(est * 3 / 2);
 
     // ---- phase 1
@@ -404,8 +411,8 @@ fn main() {
     chunks_of(0, &ev_m, 4 << 20, &mut chunks);
     chunks_of(1, &cl_m, 4 << 20, &mut chunks);
     let blocks = PerThread::new(threads, || Blocks::new(&arena));
-    let ebl = PerThread::new(threads, || (0..P1).map(|_| BList::<ERec>::new()).collect::<Vec<_>>());
-    let cbl = PerThread::new(threads, || (0..P2).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
+    let ebl = PerThread::new(threads, || (0..(1usize << p1_bits())).map(|_| BList::<ERec>::new()).collect::<Vec<_>>());
+    let cbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
     let iobufs = PerThread::new(threads, Vec::<u8>::new);
     par_for(chunks.len(), threads, |t, i| {
         let c = chunks[i];
@@ -422,30 +429,30 @@ fn main() {
         }
     });
     std::mem::forget(iobufs);
-    let eparts = PerThread::from_vec(transpose(ebl.into_inner(), P1));
-    let cparts = transpose(cbl.into_inner(), P2);
+    let eparts = PerThread::from_vec(transpose(ebl.into_inner(), 1usize << p1_bits()));
+    let cparts = transpose(cbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
 
     // ---- phase 3: dedup per eid partition, survivors partitioned by person
-    let sbl = PerThread::new(threads, || (0..P2).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
+    let sbl = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
     let dscr = PerThread::new(threads, || (KMap::<u64>::with_capacity(16), Vec::<u64>::new()));
-    par_for(P1, threads, |t, p| {
+    par_for(1usize << p1_bits(), threads, |t, p| {
         let lists = unsafe { eparts.get(p) };
         let (mp, dead) = unsafe { dscr.get(t) };
         let bs = unsafe { blocks.get(t) };
         let sb = unsafe { sbl.get(t) };
         dedup_partition(lists, mp, dead, sb, bs);
     });
-    let sparts = transpose(sbl.into_inner(), P2);
+    let sparts = transpose(sbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
 
     // ---- phase 3b: user -> person, per user-hash partition
     let sparts = PerThread::from_vec(sparts);
     let cparts = PerThread::from_vec(cparts);
-    let smv = PerThread::new(threads, || (0..P2).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
-    let cmv = PerThread::new(threads, || (0..P2).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
+    let smv = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
+    let cmv = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
     if !ctx.links.is_empty() {
-        par_for(P2, threads, |t, p| {
+        par_for(1usize << p2_bits(), threads, |t, p| {
             let bs = unsafe { blocks.get(t) };
             let map = Some(&ctx.links[p]);
             resolve_partition(p, map, unsafe { sparts.get(p) }, |r: &mut SRec| &mut r.person, unsafe { smv.get(t) }, bs);
@@ -454,10 +461,10 @@ fn main() {
     }
     let mut sparts = sparts.into_inner();
     let mut cparts = cparts.into_inner();
-    for (p, v) in transpose(smv.into_inner(), P2).into_iter().enumerate() {
+    for (p, v) in transpose(smv.into_inner(), 1usize << p2_bits()).into_iter().enumerate() {
         sparts[p].extend(v.into_iter().filter(|l| l.len > 0));
     }
-    for (p, v) in transpose(cmv.into_inner(), P2).into_iter().enumerate() {
+    for (p, v) in transpose(cmv.into_inner(), 1usize << p2_bits()).into_iter().enumerate() {
         cparts[p].extend(v.into_iter().filter(|l| l.len > 0));
     }
     eprintln!("phase3b resolve {:?} {}", t_start.elapsed(), cpu());
@@ -468,7 +475,7 @@ fn main() {
     let acc = PerThread::new(threads, || out::Acc::new(ncamp + 1, ndays));
     let pscr = PerThread::new(threads, Scratch::default);
     let ptimes = std::sync::Mutex::new(Vec::new());
-    par_for(P2, threads, |t, p| {
+    par_for(1usize << p2_bits(), threads, |t, p| {
         let a = unsafe { acc.get(t) };
         let sc = unsafe { pscr.get(t) };
         let t0 = Instant::now();
@@ -559,7 +566,7 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, cl_m: &Mapped, arena: &Arena) {
     let nslots: usize = ctx.links.iter().map(|m| m.slots.len()).sum();
     eprintln!("  stats: events {tot}, uid in links {inl}, remapped {remap}, link slots {nslots}");
     let mut bs = Blocks::new(arena);
-    let mut eb: Vec<BList<ERec>> = (0..P1).map(|_| BList::new()).collect();
+    let mut eb: Vec<BList<ERec>> = (0..(1usize << p1_bits())).map(|_| BList::new()).collect();
     let t = Instant::now();
     for c in ch {
         parse_events(ctx, &ev_m.maps[c.file as usize], c.start, c.end, &mut eb, &mut bs);
@@ -577,7 +584,7 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, cl_m: &Mapped, arena: &Arena) {
         scan_lines::<4>(&cl_m.maps[c.file as usize], c.start, c.end, |f| acc = acc.wrapping_add(f[3].len() as u64));
     }
     eprintln!("  cl scan    {:.1} ns/line", t.elapsed().as_nanos() as f64 / cl_lines as f64);
-    let mut cb: Vec<BList<CRec>> = (0..P2).map(|_| BList::new()).collect();
+    let mut cb: Vec<BList<CRec>> = (0..(1usize << p2_bits())).map(|_| BList::new()).collect();
     let t = Instant::now();
     for c in cch {
         parse_clicks(ctx, &cl_m.maps[c.file as usize], c.start, c.end, &mut cb, &mut bs);
@@ -623,7 +630,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             r.person = pack_fast(f[1], ceil);
             r.pc = (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown);
         }
-        unsafe { eb.get_unchecked_mut((hk(eid) >> P1_SHIFT) as usize) }.push(r, bs);
+        unsafe { eb.get_unchecked_mut((hk(eid) >> (64 - p1_bits())) as usize) }.push(r, bs);
     });
 }
 
@@ -644,7 +651,7 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
         let Some(camp) = ctx.campaigns.get(f[2], floor) else { return };
         let u = pack_fast(f[1], ceil);
         let r = CRec { person: u, cid: pack_fast(f[0], ceil), ts, camp };
-        unsafe { cb.get_unchecked_mut((hk(u) >> P2_SHIFT) as usize) }.push(r, bs);
+        unsafe { cb.get_unchecked_mut((hk(u) >> (64 - p2_bits())) as usize) }.push(r, bs);
     });
 }
 
@@ -668,7 +675,7 @@ fn resolve_partition<T: Copy>(
             let u = *k;
             if let Some(v) = map.get(u) {
                 *k = v;
-                let q = (hk(v) >> P2_SHIFT) as usize;
+                let q = (hk(v) >> (64 - p2_bits())) as usize;
                 if q != p {
                     unsafe { mv.get_unchecked_mut(q) }.push(*r, bs);
                     return false;
@@ -723,7 +730,7 @@ fn dedup_partition(
         l.for_each_slice(|sl| {
             for r in sl {
                 if r.pc != INVALID && dead[(i / 64) as usize] & (1 << (i % 64)) == 0 {
-                    unsafe { sb.get_unchecked_mut((hk(r.person) >> P2_SHIFT) as usize) }
+                    unsafe { sb.get_unchecked_mut((hk(r.person) >> (64 - p2_bits())) as usize) }
                         .push(SRec { person: r.person, ts: r.ts, pc: r.pc }, bs);
                 }
                 i += 1;
