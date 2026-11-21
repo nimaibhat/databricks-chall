@@ -1,6 +1,6 @@
 # OVERNIGHT_LOG.md
 
-**SUBMIT THIS: `bae2b62`** (adds the reworked scanner: masks at each line start, pext/pdep field split). x86 runner, full `docker run` wall, median of 9 (20M) and 7 (60M), EPYC 7763 4 vCPU, caches dropped before each dataset, same run: 20M 1.506 s against 1.586 s for the previous pick `fc2fb77`; 60M 4.151 s against 4.373 s (-5.0%, -5.1%). On a fast runner (EPYC 9V45) the previous pick took 1.072 s at 20M where the fastest public build took 0.902 s. Passed the full gate on arm64 and on the x86-64-v3 build, in both I/O modes and with 1 KiB read ranges (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets; output files read identically with polars, pyarrow, duckdb and fastparquet.
+**SUBMIT THIS: `b2fa94d`** (adds the one-multiply hash, pext ID packing and the links prefetch). x86 runner, full `docker run` wall, median of 9 (20M) and 7 (60M), Xeon 6975P-C 4 vCPU, caches dropped before each dataset, same run: 20M 1.244 s against 1.302 s for the previous pick; 60M 3.456 s against 3.588 s (-4.5%, -3.7%). Against the fastest public build the last same-run comparison (EPYC 7763, one pick ago) was 1.519 / 4.179 s against 1.273 / 3.508 s: about 1.19 times its time, now a few percent closer. Passed the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens); 16 unit and fuzz tests and the fixtures pass on the x86 runner; outputs equal there on both datasets; output files read identically with polars, pyarrow, duckdb and fastparquet.
 
 **If you would rather not rely on dictionary-encoded Parquet with an unknown scorer reader, submit `0f7f014` instead** (PLAIN pages, INT32 counts, without tonight's last two speedups: 1.725 / 5.038 s on an EPYC 7763 run where the dictionary build took 1.699 / 4.795 s). Dictionary pages are what pyarrow, Spark, polars and duckdb write by default, so the risk is small, but it is the one change tonight that alters the file format rather than the speed of producing it.
 
@@ -58,6 +58,9 @@ From experiment 27 on, the bench drops the page cache before each dataset: with 
 | 25 | `fc2fb77` | Parquet: `revenue_cents` as a dictionary column when smaller (output 35 -> 22 MB, 101 -> 63 MB) | 1.847 / 1.794 (Xeon 8573C; ranges 1.833-1.881 / 1.784-1.806; post-exit 0.204 -> 0.149) | run unusable (input read from disk); post-exit 0.576 -> 0.360 | out 0.015 / 0.018 | kept (-2.9% at 20M) |
 | 26 | `026b2fb` | Scanner field split by pext/pdep on x86 (RESEARCH_NOTES 34.4 stage A) | 1.585 / 1.585 (7763); 1.072 / 1.062 (9V45) | 4.739 / 4.686 (run with a polluted cache) | unchanged (x86 only) | neutral alone; kept as part of #27 |
 | 27 | `bae2b62` | Scanner: masks at each line start instead of stored mask streams and windows (stage B) | #26+#27 vs parent: 1.586 / 1.506 (7763, n=9; ranges 1.574-1.701 / 1.495-1.741) | 4.373 / 4.151 (n=7; 4.352-4.488 / 4.146-4.436) | 1.898 / 1.930 at one thread (NEON masks cost more) | kept (-5.0%, -5.1%; parse -8%) |
+| 28 | `75d054d` | Links: lookahead prefetch in pair translation and union-find | 1.520 / 1.519 (7763); 1.302 / 1.296 (6975P) | 4.220 / 4.179 ; 3.588 / 3.565 | links 0.041 / 0.039 | kept on the phase time (links -10% at 20M, -12% at 60M); wall -0.5% to -1.0% |
+| 29 | same image | Fewer partitions: `P1BITS/P2BITS` 8/8, 8/9, 9/8 against 9/9 | 1.519 / 1.538 / 1.531 / 1.516 | 4.179 / 4.256 / 4.213 / 4.274 | | rejected: parse unchanged, dedup and sessions slower |
+| 30 | `b2fa94d` | One-multiply hash; pext for the 6-bit squeeze in ID packing | 1.296 / 1.244 (6975P, n=9; ranges 1.290-1.316 / 1.218-1.260) | 3.565 / 3.456 (n=7; 3.537-3.587 / 3.375-3.475) | 0.460 / 0.456 | kept (-4.0%, -3.1%) |
 
 ## Current phase profile (`a88caa3`)
 
@@ -90,9 +93,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Links phase: lookahead prefetch in the pair translation and the serial union-find (built, gated); links are 8% of in-process time at 20M and 10% at 60M.
-2. The two scatter pushes still cost about 9 and 6 ns per event line on Zen 4 (stage timing): sweep the partition counts downward (8/8, 8/9 bits; cherylaurelia uses 2^8 at 20M), then prefetch the stage line when the partition is known.
-3. Scanner stage C (hand the callback packed offsets instead of a slice array), guided by the cachegrind line table.
+1. Smaller per-partition tables (the person table was sized for a quarter of the events, 512 KB, for about 2,000 people) and a fields array that never escapes (so it can stay in registers): both built and gated, x86 A/B next.
+2. Profile-guided optimisation as the last step, once the source settles (a competitor measured -2.7% / -4.1%): generate the profile in the Dockerfile's own toolchain image on the x86 runner, commit the merged profile, use it only if the file is present.
+3. Sessions phase without the per-person sort (half-hour bins), and a second look at the scatter pushes (about 9 and 6 ns per event on Zen 4 regardless of the partition count).
 
 ## Setup notes
 
