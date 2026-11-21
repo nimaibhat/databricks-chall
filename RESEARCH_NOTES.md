@@ -1755,6 +1755,17 @@ The user asked whether a jump to the board's top is findable (board at 06:54: 0.
 - **The step that would settle it** is a run on the scorer's machine type: a Google Cloud `n2-standard-8` (Cascade Lake, 8 vCPU) with `/data` on tmpfs, `docker run --cpus 8`, ours against Js-Hwang1 and Vibhor7-7, plus our switches (`IOMODE`, thread count, partition bits, pre-fault). It costs well under a dollar an hour and is the only measurement that can find a 20 to 30% effect; the GitHub runners cannot. This needs the user's cloud account.
 - Until that exists, the board itself is the only Cascade Lake measurement, at 2 submissions an hour and about 20% noise between machines: too coarse to tune with.
 
+## Iteration 48 (2026-11-21, 07:50): what the closest public entry does differently
+
+[Js-Hwang1/buildathon_databricks](https://github.com/Js-Hwang1/buildathon_databricks) at `73a09cc` (C++20, within 3% of ours at 20M and 1% at 60M on Zen 5, iteration 47). Read: its README and commit log only; no numbers of its own are published beyond "0.75-second revision" for an earlier Rust base. `OVERNIGHT_LOG.md` has no experiment after 60; the pick is still `73f8661`.
+
+- **Per-vendor code paths.** Commits `606c170` ("Select measured column parsing on Intel and keep scalar projection on AMD"), `f1e2004` (four AVX2 lanes), `b488fa1` (eight spans on AVX-512BW) and a launcher that picks `generic`, `avx2`, `avx512` or `vbmi2` at start. Their measurements made them choose a different parser on Intel than on AMD. Ours has one parser, tuned on AMD runners, and one Intel-only switch (the arena pre-fault). This supports 47.2: the scorer-side loss is likely in code that behaves differently on Intel, and it cannot be found on the runners we have.
+- **12-byte event records with purchases in a separate sparse stream** (`4fd8d7a`, `c270a39`: 32-bit event times sorted, purchases carried per identity on the side). Only 3% of events are purchases, so price and product leave the main record. This is the optimizer's queue item "fewer bytes per record" in a concrete shape: `DRec` shrinks to person slot + 32-bit time (+ day/flags), and a purchase record goes through its own scatter. Expected: a third fewer bytes written and zeroed in the parse, which matters most where page zeroing and memory bandwidth are dearest (Intel, 8 threads on 4 cores). Risk to exactness: medium; the purchase-to-session join must be redone by time within the person (ties in `ts` between a purchase and other events are harmless because equal timestamps share a session).
+- **Unlinked users processed in their original partition** (README): only people with links move between the two grouping stages. Ours resolves the person at parse time and scatters by person, which already avoids the second move.
+- **Two-bit counters per hash prefix to prove an event ID unique** (README): the same role as our bitmap prefilter (experiment 13).
+
+Nothing here is a 30% idea on its own. The entry is level with ours on AMD, so its value is the pointer to vendor-specific tuning, which needs the Cascade Lake machine of 47.2.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
