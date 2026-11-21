@@ -1,4 +1,5 @@
 # label|ref|build-args|env
-main|origin/gate-main-c3ac57f||
-s40p|origin/gate-s40p-181698e||
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+main|origin/gate-main-31ef320||
+p2_10|origin/gate-p2_10-31ef320||P2BITS=10
+p10_10|origin/gate-p10_10-31ef320||P1BITS=10 P2BITS=10
+p2_11|origin/gate-p2_11-31ef320||P2BITS=11
