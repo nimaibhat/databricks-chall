@@ -2,7 +2,20 @@
 
 **SUBMIT THIS: `dc58e98`** (partition counts that follow the input size, and arena pre-faulting on Intel, on top of the packed-fields parser; profile regenerated). x86 runner, full `docker run` wall, median of 9 (20M) and 7 (60M), same run each. On an Ice Lake Xeon 8370C, the scorer's CPU class: 20M 1.442 s, 60M 3.934 s, against 1.461 / 4.122 s for the previous pick `4521c25` and 1.342 / 3.796 s for the fastest public build (cherylaurelia `2e4261f`): we are 7% behind it at 20M and 4% behind at 60M there. On an EPYC 7763: 1.364 / 3.663 s against 1.353 / 3.709 s for the previous pick and 1.276 / 3.479 s for that build. On Zen 4 and on a Xeon 8573C the previous pick was already ahead of it at 60M (2.976 against 3.084 s; 3.541 against 3.561 s). At the start of the night the comparison was 2.32 / 6.99 s against 1.38 / 3.82 s. Gate: the source passes the full gate on arm64 and on the x86-64-v3 build (36/36 fixtures, dev answer, 20M at 1/2/8 threads, 60M at 2/3/10 threads, both I/O modes, 1 KiB read ranges, 2048 partitions); on the x86 runner 18 unit and fuzz tests pass, and the binary inside this commit's Docker image passes 36/36 fixtures and produces outputs equal to the previous pick on the 1M (= dev), 20M and 60M sets; output files read identically with polars, pyarrow, duckdb and fastparquet.
 
-**Fallbacks, in order of caution:** `4521c25` is the previous pick (512 partitions at every size, no pre-fault). `d9e7a12` is the previous pick (same output format, 1.128 / 3.073 s on the 9V74 run). `7170d01` is the same source without the profile (0.889 / 2.420 s on the 9V45 run). If you would rather not rely on dictionary-encoded, multi-row-group Parquet with an unknown scorer reader, submit `0f7f014` instead (PLAIN pages, INT32 counts, without tonight's last two speedups: 1.725 / 5.038 s on an EPYC 7763 run where the dictionary build took 1.699 / 4.795 s). Dictionary pages are what pyarrow, Spark, polars and duckdb write by default, so the risk is small, but it is the one change tonight that alters the file format rather than the speed of producing it.
+**Fallbacks, in order of caution:** `4521c25` is one pick back (same parser and output, 512 partitions at every size, no arena pre-fault; profile matches its source). `7170d01` is the streamed-output build without any profile-guided step (the Dockerfile there has no `pgo.profdata`). If you would rather not rely on dictionary-encoded, multi-row-group Parquet with an unknown scorer reader, `0f7f014` writes PLAIN pages with one row group per file and INT32 counts (it lacks everything after experiment 15: about 15 to 20% slower than the pick). Dictionary pages are what pyarrow, Spark, polars and duckdb write by default and all four readers tried here read the files, so that risk is small, but it is the one family of changes tonight that alters the file format rather than the speed of producing it.
+
+**The night in one table** (x86 runner, 4 vCPU, `docker run` wall; each row is one same-run comparison, CPU model in brackets):
+
+| | 20M ours / fastest public build | 60M ours / fastest public build |
+|---|---|---|
+| start of the night, `1c4fa8e` (EPYC 9V74) | 2.323 / 1.378 | 6.988 / 3.824 |
+| pick `dc58e98` (Xeon 8370C, Ice Lake) | 1.442 / 1.342 | 3.934 / 3.796 |
+| pick `dc58e98` (Xeon 8573C) | 1.514 / 1.462 | 4.024 / 4.216 |
+| pick `dc58e98` (Xeon 6973P-C) | 1.270 / 1.253 | 3.329 / 3.527 |
+| previous pick `4521c25` (EPYC 9V74) | 1.090 / 1.118 | 2.976 / 3.084 |
+| pick `dc58e98` (EPYC 7763) | 1.364 / 1.276 | 3.663 / 3.479 |
+
+In-process, on the same runner, we are still 4 to 6% behind that build and about 10% behind Vibhor7-7's latest (experiment 52); the wall is level or ahead because the binary is static on an empty image and the 21 / 60 MB of output are written while the sessions are still being computed.
 
 **Why the output size matters:** after the process prints its last line, `docker run` on the runner does not return until the output files have been flushed to disk (the flush is disk-bound, about 300 MB/s on the slow-disk runners, and negligible on others or on tmpfs). With output on tmpfs the current build takes 0.927 s at 20M and 2.441 s at 60M on a runner where the fastest public build takes 0.906 / 2.458 s: in-process we are level with it. Whether the scorer's `/output` behaves like a slow disk is unknown; smaller and earlier-written output can only help.
 
@@ -109,15 +122,19 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 | Idea | Source | Expected gain | Status |
 |---|---|---|---|
 | Resolve the person at parse time (global link table + 16-line prefetch ring), scatter once by person, dedup on a narrow 16-byte side stream that tombstones losers in place; delete the resolve pass and dedup pass 2 | cherylaurelia `src/main.rs` header, Vibhor7-7 `src/pool.rs`; RESEARCH_NOTES 1.3 | 10 to 15% wall | done (experiments 2, 3): +2% alone, a win with the new scanner |
-| Write-combining stages with non-temporal stores for the scatters | Vibhor7-7 BENCH.md exp. 18 (-12% Ice Lake, -6% Zen 4); RESEARCH_NOTES 1.2, 6 | 6 to 12% on Intel | done (experiment 5): -2.4% on Zen; Intel runner not seen yet |
+| Write-combining stages with non-temporal stores for the scatters | Vibhor7-7 BENCH.md exp. 18 (-12% Ice Lake, -6% Zen 4); RESEARCH_NOTES 1.2, 6 | 6 to 12% on Intel | done (experiment 5, 5b): -2.4% on Zen, -14% for the series on Intel |
 | Line-at-a-time split from the line's own comma/quote masks; quote validity by mask arithmetic | cherylaurelia `fast_split` (ratios 0.90 to 0.95); RESEARCH_NOTES 2.1, 4.1, 10.1 | 3 to 8% | done (experiment 3) |
 | SIMD ID packing (nibble tables + multiply-add) | Muła and Lemire base64; cherylaurelia `e3bdd51`; Vibhor exp. 2 (-8.6%) | 2 to 8% | done (experiment 4): -3% |
 | Product lookup only for purchases; hoist per-line atomic loads | micah-andelman `44f244e`; RESEARCH_NOTES 1.1, 8.2 | 1 to 2% | done: -2.3% (experiment 1) |
 | Known-date table for timestamps | RESEARCH_NOTES 1.4, 15.3 | 2 to 5% of parse | done (experiment 7): -3.6% wall |
-| `pread` into an L2-sized buffer instead of mmap | Vibhor exp. 10 (mmap +7.5% on a VM); RESEARCH_NOTES 1.5, 3.2 | -7 to +7%, must be measured | queued |
-| Sort 8-byte keys per person; interval assists; 30-minute bins | RESEARCH_NOTES 7.1, 17.1, 1.6 | 2 to 4% | keys and assists done (experiment 9): -2.1%; bins not tried |
-| INT32 counts, reserved buffers in the Parquet writer | RESEARCH_NOTES 5 | 1 to 2% | queued |
-| Catalog load on a side thread; links tail concurrent with parse | RESEARCH_NOTES 8.1, 1.10 | 1 to 3% | queued |
+| `pread` into an L2-sized buffer instead of mmap | Vibhor exp. 10 (mmap +7.5% on a VM); RESEARCH_NOTES 1.5, 3.2, 21 | -7 to +7%, must be measured | done (experiments 18, 23): +17% until its 4K-aliasing copy was fixed, then -3.8% / -4.9% |
+| Sort 8-byte keys per person; interval assists; 30-minute bins | RESEARCH_NOTES 7.1, 17.1, 1.6 | 2 to 4% | keys and assists done (experiment 9): -2.1%; bins tried and rejected (experiment 54) |
+| INT32 counts, dictionary pages, smaller output | RESEARCH_NOTES 5, 20, 30 | 1 to 2% in-process; more after exit | done (experiments 15, 19, 25, 38): output 93 -> 21 MB at 20M |
+| Output written during the sessions phase with early writeback | own measurement (experiments 14, 16, 36, 37) | the whole post-exit flush on slow-disk runners | done (experiment 39): post-exit 0.13 / 0.30 s -> 0.04 / 0.05 s |
+| Profile-guided optimisation | RESEARCH_NOTES 16.4, 24.6 | 2 to 4% | done (experiments 33, 42): -1.5% to -2.7% |
+| Packed field offsets, one room check per line, combined time-of-day test | RESEARCH_NOTES 34, 38 | 4 to 6% in-process | done (experiments 26, 27, 45): -5% then -3.4% |
+| Arena pre-fault on idle threads; partition counts by input size | own measurements (experiments 47, 48) | Intel-specific | done: -1.4% to -4.3% on Intel; -2% at 60M |
+| Catalog load on a side thread; link build prefetch | RESEARCH_NOTES 8.1, 7.3 | 1 to 3% | done (experiments 11, 28): about -1% each; links cannot run beside the parse any more because the parse needs the person table |
 
 ## Next three ideas queued
 
