@@ -426,6 +426,30 @@ From reading `src/` against the audit and competitor commits. At a 0.6 s target 
 - **Expected gain.** Pass 1 stops missing the cache (the audit charges `dedup_partition` with 24.6% of all L1 read misses for 4% of instructions), at the price of one extra sequential read of the partition. Estimate 30 to 50% of the dedup phase, 3 to 5% of wall, more at 60M where the current table is 4 MB.
 - **Risk.** Low. All copies of an id share a slot, so none can be missed; false suspects are harmless because the sort separates them by `eid`. The existing gate (fixtures E-series, dev answer, 20M cross-check at `NCPU` 1, 2 and 8) covers it. One thing to check by hand: a partition where one id makes up a large share of records (cherylaurelia tested "one event_id on 1/3 of all events") makes the suspect list long, which is slow but still correct.
 
+---
+
+## Iteration 10 (2026-11-21): model checks of two proposed rules, and what the scoring formula implies
+
+These are checks of the logic in scratch Python models, not builds or benchmarks of this repo. They show the rules are right; they say nothing about a Rust implementation of them.
+
+### 10.1 Both quote-validity formulas match the dialect rule
+
+- **What was checked.** The reference is the rule `split` implements (`parse.rs:10`): each field has no quote, or is at least 2 bytes with exactly two quotes, first and last. Against it: cherylaurelia's borrow form (entry 2.1) and the three-test PEXT form (entry 4.1), both on masks wider than 64 bits.
+- **Result.** 0 mismatches over all 265,720 strings of length 0 to 11 over `{a , "}` plus 300,000 random lines of 60 to 140 bytes (half of them 7-field lines with 30% quoted fields and occasional stray quotes), 565,720 cases in all. Script: `/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/chk2/q.py`.
+- **Meaning for 2.1 and 4.1.** The mask rule is safe to implement for lines up to 128 bytes. What remains untested is the Rust two-word carry handling (the `<< 1` across words and the borrow between words), which `fuzz_scan` must cover with lines that straddle byte 64.
+
+### 10.2 The 30-minute bin rule matches sort-based sessionization
+
+- **What was checked.** Sessions (start, event count) from sorting and splitting on gaps over 1,800,000 ms, against the bin rule of entry 1.6: one bin never splits, adjacent bins split exactly when `min(later) - max(earlier) > GAP`, bins further apart always split.
+- **Result.** 0 mismatches over 200,000 random people of 1 to 40 events, with a quarter of gaps exactly 30:00.000, a quarter 30:00.001, and repeated timestamps. Script: `/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/chk2/bins.py`.
+- **Meaning for 1.6.** The session boundaries are exact, including the two boundary gaps the generator plants. The untested part is still the purchase-to-session join for `top_category` and revenue.
+
+### 10.3 The score is the middle of three runs, so a cold cache matters less than it looked
+
+- The track page (copied in [cherylaurelia `docs/track.md`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/docs/track.md)) says a run under 20 s "is timed 3 times and scored on the middle time", each in a new container, and the final is timed 3 times, then 5 times for the fastest entries.
+- If the dataset stays on the same machine between the repeats, at most the first run sees a cold page cache, and the middle of three is then a warm run. So cold-cache work (entries 1.9 and 3.1) can only matter if the scorer drops caches between runs or the three runs land on different machines, neither of which any source establishes. Eagle Eye assumed cold runs and tuned for them; its best score was 1.01 s.
+- **Consequence.** Rank warm-path CPU work above everything cold-cache. The readahead step fix in 3.1 is still worth its three lines because it costs nothing warm.
+
 ## Next iteration
 
 - Re-read `OVERNIGHT_LOG.md` if it exists and drop anything it marks tried.
