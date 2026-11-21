@@ -126,7 +126,7 @@ pub struct Ctx {
 // ---------------------------------------------------------------------------
 // Phase 1: links
 // ---------------------------------------------------------------------------
-fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> LinkTab {
+fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize, pf_next: &AtomicUsize) -> LinkTab {
     let t0 = Instant::now();
     let paths = list_csv(&data.join("links"));
     let m = Mapped::open(&paths);
@@ -239,13 +239,12 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     // start of the record arena, which the parse threads would otherwise
     // have to wait for page by page.
     let stop = std::sync::atomic::AtomicBool::new(false);
-    let pf_next = AtomicUsize::new(0);
     let mut nmoved = 0usize; // IDs that are not a root = unions made
     std::thread::scope(|sc| {
     if prefault > 0 {
         for _ in 1..threads {
             sc.spawn(|| {
-                while !stop.load(Ordering::Relaxed) && arena.populate_step(&pf_next, prefault) {}
+                while !stop.load(Ordering::Relaxed) && arena.populate_step(pf_next, prefault) {}
             });
         }
     }
@@ -479,13 +478,19 @@ fn main() {
         // inside the parse loop costs them far more than doing it here
         // (measured: -3% at 20M, -4% at 60M on a Xeon), while on AMD Zen the
         // slower link build outweighs it (+1%). PREFAULT=1 / 0 forces it.
-        let on = match env("PREFAULT", "").as_str() {
-            "1" => true,
+        let mode = env("PREFAULT", "");
+        let on = match mode.as_str() {
+            "1" | "2" => true,
             "0" => false,
             _ => is_intel(),
         };
         let prefault = if on { (ev_bytes / 78 * 32 + cl_bytes / 47 * 32) * 3 / 4 } else { 0 };
-        let links = build_links(&data, threads, &arena, prefault);
+        let pf_next = AtomicUsize::new(0);
+        let links = build_links(&data, threads, &arena, prefault, &pf_next);
+        if mode == "2" {
+            // experiment: finish the pre-fault on all threads before the parse
+            par_for(threads, threads, |_t, _i| while arena.populate_step(&pf_next, prefault) {});
+        }
         (links, h.join().expect("catalogs"))
     });
     let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels } = cats;
