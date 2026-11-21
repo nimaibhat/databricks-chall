@@ -393,11 +393,15 @@ fn main() {
     let cl_paths = list_csv(&data.join("clicks"));
     let ev_in = Inputs::open(if io5 { &ev_paths } else { &[] });
     let cl_in = Inputs::open(if io5 { &cl_paths } else { &[] });
-    let ev_m = Mapped::open(if io5 { &[] } else { &ev_paths });
-    let cl_m = Mapped::open(if io5 { &[] } else { &cl_paths });
-    background_readahead(&[&ev_m, &cl_m]);
-    let ev_bytes: usize = ev_m.maps.iter().map(|m| m.len()).sum::<usize>() + ev_in.bytes();
-    let cl_bytes: usize = cl_m.maps.iter().map(|m| m.len()).sum::<usize>() + cl_in.bytes();
+    // diagnostics for IOMODE=5: IO5MAP=1 also maps the files (unused), IO5RA=1 starts the read-ahead thread on them
+    let io5map = io5 && env("IO5MAP", "0") == "1";
+    let ev_m = Mapped::open(if io5 && !io5map { &[] } else { &ev_paths });
+    let cl_m = Mapped::open(if io5 && !io5map { &[] } else { &cl_paths });
+    if !io5map || env("IO5RA", "0") == "1" {
+        background_readahead(&[&ev_m, &cl_m]);
+    }
+    let ev_bytes: usize = if io5 { ev_in.bytes() } else { ev_m.maps.iter().map(|m| m.len()).sum::<usize>() };
+    let cl_bytes: usize = if io5 { cl_in.bytes() } else { cl_m.maps.iter().map(|m| m.len()).sum::<usize>() };
     // Records are never larger than twice the input (a valid event line of
     // >= 35 bytes makes 32 bytes, an invalid one of >= 8 bytes makes 16, a
     // valid click line of >= 20 bytes makes 32), plus one partial block per
