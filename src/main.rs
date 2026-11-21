@@ -144,12 +144,13 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
         let d: &[u8] = &m.maps[c.file as usize];
         let p = unsafe { pairs.get(t) };
         let sk = unsafe { skeys.get(t) };
+        let ceil = unsafe { d.as_ptr().add(d.len()) };
         let mut sink = FnSink::<2, _>(|f: &[&[u8]; 2]| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
-            let a = pack(f[0]);
-            let b = pack(f[1]);
+            let a = pack_fast(f[0], ceil, false);
+            let b = pack_fast(f[1], ceil, false);
             if a == b {
                 return; // self-link: no effect
             }
