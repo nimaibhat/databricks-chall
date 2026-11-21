@@ -716,6 +716,29 @@ Sources: commits pushed after iteration 2 to joch44 (`e71539c`), Vibhor7-7 (`7a5
 - [Th3r0n `6034d47`](https://github.com/Th3r0n/shopping-sessions/commit/6034d47): "software-pipelined union-find, prefetched final passes", the same direction as entry 7.3. No number given.
 - [TejasviniChawla `6925b5e`](https://github.com/TejasviniChawla/shopping-sessions/commit/6925b5e) added Snappy page compression to its Parquet writer and a CI experiment on tmpfs against bind-mounted output; no result is recorded yet. The scorer's `/output` is reported as ext4 (entry 11.1).
 
+---
+
+## Iteration 17 (2026-11-21, about 01:05): the sessions phase (16% of in-process time) and what the profile closes
+
+### 17.1 Assist increments: 36.9 million scattered adds at 20M
+
+- **Evidence.** The audit's read-back of the 20M output gives `sum(assisted_sessions) = 36,877,579` for 3,402,836 sessions: about 11 assists per session on average, driven by the whales, who have a session in every two-hour slot and about 100,000 clicks each ([joch44 `DATA_PROFILE.md`](https://github.com/joch44/shopping-sessions/blob/e71539c/DATA_PROFILE.md)). Each one is `a.camp_cell(c, di)[3] += 1` at `main.rs:987-989`, a read-modify-write into a 900 KB per-thread array (2,001 campaigns by 14 days by 32 bytes), so it lives in L2, not L1.
+- **Idea.** Count per (campaign, day) by intervals instead of per session. Keep, for every active campaign, the number of this person's sessions started today when it became active (`since[c]`). When a campaign leaves the window, or the day changes, or the person ends, add `sessions_today - since[c]` to the cell once. A campaign that stays active across 12 sessions of a day costs one add instead of 12.
+- **Sources.** axhiao `1d1fa1c`: "assists batched per active-set change". jklein07 `d1036a8` and AbhirajTiwari12 `b90b316`: "interval assists" / "Assists counted by intervals". This repo's own earlier version did per-campaign interval unions and was replaced by the sliding window in `49305fe`; this keeps the sliding window and only changes when the cell is written.
+- **Here.** `main.rs:949-970` already tracks entry (`acnt[c]` going 0 to 1) and exit (1 to 0) of each campaign. Record `since[c] = d_sess_before_this_session` on entry; on exit add `d_sess_before - since[c]` (the leaving campaign did not assist the current session, since exits are processed before the current session is counted; check this ordering against lines 949 to 970, where entries are processed first and exits second for the same `start`). At a day change and at the end of the person, flush every active campaign and reset `since`.
+- **Expected gain.** Tens of milliseconds of CPU at 20M: about 1% of wall. Small; listed because the count is so large.
+- **Risk.** Medium for its size: it touches the assist rule's boundaries (inclusive 7-day window at both ends, day of the session start). The fixtures in the A-series cover those; a wrong count shows up in `assisted_sessions` on the dev answer.
+
+### 17.2 Where the sessions phase goes, by reading the code
+
+- Per event: one `gmap.entry` (hash plus probe, `main.rs:792`), one `gid.push`, one scatter copy of 16 bytes. Per person: a sort (median person has 12 events and 3 sessions by joch44's profile, so nearly all sorts are insertion sorts of fewer than 20 elements), the sweep, and a `flush_user` per person-day.
+- So the levers are, in order: 8-byte sort keys (entry 7.1, halves the copy and the sort moves); a cheaper hash (entry 1.7; `hk` is two multiplies and the map is L1-resident, so the hash is most of the probe cost); 16-byte click keys (entry 13.2); then assists (17.1). A sorting network or rank sort for small groups is next after those: cherylaurelia's AVX2 rank sort for up to 64 events took its sessions phase from 0.544 to 0.487 CPU-s (`ca9e524`).
+
+### 17.3 Closed by the profile
+
+- **Output is 0.048 s of about 2.1 s in-process at 20M** (`OVERNIGHT_LOG.md`). Every Parquet idea (entries 1.8, 5.2, the queued INT32 and buffer reservation) is worth at most 1 to 2% in total and carries reader risk. Do not spend a submission on them. The one output item still worth doing is the zero-row `part-0` hazard in entry 5.4, which is about correctness on tiny inputs, not speed.
+- **Thread count, partition counts, chunk size**: three teams swept them and found nothing (entries 1.10, 11.3, 16.2).
+
 ## Next iteration
 
 - Re-read `OVERNIGHT_LOG.md` (first seen in iteration 14; experiments table had only the baseline) and drop anything it marks tried.
