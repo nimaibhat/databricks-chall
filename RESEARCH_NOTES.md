@@ -11,7 +11,7 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
 | 1 | Fresh numbers for the new pipeline (no code): lap line, `prof` thread-ms, fault count, user/system time, peak RSS, `perf report` top 15 symbols, and `perf annotate` of the new `ev_loop` | n/a | Directs everything else | Every figure these notes rank by was measured on `941879e`/`801982c`; the parser, record size, click index and writer have all changed since (experiments 15, 16) | None | 18.1 |
-| 2 | Staging footprint of the 12-byte event path: test `XL_BB=16` once, and the staging-block prefetch | `parse.rs:318` (`EV_STAGE = 192`), `parse.rs:428` (`EvPart::push_many`) | Unknown; experiment 15 shows the sign: more buckets now costs parse 8 ms at 20M | Staging is now 256 B per bucket per thread (was 64 B): 197 KB at 20M, 295 KB at 30M, two hyperthreads per 1 MiB L2 | None for the prefetch; `BB=16` takes the old stage 3 path (`events.rs`, `BB > 15`), gate it | 18.2 |
+| 2 | Staging footprint of the 12-byte event path: prefetch the staging block a batch ahead | `parse.rs:318` (`EV_STAGE = 192`), `parse.rs:428` (`EvPart::push_many`) | Unknown; experiment 15 shows the sign: more buckets now costs parse 8 ms at 20M | Staging is now 256 B per bucket per thread (was 64 B): 197 KB at 20M, 295 KB at 30M, two hyperthreads per 1 MiB L2 | None | 18.2 |
 | 3 | Frequency-licence probe at three points | end of `stage1`, end of `stage3a` | Diagnostic | Still not run; the new push path uses a masked 128-bit store only, so the picture has not got worse | None | 14.2 |
 | 4 | (empty until 18.1's numbers exist) | | | | | |
 | 5 | (empty) | | | | | |
@@ -566,8 +566,9 @@ On `9363748`, seed 20, tmpfs, the same commands as the "Facts for the research s
 ### 18.2 Row 2: staging footprint
 
 - Each thread now keeps 256 B of staging per bucket (192 B block plus per-bucket state), four times the old 64 B line. At 769 buckets that is 197 KB per thread, about 400 KB for the two hyperthreads sharing a 1 MiB L2, before the scanner's tables and the input. Experiment 15's `upb` column fits: doubling the buckets cost parse 8 ms at 20M where on the old layout it was free.
-- So the stage is now on the edge at 20M, and two cheap tests follow. (1) `XL_BB=16`: halves the staging (98 KB) at the price of a 1 MiB dedup table in stage 3 and the older stage 3 path (`BB > 15` selects it). Parse should gain, ev3a should lose; one build says which wins. (2) In `EvPart::push_many`, prefetch the target of each row (`l + f`, known from `lp` and `fill`) a batch ahead, as in old 17.2. **Both are my estimates of sign only; no size claimed.**
-- Risk to output: none for (2). (1) changes which stage 3 code runs, so full gate.
+- So the stage is now on the edge at 20M. `XL_BB=16` is not available: the 12-byte layout asserts `BB <= 15` (`parse.rs:325`), so a larger bucket would mean giving up the 12-byte records. That leaves one cheap test: in `EvPart::push_many` (`parse.rs:428`), prefetch each row's target (`l + f`, from `lp` and `fill`) a batch ahead. **My estimate of sign only; no size claimed.**
+- Users numbered at or above 2^22 take the 16-byte escape path (`R12_UMAX`, `parse.rs:324`, `esc_defer`). At one user per 30 events that is 126M events, far beyond any stated size; noted so nobody is surprised by a slow run on a synthetic set with many users.
+- Risk to output: none.
 
 ## Next passes
 
