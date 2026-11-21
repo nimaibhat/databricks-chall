@@ -716,19 +716,57 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
             if c.count_ones() as usize != N - 1 || bad != 0 {
                 continue; // wrong field count (or an empty line), or a misplaced quote
             }
-            let mut m = c;
-            let mut fs = 0u32;
-            for i in 0..N {
-                let fe = if i == N - 1 {
-                    ll
-                } else {
-                    let p = m.trailing_zeros();
-                    m &= m.wrapping_sub(1);
-                    p
-                };
-                let qa = ((q >> fs) as u32) & 1; // quoted: drop the first and last byte
-                fields[i] = unsafe { std::slice::from_raw_parts(lp.add((fs + qa) as usize), (fe - fs - 2 * qa) as usize) };
-                fs = fe + 1;
+            // x86-64 with BMI2: every field's start and length as bytes of two
+            // words, with a fixed number of rounds on both mask words (the
+            // comma count per word varies line to line, so a loop over set
+            // bits would mispredict) and the quoted flags through pext/pdep.
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            unsafe {
+                use std::arch::x86_64::{_pdep_u64, _pext_u64};
+                const { assert!(N >= 2 && N <= 8) };
+                const ONES: u64 = 0x0101_0101_0101_0101;
+                let (c0, c1) = (c as u64, (c >> 64) as u64);
+                let n0 = c0.count_ones();
+                let (mut a, mut b, mut p0, mut p1) = (c0, c1, 0u64, 0u64);
+                for j in 0..N - 1 {
+                    p0 |= (a.trailing_zeros() as u64) << (8 * j);
+                    a &= a.wrapping_sub(1);
+                    p1 |= (64 + b.trailing_zeros() as u64) << (8 * j);
+                    b &= b.wrapping_sub(1);
+                }
+                // the first n0 commas come from the low word, the rest from the high one
+                let lowm = if n0 >= 8 { !0u64 } else { (1u64 << (8 * n0)) - 1 };
+                let hi = if n0 >= 8 { 0 } else { p1 << (8 * n0) };
+                let allm = if N - 1 >= 8 { !0u64 } else { (1u64 << (8 * (N - 1))) - 1 };
+                let commas = ((p0 & lowm) | hi) & allm;
+                let ends = commas | (ll as u64) << (8 * (N - 1));
+                let starts = (ends << 8).wrapping_add(ONES << 8);
+                let (x0, x1, s0, s1) = (x as u64, (x >> 64) as u64, st as u64, (st >> 64) as u64);
+                let k0 = s0.count_ones();
+                let qbits = _pext_u64(x0, s0) | if k0 >= 64 { 0 } else { _pext_u64(x1, s1) << k0 };
+                let quoted = _pdep_u64(qbits, ONES);
+                let at = starts.wrapping_add(quoted);
+                let ln = ends.wrapping_sub(at).wrapping_sub(quoted);
+                for i in 0..N {
+                    fields[i] = std::slice::from_raw_parts(lp.add((at >> (8 * i)) as u8 as usize), (ln >> (8 * i)) as u8 as usize);
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            {
+                let mut m = c;
+                let mut fs = 0u32;
+                for i in 0..N {
+                    let fe = if i == N - 1 {
+                        ll
+                    } else {
+                        let p = m.trailing_zeros();
+                        m &= m.wrapping_sub(1);
+                        p
+                    };
+                    let qa = ((q >> fs) as u32) & 1; // quoted: drop the first and last byte
+                    fields[i] = unsafe { std::slice::from_raw_parts(lp.add((fs + qa) as usize), (fe - fs - 2 * qa) as usize) };
+                    fs = fe + 1;
+                }
             }
         }
         f(&fields);
