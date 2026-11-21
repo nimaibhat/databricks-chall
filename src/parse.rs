@@ -226,10 +226,10 @@ pub struct Mapped {
 
 /// I/O strategy, from env IOMODE: 0 none, 1 whole-file WILLNEED at open,
 /// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread
-/// of a mapped file, 5 pread only (events and clicks are never mapped).
+/// of a mapped file, 5 (default) pread only: events and clicks are never mapped.
 pub fn io_mode() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
+    *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
 }
 
 /// Makes chunk bytes available. Returns (data, start, end) to scan.
@@ -340,6 +340,45 @@ pub fn background_readahead(ms: &[&Mapped]) {
     let _ = ms;
 }
 
+/// A page-aligned, huge-page backed read buffer. Reads are issued at
+/// page-aligned file offsets into it, so the kernel copies page to page: a
+/// source and destination that differ by a few bytes modulo 4096 make the
+/// copy several times slower (4K aliasing).
+pub struct IoBuf {
+    ptr: *mut u8,
+    cap: usize,
+    len: usize,
+}
+unsafe impl Send for IoBuf {}
+
+impl IoBuf {
+    pub fn new() -> IoBuf {
+        IoBuf { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), cap: 0, len: 0 }
+    }
+    fn reserve(&mut self, want: usize) {
+        if want <= self.cap {
+            return;
+        }
+        const ALIGN: usize = 2 << 20;
+        let cap = (want.max(self.cap * 2) + ALIGN - 1) & !(ALIGN - 1);
+        unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), cap + ALIGN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+            assert!(p != libc::MAP_FAILED, "read buffer mmap");
+            let b = ((p as usize + ALIGN - 1) & !(ALIGN - 1)) as *mut u8;
+            #[cfg(target_os = "linux")]
+            libc::madvise(b as *mut _, cap, libc::MADV_HUGEPAGE);
+            std::ptr::copy_nonoverlapping(self.ptr, b, self.len);
+            // the old mapping (if any) is left to process exit: growth is rare
+            self.ptr = b;
+            self.cap = cap;
+        }
+    }
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 /// Input files read with `pread`, never mapped (IOMODE=5).
 pub struct Inputs {
     pub files: Vec<File>,
@@ -376,48 +415,48 @@ impl Inputs {
             }
         }
     }
-    /// Appends file bytes [from + buf.len(), upto) to `buf`.
-    fn fill(&self, file: usize, from: usize, upto: usize, buf: &mut Vec<u8>) {
+    /// Appends file bytes [from + buf.len, upto) to `buf`.
+    fn fill(&self, file: usize, from: usize, upto: usize, buf: &mut IoBuf) {
         use std::os::unix::fs::FileExt;
-        let have = buf.len();
         let want = upto - from;
-        if want <= have {
+        if want <= buf.len {
             return;
         }
-        buf.reserve(want - have);
-        unsafe { buf.set_len(want) };
-        let mut got = have;
+        buf.reserve(want);
+        let mut got = buf.len;
         while got < want {
-            let r = self.files[file].read_at(&mut buf[got..want], (from + got) as u64).expect("pread");
+            let dst = unsafe { std::slice::from_raw_parts_mut(buf.ptr.add(got), want - got) };
+            let r = self.files[file].read_at(dst, (from + got) as u64).expect("pread");
             if r == 0 {
                 break; // the file shrank: treat the rest as absent
             }
             got += r;
         }
-        buf.truncate(got);
+        buf.len = got;
     }
     /// Reads the lines a range owns into `buf`; returns (data, start, end)
-    /// for `scan_lines`. A few bytes before the first line are kept so that
-    /// backward word loads stay inside the buffer.
-    pub fn read<'a>(&self, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8], usize, usize) {
+    /// for `scan_lines`. The read starts at a page boundary at least 16 bytes
+    /// before the range, so backward word loads stay inside the buffer.
+    pub fn read<'a>(&self, c: &Chunk, buf: &'a mut IoBuf) -> (&'a [u8], usize, usize) {
         const PRE: usize = 16;
         const STEP: usize = 64 << 10;
         let file = c.file as usize;
         let size = self.sizes[file];
-        let rs = c.start.saturating_sub(PRE);
+        let rs = c.start.saturating_sub(PRE) & !4095;
         let mut re = (c.end + 512).min(size);
-        buf.clear();
+        buf.len = 0;
         self.fill(file, rs, re, buf);
         // first newline at or after buffer offset `from`, reading on as needed
-        let mut newline_from = |buf: &mut Vec<u8>, mut from: usize| -> Option<usize> {
+        let mut newline_from = |buf: &mut IoBuf, mut from: usize| -> Option<usize> {
             loop {
-                if let Some(p) = memchr::memchr(b'\n', &buf[from.min(buf.len())..]) {
-                    return Some(from.min(buf.len()) + p);
+                let have = buf.len;
+                if let Some(p) = memchr::memchr(b'\n', &buf.as_slice()[from.min(have)..]) {
+                    return Some(from.min(have) + p);
                 }
-                if re >= size || buf.len() < re - rs {
+                if re >= size || have < re - rs {
                     return None;
                 }
-                from = buf.len();
+                from = have;
                 re = (re + STEP).min(size);
                 self.fill(file, rs, re, buf);
             }
@@ -426,31 +465,31 @@ impl Inputs {
         let s = if c.start == 0 {
             match newline_from(buf, 0) {
                 Some(p) => p + 1, // after the header
-                None => return (&buf[..], 0, 0),
+                None => return (buf.as_slice(), 0, 0),
             }
-        } else if buf.get(c.start - 1 - rs) == Some(&b'\n') {
+        } else if buf.as_slice().get(c.start - 1 - rs) == Some(&b'\n') {
             c.start - rs
         } else {
             match newline_from(buf, c.start - rs) {
                 Some(p) => p + 1,
-                None => return (&buf[..], 0, 0),
+                None => return (buf.as_slice(), 0, 0),
             }
         };
         // where the first line owned by the next range starts
         let e = if c.end >= size {
-            buf.len()
-        } else if buf.get(c.end - 1 - rs) == Some(&b'\n') {
+            buf.len
+        } else if buf.as_slice().get(c.end - 1 - rs) == Some(&b'\n') {
             c.end - rs
         } else {
             match newline_from(buf, c.end - rs) {
                 Some(p) => p + 1,
-                None => buf.len(),
+                None => buf.len,
             }
         };
         if s >= e {
-            return (&buf[..], 0, 0);
+            return (buf.as_slice(), 0, 0);
         }
-        (&buf[..], s, e)
+        (buf.as_slice(), s, e)
     }
 }
 
@@ -870,6 +909,7 @@ mod tests {
                 let len = match rnd(8) {
                     0 => 0,
                     1 => 200 + rnd(3000),
+                    2 if case % 10 == 0 => 3000 + rnd(9000),
                     _ => rnd(60),
                 };
                 for _ in 0..len {
@@ -902,11 +942,11 @@ mod tests {
                 v
             };
             let inp = Inputs::open(&[path.clone()]);
-            for target in [1usize, 2, 3, 7, 16, 17, 64, 100, 1000, 5000, 1 << 20] {
+            for target in [1usize, 2, 3, 7, 16, 17, 64, 100, 1000, 4096, 5000, 8192, 1 << 20] {
                 let mut chunks = Vec::new();
                 inp.chunks(0, target, &mut chunks);
                 let mut got: Vec<Vec<u8>> = Vec::new();
-                let mut buf = Vec::new();
+                let mut buf = IoBuf::new();
                 for c in &chunks {
                     let (data, s, e) = inp.read(c, &mut buf);
                     let mut start = s;
