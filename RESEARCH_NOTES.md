@@ -1065,6 +1065,22 @@ Sources: this repo's log; [TejasviniChawla notes](https://github.com/TejasviniCh
 - **Local timing (the one benchmark run by this session, on the user's instruction).** Built natively on the Mac in the scratchpad and run on `~/ss-data/d20` with `NCPU=8`, interleaved with this repo's current pick (`~/ss-data/bin/s7`, the date-table build), nine rounds, process wall time: median 0.54 s for both; best 0.47 s for theirs against 0.45 s for this repo's. The machine was busy with the optimizer's own runs (load average about 6, several multi-second outliers), so the two are indistinguishable here. Its output matched the golden 20M tables (`scripts/compare.py`: MATCH), and its `user_daily` is 75 MB against this repo's 96 MB.
 - **What that does not say.** The Mac is ARM: it has no streaming stores and hides the page-fault and TLB costs that matter on the scorer (entries 11.4, 25.2), so this is not a board prediction. A real comparison is one line in the optimizer's x86 bench (`bench/variants.txt` accepts `ext:owner/repo[@sha]`).
 
+## Iteration 27 (2026-11-21, 01:45): Vibhor7-7 and anthonyteti measured on x86 next to ours (user request)
+
+Run [44876013351](https://github.com/nimaibhat/databricks-chall/actions/runs/44876013351) on branch `bench-ext` (a copy of `bench` with its own variants file, so the optimizer's branch is untouched). EPYC 7763, 4 vCPU, full `docker run` wall with the scorer's flags, interleaved, median of 7 (min to max); empty container 0.19 s. All outputs equal to ours on both datasets.
+
+| Build | 20M | 60M | vs ours |
+|---|---|---|---|
+| cherylaurelia `2e4261f` | 1.266 (1.262-1.276) | 3.488 (3.473-3.537) | -27% / -32% |
+| Vibhor7-7 `daa3682` (team VibDiv, board 0.78 s) | 1.379 (1.366-1.422) | 3.910 (3.874-4.354) | -20% / -24% |
+| anthonyteti `5aa0ef6` | 1.540 (1.530-1.575) | 4.469 (4.371-4.916) | -11% / -13% |
+| ours `0a06317` | 1.729 (1.720-2.074) | 5.149 (5.097-5.539) | |
+
+- **The Mac parity in iteration 26 does not hold on x86**: anthonyteti is 11% faster than our pick here.
+- **Board calibration.** Vibhor's code scored 0.78 s (SUBMISSIONS.md, 10th of 163). Scaling by this run's ratio puts our pick near 0.98 s, anthonyteti near 0.87 s and cherylaurelia near 0.72 s. Rough: the scorer is Intel and this runner is Zen 3; write-combining gained more on Intel.
+- Our phases in this run (20M): links 0.111, parse 0.983, dedup 0.097, sessions 0.278, output 0.050. Parse is 57% of the wall and remains the gap.
+- Vibhor7-7 experiments 23 to 25 (pulled this cycle) are already covered by entries 22.3 and 22's list; nothing new to rank.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
