@@ -17,7 +17,7 @@ for v in "${V[@]}"; do
     git worktree add -f /tmp/src "$ref" -q; desc="$(git rev-parse --short $ref) $(git log -1 --format=%s $ref | cut -c1-70)"
   fi
   ba=""; for b in $bargs; do ba="$ba --build-arg $b"; done
-  docker build -q $ba -t "sut:$label" /tmp/src >/dev/null 2>/tmp/build.err || { echo "BUILD FAILED $label"; tail -5 /tmp/build.err; }
+  docker build -q $ba -t "sut:$label" /tmp/src >/dev/null 2>/tmp/build.err || { echo "BUILD FAILED $label"; grep -E "error" -A12 /tmp/build.err | head -60 | cut -c1-230; }
   [[ "$ref" == ext:* ]] && rm -rf /tmp/src || git worktree remove --force /tmp/src
   echo "built $label = $desc [$bargs] [$envs]"
 done
