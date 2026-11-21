@@ -73,6 +73,29 @@ impl Arena {
         }
         let _ = threads;
     }
+    /// Faults in (and so zeroes) the next not yet populated piece of the
+    /// first `limit` bytes; false when there is nothing left to do or the
+    /// kernel cannot do it. Meant for threads with nothing else to do: the
+    /// pages are the ones the block allocator hands out first, so the
+    /// workers that fill them later do not stop to have them zeroed.
+    pub fn populate_step(&self, next: &AtomicUsize, limit: usize) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            const STEP: usize = 8 << 20;
+            let at = next.fetch_add(STEP, Ordering::Relaxed);
+            if at >= limit.min(self.cap) {
+                return false;
+            }
+            let len = STEP.min(limit.min(self.cap) - at);
+            // 23 = MADV_POPULATE_WRITE (Linux 5.14); an older kernel says EINVAL
+            unsafe { libc::madvise(self.base.add(at) as *mut _, len, 23) == 0 }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (next, limit);
+            false
+        }
+    }
     pub fn used(&self) -> usize {
         self.off.load(Ordering::Relaxed)
     }

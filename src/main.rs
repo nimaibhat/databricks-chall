@@ -126,7 +126,7 @@ pub struct Ctx {
 // ---------------------------------------------------------------------------
 // Phase 1: links
 // ---------------------------------------------------------------------------
-fn build_links(data: &Path, threads: usize) -> LinkTab {
+fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> LinkTab {
     let t0 = Instant::now();
     let paths = list_csv(&data.join("links"));
     let m = Mapped::open(&paths);
@@ -235,7 +235,20 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
         }
         x
     }
+    // The union pass is serial. Meanwhile the other threads fault in the
+    // start of the record arena, which the parse threads would otherwise
+    // have to wait for page by page.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let pf_next = AtomicUsize::new(0);
     let mut nmoved = 0usize; // IDs that are not a root = unions made
+    std::thread::scope(|sc| {
+    if prefault > 0 {
+        for _ in 1..threads {
+            sc.spawn(|| {
+                while !stop.load(Ordering::Relaxed) && arena.populate_step(&pf_next, prefault) {}
+            });
+        }
+    }
     for v in &ipairs {
         for (j, &(a, b)) in v.iter().enumerate() {
             // serial and cache-bound: fetch the next pairs' entries early
@@ -258,6 +271,8 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
             }
         }
     }
+    stop.store(true, Ordering::Relaxed);
+    });
     let uf_time = t_uf.elapsed();
     let t_union = t0.elapsed();
     let t_name = t0.elapsed();
@@ -435,7 +450,9 @@ fn main() {
     // ---- phase 1 (the catalogs load on a side thread meanwhile)
     let (links, cats) = std::thread::scope(|sc| {
         let h = sc.spawn(|| load_catalogs(&data));
-        let links = build_links(&data, threads);
+        // at most the part of the arena the estimate says will be used (PREFAULT=0 turns it off)
+        let prefault = if env("PREFAULT", "1") == "0" { 0 } else { (ev_bytes / 78 * 32 + cl_bytes / 47 * 32) * 3 / 4 };
+        let links = build_links(&data, threads, &arena, prefault);
         (links, h.join().expect("catalogs"))
     });
     let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels } = cats;
