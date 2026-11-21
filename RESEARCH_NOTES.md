@@ -758,11 +758,32 @@ The log's first queued change resolves the person in the parse loop. Entry 14.2 
 - **Expected gain.** This is the enabling piece for deleting the resolve pass (0.175 s of about 2.1 s at 20M on the runner, 8%) when combined with 14.2; on its own it adds cost to the parse loop.
 - **Risk.** Low for the table itself: a lookup returns the same person as `KMap::get(...).unwrap_or(uid)`. The ring adds a flush at chunk end, where the last 16 records must be drained before the thread's lists are read.
 
+---
+
+## Iteration 19 (2026-11-21, about 01:30): a lower-risk scanner step, and small-group sorting
+
+### 19.1 Keep the separator index; split all fields of a line at once around its delimiters
+
+- **Idea.** A middle path between today's scanner and the rewrite in 14.1. `pos` already holds the offsets of a line's delimiters in order. For each of them load the 4 bytes starting one byte before it: byte 0 is the last character of the field before the delimiter, byte 2 the first character of the field after it. Put the eight 4-byte loads in one 256-bit register, compare with `"` once, and every field's "wrapped in quotes" flag, start and length come out of a few vector operations.
+- **Source.** [Vibhor7-7 `src/reader.rs`](https://github.com/Vibhor7-7/shopping-sessions/blob/7a5ddaf/src/reader.rs) lines 86 to 131 (`split::<N>`, experiment 22): eight scalar 32-bit loads inserted into two `xmm` halves (no gather instruction), `cmpeq_epi8` with a quote, a lane permute so each field sees its closing byte, `wrapped = open & close & (len > 1)`, then `start = before + 1 + wrapped` and `len = after - before - 1 - 2 * wrapped` stored as two arrays of 8. The commit message counts the old per-field loop at about 145 instructions per line. No A/B result is logged yet; AbhirajTiwari12 tried a variant with a real gather and reverted it.
+- **Validity rule used there.** A line is well formed iff its total quote count equals twice the number of wrapped fields. Brute-force checked here against the `split` rule on all 797,161 strings of length 0 to 12 over `{a , "}`: 0 mismatches (`/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/chk2/wrapped.py`). This is the same test as `bad == 0 && seen == qcount` at `parse.rs:636`, without the separate `qa ^ qz` term.
+- **Here.** Replace only the loop at `parse.rs:621-635`. The delimiters of the line are `line_start - 1` (the previous newline) followed by `pos[first..first + N]`; `qcount` is still computed from the ring as now. Two edge conditions: the loads read 1 byte before the first delimiter and 2 bytes past the last one, so the first line of a file (nothing readable before offset 0 of a mapping) and a line ending within 2 bytes of the chunk's readable end go to `split`; the existing long-line fallback stays.
+- **Expected gain.** The log's `perf` profile puts the per-field quote loop at 7.7% of self time; this removes most of it, so about 5% of wall, without touching how lines and separators are found.
+- **Risk.** Low to medium: the line-finding and field-count logic do not change, and `fuzz_scan` compares the result with `split` directly.
+- **Relation to 14.1.** Do this first if the rewrite looks too large; 14.1 additionally removes the flatten loop and the ring (the rest of the scanner's 490 instructions), so the two are alternatives for the quote loop but 14.1 goes further.
+
+### 19.2 Branch-free rank sort for small groups
+
+- **Idea.** For up to 8 keys, hold them in one 256-bit register, rotate it 7 times, and count for each lane how many other keys are smaller (ties broken by original position). The counts are the sorted positions, so the sort is `out[rank[i]] = in[i]` with a fixed trip count and no data-dependent branch. For 9 to 64 keys, compare each key against the whole array 8 at a time and popcount the masks.
+- **Source.** [cherylaurelia `ranks_small`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs) lines 2463 to 2550; commit `ca9e524`: "AVX2 rank sort for the events and clicks of people with up to 64 of them, vector 7-day window ... sessions-phase cpu 0.544 to 0.487 s", so about 10% of that phase with both parts.
+- **Here.** After entry 7.1 the per-person sort at `main.rs:895` is over `u64` words whose top 32 bits are `ts`; a rank sort on the 32-bit `ts` followed by a permuting copy does the same job. The median person has 12 events and 3 sessions ([joch44 `DATA_PROFILE.md`](https://github.com/joch44/shopping-sessions/blob/e71539c/DATA_PROFILE.md)), so most groups fall in the 9-to-64 path, where the cost is quadratic: 12 keys need 24 vector compares.
+- **Expected gain.** 3 to 10% of the sessions phase, so at most 1.5% of wall. Do it after 7.1, which is larger and free.
+- **Risk.** None to exactness: any order of equal `ts` gives the same output (entry 7.1).
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
 
-- cherylaurelia's sessions phase (`src/main.rs` from line 2363): rank sort for small groups and the vector 7-day window, as a spec.
-- Vibhor7-7's reader (`src/reader.rs`): how 256 KB blocks carry partial lines, for the `pread` A/B.
+- Vibhor7-7's reader (`src/reader.rs` from line 161): how 256 KB blocks carry partial lines, for the `pread` A/B.
 - micah-andelman `scan2` and joch44 `split_masked`: two more implementations of the mask split to compare with 14.1.
 - New repos and scores from the public search API.
