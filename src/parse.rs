@@ -686,7 +686,6 @@ pub fn scan_lines_fast<'a, const N: usize>(data: &'a [u8], start: usize, end: us
         let c = ((c0 as u128) | ((c1 as u128) << 64)) & lm;
         let q = ((q0 as u128) | ((q1 as u128) << 64)) & lm;
         let s = c | (1u128 << len);
-        let line_start = ls;
         ls += len as usize + 1;
         if c.count_ones() as usize != N - 1 {
             continue;

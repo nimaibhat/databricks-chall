@@ -452,29 +452,22 @@ fn main() {
         let (mp, dead) = unsafe { dscr.get(t) };
         let bs = unsafe { blocks.get(t) };
         let sb = unsafe { sbl.get(t) };
-        dedup_partition(lists, mp, dead, sb, bs);
+        dedup_partition(&ctx, lists, mp, dead, sb, bs);
     });
     let sparts = transpose(sbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
 
-    // ---- phase 3b: user -> person, per user-hash partition
-    let sparts = PerThread::from_vec(sparts);
+    // ---- phase 3b: clicks user -> person, per user-hash partition (events were resolved in dedup)
     let cparts = PerThread::from_vec(cparts);
-    let smv = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
     let cmv = PerThread::new(threads, || (0..(1usize << p2_bits())).map(|_| BList::<CRec>::new()).collect::<Vec<_>>());
     if !ctx.links.is_empty() {
         par_for(1usize << p2_bits(), threads, |t, p| {
             let bs = unsafe { blocks.get(t) };
             let map = Some(&ctx.links[p]);
-            resolve_partition(p, map, unsafe { sparts.get(p) }, |r: &mut SRec| &mut r.person, unsafe { smv.get(t) }, bs);
             resolve_partition(p, map, unsafe { cparts.get(p) }, |r: &mut CRec| &mut r.person, unsafe { cmv.get(t) }, bs);
         });
     }
-    let mut sparts = sparts.into_inner();
     let mut cparts = cparts.into_inner();
-    for (p, v) in transpose(smv.into_inner(), 1usize << p2_bits()).into_iter().enumerate() {
-        sparts[p].extend(v.into_iter().filter(|l| l.len > 0));
-    }
     for (p, v) in transpose(cmv.into_inner(), 1usize << p2_bits()).into_iter().enumerate() {
         cparts[p].extend(v.into_iter().filter(|l| l.len > 0));
     }
@@ -704,6 +697,7 @@ fn resolve_partition<T: Copy>(
 /// Keeps, per event_id, the copy with the smallest ingest_ts; emits it if valid.
 #[inline(never)]
 fn dedup_partition(
+    ctx: &Ctx,
     lists: &mut [BList<ERec>],
     mp: &mut KMap<u64>,
     dead: &mut Vec<u64>,
@@ -738,18 +732,37 @@ fn dedup_partition(
             }
         });
     }
-    // pass 2: survivors, sequentially
+    // pass 2: survivors, sequentially, with user -> person resolved through a
+    // small ring so the links lookup is prefetched PD records ahead
+    const PD: usize = 8;
+    let mut ring = [(SRec::default(), 0u64); PD];
+    let mut nr = 0usize;
+    let emit = |s: SRec, h: u64, sb: &mut [BList<SRec>], bs: &mut Blocks| {
+        let v = ctx.person_h(s.person, h);
+        let hv = if v == s.person { h } else { hk(v) };
+        unsafe { sb.get_unchecked_mut((hv >> (64 - p2_bits())) as usize) }.push(SRec { person: v, ..s }, bs);
+    };
     let mut i = 0u32;
     for l in lists.iter() {
         l.for_each_slice(|sl| {
             for r in sl {
                 if r.pc != INVALID && dead[(i / 64) as usize] & (1 << (i % 64)) == 0 {
-                    unsafe { sb.get_unchecked_mut((hk(r.person) >> (64 - p2_bits())) as usize) }
-                        .push(SRec { person: r.person, ts: r.ts, pc: r.pc }, bs);
+                    let h = hk(r.person);
+                    ctx.prefetch_person(h);
+                    let slot = &mut ring[nr % PD];
+                    if nr >= PD {
+                        emit(slot.0, slot.1, sb, bs);
+                    }
+                    *slot = (SRec { person: r.person, ts: r.ts, pc: r.pc }, h);
+                    nr += 1;
                 }
                 i += 1;
             }
         });
+    }
+    for k in nr.saturating_sub(PD)..nr {
+        let (s, h) = ring[k % PD];
+        emit(s, h, sb, bs);
     }
     for l in lists.iter_mut() {
         l.release(&mut bs.free);
