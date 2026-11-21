@@ -1766,6 +1766,16 @@ The user asked whether a jump to the board's top is findable (board at 06:54: 0.
 
 Nothing here is a 30% idea on its own. The entry is level with ours on AMD, so its value is the pointer to vendor-specific tuning, which needs the Cascade Lake machine of 47.2.
 
+## Iteration 49 (2026-11-21, 08:35): two more teams see the scorer disagree with their own machines
+
+`OVERNIGHT_LOG.md`: experiments 61 and 62 (union-find on the dense numbers, with and without pre-fault through the naming passes) rejected, +0.5 to +1% on Intel; pick still `73f8661`.
+
+- [Th3r0n `BENCH.md` at `9db3c00`](https://github.com/Th3r0n/shopping-sessions/blob/9db3c00/BENCH.md), "Scorer vs local, cold cache": board 1.10, 1.07, 1.05 s for local in-process 0.642, 0.616, 0.573 s; "the scorer moves by about half of the internal change (noise, a large fixed part, or I/O)". Half a second on the board is not in their process timer. They have now added probe builds (`SS_PROBE=time`, `env`, phase marks) to read the scorer.
+- [micah-andelman `21b62d3`](https://github.com/micah-andelman/shopping-sessions/commit/21b62d3): "board diagnostic ... to isolate which v5.13 change is slower on the scorer": a change that won locally lost on the board.
+- With Vibhor7-7's "about 0.36 s of the 0.78 s is outside what the in-process timer sees" (25.2) and this repo's own reversal against Vibhor7-7 (47.2), four teams now report the same thing: a large part of a board score is not the compute their timers and runners measure. The leader's 0.31 s is below that part for everyone else, so that part is avoidable, not fixed. What it could be, in order of what the sources support: memory that is touched and torn down (page zeroing at first touch and unmapping at exit, both on 4 KiB pages unless THP is granted; the scorer's THP mode is `madvise`); output bytes flushed to ext4 before the container is reported exited (29); the input copy from tmpfs. All three scale with bytes, not instructions, and all three are cheap on the AMD runners.
+- **Consequence for ranking.** Byte-count items move up and instruction items down: smaller records (48), `_exit` without unmapping and with the arena released by `MADV_DONTNEED` only if that is measured faster, peak memory as a first-class number in every A/B. Our peak is about 1.1 GB at 20M; Js-Hwang1's 12-byte events and Vibhor7-7's 1.14 GB are the comparisons. None of this can be sized without a Cascade Lake machine (47.2) or a probe submission that reports `rusage`, fault counts and phase stamps from the dev-set run.
+- Vibhor7-7 experiments 35 to 37 (offset timestamps finished in the parse, campaign cells side by side): each under 1%, not ranked.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
