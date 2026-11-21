@@ -1,6 +1,6 @@
 # OVERNIGHT_LOG.md
 
-**SUBMIT THIS: `1c4fa8e`** (source unchanged since; later commits on main so far are notes only). x86 runner (4 vCPU EPYC 9V74, full `docker run` wall, median of 7): 20M 2.32 s, 60M 6.99 s. It is the best *verified* build so far: 36/36 fixtures, dev answer, 20M/60M golden, identical at 1/2/8 threads. Nothing faster has passed the gate yet.
+**SUBMIT THIS: `e7a116f`** (category lookup only for purchases). x86 runner, full `docker run` wall, median of 7, same run as its parent: 20M 2.822 s vs 2.889 s, 60M 8.056 s vs 8.253 s (Xeon 8573C, 4 vCPU; ranges do not overlap). Passed the full gate: 36/36 fixtures, dev answer, 20M at 1/2/8 threads and 60M equal to the goldens, same on the x86-64-v3 build, outputs equal on the x86 runner. It is the fastest build that has passed everything; larger changes are still being measured.
 
 How to read the numbers: "x86" is a GitHub Actions `ubuntu-latest` runner (4 vCPU, 16 GB; CPU model varies per run, so only same-run comparisons count), timed around the whole `docker run` with the scorer's flags, variants interleaved, warm page cache. "M4" is this Mac (arm64, 10 cores), process wall. The x86 number decides.
 
@@ -21,9 +21,12 @@ Reading: Vibhor's build scored 0.82 to 0.96 s on the board and takes 1.59 s here
 
 ## Experiments
 
+Before/after pairs come from one x86 run each; absolute times differ between runs because the runner CPU differs (EPYC 9V74 in run 1, Xeon 8573C in run 2, where container start/stop alone is about 0.5 s).
+
 | # | Commit | Change | x86 20M before/after | x86 60M before/after | M4 20M before/after | Verdict |
 |---|---|---|---|---|---|---|
 | 0 | `1c4fa8e` | baseline | 2.323 | 6.988 | 0.517 | baseline |
+| 1 | `e7a116f` | Category lookup only for purchases; per-line atomic and `OnceLock` loads hoisted | 2.889 / 2.822 (min-max 2.876-3.019 / 2.802-2.843) | 8.253 / 8.056 (8.192-8.615 / 8.034-8.136) | 0.516 / 0.506 | kept |
 
 ## Current phase profile (`1c4fa8e`)
 
@@ -47,7 +50,7 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 | Write-combining stages with non-temporal stores for the scatters | Vibhor7-7 BENCH.md exp. 18 (-12% Ice Lake, -6% Zen 4); RESEARCH_NOTES 1.2, 6 | 6 to 12% on Intel | queued |
 | Line-at-a-time split from the line's own comma/quote masks; quote validity by mask arithmetic | cherylaurelia `fast_split` (ratios 0.90 to 0.95); RESEARCH_NOTES 2.1, 4.1, 10.1 | 3 to 8% | queued |
 | SIMD ID packing (nibble tables + multiply-add) | Muła and Lemire base64; cherylaurelia `e3bdd51`; Vibhor exp. 2 (-8.6%) | 2 to 8% | queued |
-| Product lookup only for purchases; hoist per-line atomic loads | micah-andelman `44f244e`; RESEARCH_NOTES 1.1, 8.2 | 1 to 2% | queued |
+| Product lookup only for purchases; hoist per-line atomic loads | micah-andelman `44f244e`; RESEARCH_NOTES 1.1, 8.2 | 1 to 2% | done: -2.3% (experiment 1) |
 | Known-date table for timestamps | RESEARCH_NOTES 1.4 | 2 to 5% of parse | queued |
 | `pread` into an L2-sized buffer instead of mmap | Vibhor exp. 10 (mmap +7.5% on a VM); RESEARCH_NOTES 1.5, 3.2 | -7 to +7%, must be measured | queued |
 | Sort 8-byte keys per person; 30-minute bins | RESEARCH_NOTES 7.1, 1.6 | 2 to 4% | queued |
