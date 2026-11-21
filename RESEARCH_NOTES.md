@@ -6,19 +6,19 @@ Research-only notes for the optimizing session. Nothing here has been built or b
 
 ## Top five untried ideas (ranked by expected gain per unit of correctness risk)
 
-Re-ranked in iteration 23. The optimizer's experiment branches (`origin/gate-s2` to `gate-s6`, not yet in the log's experiment table) already implement the previous top three and two runners-up: person lookup at parse with tombstone dedup, the line-at-a-time scanner, SIMD ID packing, a write-combining scatter and a chunk-size knob for `IOMODE=4`. A teammate branch (`origin/saran/work`) has a dedup bitmap prefilter. So the list below is what is still untried anywhere, assuming those branches land. Line numbers in the "Where" column refer to `origin/gate-s6-40e0519`.
+Re-ranked in iteration 24 against `OVERNIGHT_LOG.md` at 01:05. `main` is now `e75b17b`: experiments 2 to 5 (person at parse with tombstone dedup, line-at-a-time scanner, SIMD ID packing, write-combining scatter) are kept, 1.553 s against 1.654 s for the previous pick on the same runner. In-process time at 20M on 4 vCPUs is about 1.07 s: parse 0.673, sessions 0.214, links 0.084, dedup 0.060, output 0.035. The log's own queue already holds the date table (being measured), a scanner instruction diet, 8-byte sort keys, interval assists and a dedup prefilter, so those are listed here only where this file adds something. Line numbers refer to `main` at `e75b17b`.
 
 | # | Idea | Where | Expected gain | Risk to exactness | Entry |
 |---|---|---|---|---|---|
-| 1 | Sort 8-byte `(ts << 32) \| pc` keys per person instead of 16-byte `SRec`s | `process_partition`, `main.rs:782-800` and the sort and sweep after | Measured by a competitor at -2.8% for the same change; three teams do it. Sessions is now a larger share, since the resolve pass is gone | None | [7.1](#71-sort-8-byte-keys-per-person), [11.3](#113-measured-numbers-for-ideas-already-in-this-file) |
-| 2 | Known-date table for timestamps, with one-expression validation and one-word time of day | `civil_swar`, `parse_ingest_s`, `parse_ts_fast` in `parse.rs` | 50 to 70 instructions per event line by hand count; another team measured timestamp work at -8% of total. Model-checked | Low | [15.3](#153-the-date-table-concretely), [15.1](#151-validate-digits-and-separators-in-one-expression-per-word), [15.2](#152-hour-minute-and-second-from-one-word-and-one-multiply) |
-| 3 | Dedup without a key table: two-bit counters find the few repeated ids, only those are sorted | `dedup_partition`, `main.rs:679-710` | The table is still 16-byte slots at load 0.25 to 0.5, cleared per partition (2 to 4 MB each). Five teams use a filter or sketch; `saran/work` has a bitmap prefilter in progress | Low | [9.1](#91-two-bit-counters-instead-of-a-key-table), [23.2](#232-what-is-still-slow-on-that-branch) |
-| 4 | Branch-free link lookup: four keys then four values per cache line, one vector compare, `select_unpredictable` | `LinkTab::get`, `keys.rs:262-276` | Measured by a competitor at -2% and -1.5% for the two parts | Low | [18.1](#181-one-cache-line-per-lookup-four-keys-then-their-four-people), [23.2](#232-what-is-still-slow-on-that-branch) |
+| 1 | Take the serial work out of start-up: catalog load on a side thread, and prefetch (then parallelise) the serial union-find and naming loop | `main.rs` phase 0 before `build_links`; `build_links` union-find and naming | Links are 0.084 s and the catalog load about 0.015 to 0.02 s of 1.07 s in-process, mostly on one thread while three sit idle: up to 6 to 8% of in-process time | Low for the side thread and the prefetch; medium for a parallel union-find | [8.1](#81-catalog-load-is-about-60m-serial-instructions-before-anything-parallel-starts), [7.3](#73-union-find-prefetch-before-changing-the-algorithm), [24.3](#243-links-are-now-8-of-in-process-time-and-mostly-serial) |
+| 2 | Scanner field loop on 64-bit halves with byte-packed offsets, instead of `u128` shifts and seven fat-pointer slices | `scan_lines` field loop in `parse.rs` | By hand count about 200 of the scanner's roughly 300 instructions per line are in that loop; a halves version is about 70. The stage is 34.5 of 130 ns per line. In the log's queue; the halves algorithm is already model-checked here | Medium (scanner) | [24.2](#242-the-scanners-field-loop-is-most-of-its-cost), [14.1](#141-a-line-at-a-time-splitter-that-scans-each-byte-once) |
+| 3 | Branch-free link lookup: four keys then four values per cache line, one vector compare, `select_unpredictable` | `LinkTab::get` in `keys.rs`, `emit_event` and `emit_click` in `main.rs` | The ring and lookup stage is 14.9 of 130 ns per line, and experiment 2 was slower on its own because of it. A competitor measured -2% and -1.5% for the two parts | Low | [18.1](#181-one-cache-line-per-lookup-four-keys-then-their-four-people), [23.2](#232-what-is-still-slow-on-that-branch) |
+| 4 | Sort 8-byte keys per person, and 16-byte click records | `process_partition` | Sessions is now 20% of in-process time. A competitor measured -2.8% for the event half. In the log's queue | None for events; low for clicks | [7.1](#71-sort-8-byte-keys-per-person), [13.2](#132-16-byte-click-records-inside-a-person-group) |
 | 5 | Profile-guided optimisation, as the last step once the source settles | `Dockerfile` | Measured by a competitor at -2.7% (20M) and -4.1% (60M) | None to exactness; a build failure is a rejected submission | [16.4](#164-profile-guided-optimisation-a-measured-3-to-4-reopening-a-rejected-item) |
 
-Runners-up, in order: catalog load off the serial path ([8.1](#81-catalog-load-is-about-60m-serial-instructions-before-anything-parallel-starts)); 16-byte click records ([13.2](#132-16-byte-click-records-inside-a-person-group)); serial union-find prefetch and running the link tail beside the parse ([7.3](#73-union-find-prefetch-before-changing-the-algorithm), [16.5](#165-serial-sections-another-team-found-once-its-parse-got-fast)); interval assists ([17.1](#171-assist-increments-369-million-scattered-adds-at-20m)); 256-bit stores and a stage-size sweep in the scatter ([23.2](#232-what-is-still-slow-on-that-branch)); rank sort for small groups ([19.2](#192-branch-free-rank-sort-for-small-groups)); 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)).
+Runners-up, in order: dedup with two-bit counters ([9.1](#91-two-bit-counters-instead-of-a-key-table); dedup is down to 0.060 s, so this fell); interval assists ([17.1](#171-assist-increments-369-million-scattered-adds-at-20m)); 256-bit stores and a stage-size sweep in the scatter ([23.2](#232-what-is-still-slow-on-that-branch)); one-multiply hash ([1.7](#17-one-multiply-hash); `hk` now runs three times per event line); rank sort for small groups ([19.2](#192-branch-free-rank-sort-for-small-groups)); 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)).
 
-Closed: everything for a cold page cache (1.9, 3.1), because `/data` on the scorer is reported to be tmpfs; output size, unless this repo's own bench shows a cost after exit (20.1, 20.5, 22.4).
+Closed: everything for a cold page cache (1.9, 3.1); output size (20.1, 20.5, 22.4); `pread` against mmap, measured by the optimizer as within noise at 20M and about -1% at 60M (experiment 6).
 
 ## A finding to act on before trusting the TSBL toggle
 
@@ -29,7 +29,13 @@ Closed: everything for a cold page cache (1.9, 3.1), because `/data` on the scor
 ## What is already tried, rejected or queued (do not re-propose)
 
 - Implemented and kept, from this file: product category only for purchases and hoisted per-line loads (entries 1.1 and 8.2; experiment 1 in `OVERNIGHT_LOG.md`, commit `e7a116f`, -2.3% at 20M and -2.4% at 60M on the x86 runner, against a competitor's -2.3% for the same change).
-- Implemented on experiment branches, awaiting the log's verdict (as of 00:59): person lookup at parse through a prefetched global link table, one scatter by person, 16-byte dedup keys that mark losers dead in place, resolve pass removed (`242e9bc`; entries 1.3, 14.2, 18.1, 13.1); line-at-a-time scanner with 128-bit mask windows and mask quote validity (`6c99487`; entries 14.1, 2.1, 4.1); SIMD ID packing (`7f18df9`; entry 14.3); `CHUNKKB` with 256 KiB default under `IOMODE=4` (`068baf1`; entries 1.5, 21.1); write-combining scatter with 128-byte stages and non-temporal stores (`40e0519`; entries 1.2, 6). On `saran/work`: a 28-byte `ERec`, links built during parse, a dedup bitmap prefilter (`40f157f`).
+- Measured by the optimizer (experiments 2 to 6 in `OVERNIGHT_LOG.md`, x86 runner):
+  - Person lookup at parse through a prefetched global link table, one scatter by person, tombstone dedup (`b9c5acc`; entries 1.3, 14.2, 18.1, 13.1): **slower on its own, +1.9%** (parse +0.21 s, dedup and resolve -0.18 s), kept as the base of the scanner.
+  - Line-at-a-time scanner (`3826acb`; entries 14.1, 2.1, 4.1): the pair -2.5 to -4.8% at 20M and -3.2 to -6.3% at 60M, kept.
+  - SIMD ID packing (`cc5e2bd`; entry 14.3): -3.0%, kept.
+  - Write-combining scatter with non-temporal stores (`e75b17b`; entries 1.2, 6): -2.4% at 20M and -2.1% at 60M on an EPYC runner, kept. No Intel runner has been seen yet.
+  - `IOMODE=4` with 256 KiB and 1 MiB chunks against mmap (entries 1.5, 21.1): within noise at 20M, about -1% at 60M, not switched.
+- In progress there: the date table (`gate-s7`; entries 1.4, 15.3; "-6% single-thread parse on the Mac"). On `saran/work`: a 28-byte `ERec`, links built during parse, a dedup bitmap prefilter.
 - Implemented (git log): `civil_swar` fix; one-word `Catalog::get`; `FLAT16` and `TSBL` toggles; sliding-window assists; `P1BITS`/`P2BITS`; AVX-512BW masks behind `XCPU`; background read-ahead; SWAR F2; `pack_fast`; branch-free quote check; unchecked F1 ingest; dense catalog; per-partition resolve; flatten-based scanner; prefetch pipeline for parse-time person lookup (replaced by per-partition resolve in `b3c1d38`).
 - Queued in `speedups.md` and not yet in git: reserve `Acc.users`; reserve or stream Parquet buffers; `MADV_WILLNEED` fallback; largest partition first; links concurrent with parse; INT32 counts. Competitor numbers for two of these are in [1.10](#110-competitor-numbers-for-ideas-already-queued).
 - Rejected in `speedups.md` by measurement: `IOMODE=4` as default (one run, whole 4 MB chunk per `pread`), `DROP=1`, `AREL=1`.
@@ -963,6 +969,49 @@ Read from `parse.rs:477-587` at `40e0519` (commit `6c99487`).
 - **Trim 1: 128-bit shifts and bit scans in the field loop** (`:571-584`). `m.trailing_zeros()` and `m &= m - 1` on a `u128`, and `(q >> fs) as u32` with a variable shift of a `u128`, each compile to several instructions with a branch or conditional move, six or seven times per line. cherylaurelia's version works on the two 64-bit halves separately (comma offsets from each word, merged by a shift of `8 * popcount(c0)`; quoted flags through `pext`/`pdep`), which keeps every operation a single 64-bit instruction (entry 2.1, lines 1352 to 1380 of their `src/main.rs`). TejasviniChawla measured its own `u64`-halves splitter at only 1 ns per line better (entry 22.1), so this is small.
 - **Trim 2: three blocks recomputed per refill.** Each refill restarts at the current block and recomputes the masks of blocks that the previous segment already covered as its three look-ahead blocks: about 5% more `masks64` calls than needed. Carrying the last three words forward removes it.
 - **Expected gain.** A few percent of the scanner at most; listed for completeness now that the scanner is the newest code.
+
+---
+
+## Iteration 24 (2026-11-21, 01:15): where the remaining 2.4x is, from the log's stage profile
+
+`OVERNIGHT_LOG.md` (01:05) says the fastest public build runs the same 20M set in about 0.43 s in-process against 1.07 s here, and gives a one-thread stage profile in ns per event line: scan and split 34.5, `event_id` pack and `ingest_ts` 12.6, `ts` 14.8, type, price, user pack and hash 13.0, prefetch ring and link lookup 14.9, event record push 9.0; then the dedup-key push and all click lines 31.
+
+### 24.1 The same stages in two other teams' logs
+
+| Stage | This repo (EPYC 7763, 1 thread) | TejasviniChawla (Zen 3, isolated) | Vibhor7-7 (Zen 4, 1 thread, per 21.6M lines) |
+|---|---|---|---|
+| Read | (mapped) | | 4.9 ns |
+| Scan and split | 34.5 ns | 20 + 19 = 39 ns | 11.9 ns (scan 9.9, line walk 2.0) |
+| Fields into values (both IDs, both timestamps, type, price, validation) | 12.6 + 14.8 + 13.0 = 40.4 ns | 10 + 5 + 8 + 8 = 31 ns | 36.6 ns |
+| Link lookup | 14.9 ns | | 7.5 ns |
+| Record pushes | 9.0 ns plus the dedup key | 15 ns | 15.5 ns |
+
+Sources: this repo's log; [TejasviniChawla notes](https://github.com/TejasviniChawla/shopping-sessions/blob/8ff776b/docs/NOTES.md) ("scan 20 | split 19 | ts 10 | ingest 5 | keys 8 | type/hash 8 | push 15"); [Vibhor7-7 `BENCH.md`](https://github.com/Vibhor7-7/shopping-sessions/blob/f245e54/BENCH.md), the "parse phase cut short at each stage" row, one-thread cumulative ms 105, 318, 361, 1152, 1313, 1647 divided by 21.6M lines (their line count is assumed equal to this repo's 20M set; the CPUs differ, so read ratios, not nanoseconds).
+
+- **Reading.** The decode ("fields into values") is now level with both. The two places still far off are the scan and split, three times Vibhor7-7's, and the link lookup, twice theirs. Those are items 2 and 3 of the table.
+
+### 24.2 The scanner's field loop is most of its cost
+
+- Entry 23.3 called the `u128` field loop "small". The stage profile says otherwise: 34.5 ns per line is roughly 300 instructions, and counting the code at `parse.rs` (the `for i in 0..N` loop of `scan_lines`): per field, a `u128` `trailing_zeros` (about 6 instructions), `m &= m - 1` on `u128` (5), a variable `u128` shift for the quote bit (8), and building and storing a two-word slice (about 10). That is about 29 per field, about 200 for 7 fields; the three mask windows, the validity test and the classification are the other 100.
+- **The halves version.** Take comma offsets from each 64-bit word separately as bytes of a `u64` (`p0 |= tzcnt(a) << 8j; a &= a - 1`, six rounds on both words with no data-dependent branch), merge with `(p0 & low(8 * n0)) | (p1 << 8 * n0)`, append the line length, derive starts as `(ends << 8) + 0x0101...00`, and get the quoted flags as `pdep(pext(x0, s0) | pext(x1, s1) << popcnt(s0), 0x0101...)`. Field `i` is then byte `i` of `at` and of `len`, read where it is used; no array of slices is built. About 70 instructions.
+- **Source and check.** [cherylaurelia `fast_split`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs) lines 1352 to 1380; the Python model at `scratchpad/chk2/split.py` (entry 14.1) is exactly this halves algorithm and matched the scalar rule on 6,000 buffers.
+- **Here.** `scan_lines` would hand the closure `(line pointer, at: u64, len: u64)` instead of `&[&[u8]; N]`; `parse_events` reads `f[k]` as `line + byte k of at` with length `byte k of len`. `build_links` and `parse_clicks` use the same call with N = 2 and 4. The scalar `split` fallback fills the same two words when the line is under 256 bytes and otherwise needs the old slice path.
+- **Expected gain.** About 130 instructions per line of roughly 1,000: 10 to 15 ns of the 130 ns line, so about 10% of parse, 6% of in-process time.
+- **Risk.** Medium, as for any scanner change; offsets are bytes, so the packed form only covers lines under 128 bytes, which is already the fast path's limit.
+
+### 24.3 Links are now 8% of in-process time and mostly serial
+
+- 0.084 s at 20M and 0.247 s at 60M on 4 vCPUs. `build_links` parses and interns in parallel, then runs the union-find over all pairs and the naming loop on one thread, then counts non-root IDs on one thread, then fills the `LinkTab` in parallel. The audit timed the union-find and naming at 34 to 109 ms at 20M on a slower box.
+- **Cheapest first.** (1) Prefetch `parent[a]` and `parent[b]` 8 to 16 pairs ahead in the union loop, and `name[parent[i]]` in the naming loop (entry 7.3). (2) Fold the `nmoved` count into the naming pass or compute it per shard inside the parallel fill with an atomic, so the table can be sized from an upper bound (`nids`) instead. (3) Run the catalog load (entry 8.1) on a side thread during all of this. (4) Only then a lock-free union-find in the final table, as cherylaurelia, Vibhor7-7 and axhiao do; joch44 measured that change as a tie at 1.5 s but it turned 0.25 s of serial work into 0.08 s of parallel work (entry 16.5), and it matters more the faster parse gets.
+- **Expected gain.** 3 to 6% of in-process time for steps 1 to 3.
+- **Risk.** None for 1 and 3; 2 changes only table sizing.
+
+### 24.4 Experiment 2's lesson for the link lookup
+
+- Moving the lookup into the parse loop cost 0.21 s of parse and saved 0.18 s elsewhere: a net loss until the scanner made up for it. The stage profile prices the ring and lookup at 14.9 ns per line, twice Vibhor7-7's.
+- What differs from the version that works (entry 18.1): the slot layout interleaves key and value, so a lookup is up to four compare-and-branch steps on a result that is a hit 39% of the time; and each pending record is 40 bytes copied into and out of the ring. Vibhor7-7 keeps the parsed record where it is and stores only the home index in the ring, compares four keys with one vector instruction and selects without a branch.
+- Also possible: the table is sized at 2 to 4 times the moved IDs (`LinkTab::new`, load 0.25 to 0.5). At 20M that is 32 MB; Vibhor7-7 found a table twice as large was slower (entry 18.1). A load near 0.5 at the bucket level, by sizing from the exact count, halves the footprint in the worst case of the power-of-two rounding.
+- **Expected gain.** 4 to 6 ns of the 130 ns line.
 
 ## Next iteration
 
