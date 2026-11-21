@@ -10,11 +10,13 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
-| 1 | Fresh numbers for the new pipeline (no code): lap line, `prof` thread-ms, fault count, user/system time, peak RSS, `perf report` top 15 symbols, and `perf annotate` of the new `ev_loop` | n/a | Directs everything else | Every figure these notes rank by was measured on `941879e`/`801982c`; the parser, record size, click index and writer have all changed since (experiments 15, 16) | None | 18.1 |
-| 2 | Staging footprint of the 12-byte event path: first the 10M parse lap (no code), then the prefetch pre-pass | `parse.rs:428` (`EvPart::push_many`) | Pool about 7 ms at 20M if the bucket-count line extrapolates (arithmetic on experiments 15 and 16, mine); the prefetch would take part of it, **my estimate** 0 to 2 ms | Staging is now 256 B per bucket per thread (was 64 B): 197 KB at 20M, 295 KB at 30M, two hyperthreads per 1 MiB L2 | None | 19 |
-| 3 | Frequency-licence probe at three points | end of `stage1`, end of `stage3a` | Diagnostic | Still not run; the new push path uses a masked 128-bit store only, so the picture has not got worse | None | 14.2 |
-| 4 | (empty until 18.1's numbers exist) | | | | | |
-| 5 | (empty) | | | | | |
+| 1 | Fresh numbers for the new pipeline (no code): lap line, `prof` thread-ms, faults, user/system time, `perf report` top 15, `perf annotate` of `ev_loop`; plus two new counters: a histogram of event-line shapes (21.2) and the TLB row of `/proc/interrupts` before and after a run (21.4) | n/a | Directs everything else | All ranking figures predate the new pipeline | None | 18.1, 21 |
+| 2 | Map each input file at a 2 MiB-congruent address, so a tmpfs with huge folios is mapped by 2 MiB entries | `setup.rs` (where files are mapped into the region; `io_advise` is called there) | Nothing if the scorer's tmpfs has 4 KiB folios (the default); if it has huge folios, most of the input fault and unmap work goes, which was about 20% of parse thread time on the old build (log). **My guess at the odds: 5 to 10%** | Kernel source and docs (quoted in 21.1): large folios are mapped whole when the mapping is congruent; default mount policy is `never` | None: only addresses change | 21.1 |
+| 3 | Frequency-licence probe at three points | end of `stage1`, end of `stage3a` | Diagnostic; ceiling is the L0 to L1 gap, 12.5% on the one Skylake-X part with published figures (quoted, 21.3) | Literature: sustained 256-bit integer multiplies request L1, and the drop applies to both hyperthreads of the core | None | 14.2, 21.3 |
+| 4 | Dominant-shape fast path in the event scanner, **only if** the histogram of row 1 shows one or two shapes covering most lines | `k_free.rs` `ev_loop` | Unknown until the histogram exists; published gains for this trick are 15 to 25% of scan time in other parsers (quoted, different programs) | 1BRC write-ups (21.2) | Low if the fast path falls back to the existing code on any mismatch; it is new scanner code, so full gate | 21.2 |
+| 5 | Stage 3 dedup table with 12-byte slots (the arena record copied as is, widened in the compaction) | `events.rs:262` (`scatter_chunk12`) and the compaction after it | **My estimate** 1 to 2 ms, by proportion from the 3.5 ms measured for halving the table | Experiments 9 and 15; literature agrees the stage is L2-capacity-bound (21.5) | Row-sensitive: this code decides which duplicate survives. Ranked last for that reason | 20, 21.5 |
+
+Staging prefetch (19, change A) is demoted: the partitioning literature measures prefetch as neutral to negative below about 1,024 partitions (21.5). The 10M parse lap is still worth having.
 
 **All file and line references below iteration 18 are to the old source and are stale.**
 
@@ -607,6 +609,48 @@ Read `scatter_chunk12` (`events.rs:262-330`). Per record: one unaligned load, on
 - **No prefetch to add.** The slot index is in the record itself and the loads of successive records are independent, so the out-of-order window already overlaps about 20 of them. A software prefetch of the slot would duplicate that.
 - **What limits it is the table size.** The table is 2^15 slots of 16 B, 512 KB per thread, so two hyperthreads fill their shared 1 MiB L2 exactly, before the input chunk. Evidence: halving it (bucket 2^14) took 3.5 ms off ev3a in experiments 9 and 15, and the second hyperthread adds only 1.14x in ev3a (experiment 13) against 1.22x in parse.
 - **Speculative idea, not ranked:** keep the slots at 12 B, as the records already are in the arena, and widen to 16 B only in the compaction that follows. That is 384 KB per thread, 768 KB per pair. If the gain scales with the size cut (a quarter against a half), it is 1 to 2 ms (**my estimate**, by proportion from the 3.5 ms above). It means rewriting the tag test, the keep-smallest-ingest rule and the 512-bit compaction for 12-byte slots, all of which decide which copy of a duplicated event survives. That is exactly the row-sensitive code, so by the rule of these notes it ranks below everything output-neutral and I would only take it up if the fresh profile (18.1) shows ev3a's scatter well above its old 98 thread-ms share.
+
+## Iteration 21 (2026-11-21): literature pass (kernel, parsing, partitioning)
+
+Three searches of papers, kernel sources and public write-ups. Headline, stated plainly: **nothing found beats the current design; the literature puts it at or past the published state of the art, on a flat optimum.** What follows is what survived. "Quoted" means the figure is from the source named; everything else is my inference.
+
+### 21.1 Kernel side
+
+- **Dead, with reasons:** no zero-copy read of tmpfs page cache exists other than mapping (splice, io_uring fixed buffers, `O_DIRECT` on tmpfs, `process_vm_readv` all copy). Fault-around is fixed at 64 KiB and tunable only through debugfs; our 29k faults for 2.3 GB means it is already at its ceiling. `MAP_POPULATE` uses the same path as `MADV_POPULATE_READ` (measured null, experiment 4). No uninitialised memory without a kernel build option. `munmap` is never cheaper than `MADV_DONTNEED`. Exit-in-a-child tricks do not work for a container's main process: the kernel waits for every process in the PID namespace before the container is seen to exit. `MADV_COLLAPSE` inside the run costs a copy. The double zeroing of huge pages with `init_on_alloc` was fixed in 6.13, so not on 7.0.
+- **Per-VMA locks:** since 6.7 file faults and since about 6.17 `MADV_DONTNEED` take only the per-VMA lock, so eight threads on one mapping do not contend, provided each `madvise` call stays inside one VMA.
+- **Teardown cost, quoted** (2026 RFC, 32-CPU bare metal): tmpfs mapping about 8.8 ms per GB single-threaded; huge-page anonymous memory about 1.7 ms per GB. So the anonymous memory left at exit (305 MB) costs about 0.5 ms and should be left alone, which is what the code does.
+- **The one live item (row 2).** If a tmpfs is mounted `huge=always` or `huge=within_size`, files written to it get large folios (kernel 6.14 on), and a reader's fault maps a whole folio, or a 2 MiB entry, at once, but only if the mapping address is congruent with the file offset modulo 2 MiB. With the default policy (`never`) nothing changes. The check on any machine: `huge=` in `/proc/self/mountinfo`, and `ShmemPmdMapped` in `/proc/self/smaps`. To size the upside on the VM: remount the test tmpfs with `huge=always`, copy the set in again, run with aligned mappings.
+- Sources: kernel `mm/memory.c`, `mm/shmem.c`, `mm/madvise.c`; docs.kernel.org `admin-guide/mm/transhuge.html`; man pages `madvise(2)`, `mmap(2)`; lkml 2607.2/06062 (teardown RFC).
+
+### 21.2 Parsing
+
+- **Where we stand, quoted figures:** Ellmann and Neumann (PVLDB 2026) report 1.8 to 2.1 GB/s per thread for counting records only on Zen 5, and about 0.31 GB/s per core with all columns converted. simdjson reports 2.2 GB/s on Skylake. This binary does about 1.9 GB/s per hyperthread with full conversion and partitioning. A two-stage structural index would be slower on 85-byte lines (my arithmetic from their per-byte costs: 70 to 127 cycles per line against about 40 for our whole scanner).
+- **Dominant-shape fast path (row 4).** QuestDB's write-up: specialising on the commonest shape cut branch misses from 0.657 to 0.084 per row and time from 2.4 to 1.8 s; the 1BRC winner's branch-to-mask step gave 15.4% (both quoted, other programs). Here it would mean: compare the line's comma mask with one or two constants, and on a match run with every shuffle and length constant in registers, no table reads. It pays only if shapes are concentrated; the generator makes IDs fixed-length, so they may be. **Needed first:** a histogram of the shape key the scanner already computes (one counter array in a `knobs` build).
+- **Multiple cursors per thread:** 4 to 22% in 1BRC entries (quoted), but the same author found hyperthreading stopped helping once he interleaved. With two threads per core already, expect little. Not ranked.
+- **Not applicable:** IFMA/VBMI tricks (not on this CPU); `vpmuludq` for `vpmullq` (the key recovery needs the low 40 bits of a 40x64 product, which is three `vpmuludq` anyway).
+- Sources: vldb.org/pvldb/vol19/p3579-ellmann.pdf; arxiv.org/pdf/1902.08318; questdb.com/blog/billion-row-challenge-step-by-step; curiouscoding.nl/posts/1brc; github.com/thomaswue/1brc-steps.
+
+### 21.3 Frequency licences
+
+Quoted (Lemire 2018; Downs 2020, Xeon W-2104): heavy instructions are floating point and integer multiplies; sustained 256-bit heavy use moves the core to L1; the drop covers the sibling hyperthread; L0/L1/L2 were 3.2/2.8/2.4 GHz on that part; returning to L0 takes about 680 microseconds. No published Cascade Lake measurement of 256-bit integer multiplies was found, so the probe (row 3) is the only way to know. If parse sits in L1 because of `vpmullq` in `ev_vec`, the remedy is a scalar or 128-bit key recovery, worth up to the L0/L1 gap on everything in parse.
+
+### 21.4 Cross-CPU TLB flushes
+
+Every `MADV_DONTNEED` over more than 33 pages is a full TLB flush sent to every CPU running the process (kernel `arch/x86/mm/tlb.c`), which also drops each thread's 2 MiB entries for the arenas. About 2.7 microseconds per flush on bare metal (quoted, LATR paper), more in a VM. Count them: the TLB row of `/proc/interrupts` before and after one run. If the count is in the thousands, fewer and larger release calls are worth a test; if it is a few hundred (my expectation with 64 MiB chunks), close it.
+
+### 21.5 Partitioning and dedup
+
+- **Staging:** Schuhknecht et al. (PVLDB 2015) find the best staging footprint is about half the L2 and that small buffers (under 8 lines) with non-temporal flushes are best; Zhang et al. (CIDR 2019, Skylake) say to group records to the stream width, which is exactly 16 x 12 = 192 B. Balkesen et al. (ICDE 2013): with 2 MiB pages a single pass beats two passes. All quoted. The current layout matches every recommendation.
+- **Prefetching staging:** Schuhknecht, quoted: prefetching "decreases the performance if misses are not a major problem, e.g. for less than 1024 partitions". That is against 19's change A at 769 buckets; demoted.
+- **Split stores:** 2.3 cycles against 1.05 for a store crossing a line on Skylake (quoted, Ertl). At 3 of 16 rows that is about 0.2 cycles per record. Closed.
+- **Compress:** 2 cycles per 512-bit compress (uops.info), under 1 ms of the run. Closed.
+- **Stage 3 is L2-capacity-bound** (two 512 KB tables in a 1 MiB L2); the literature's SMT figures for such code are 1.0 to 1.1x, ours is 1.14x. The only lever is a smaller slot (row 5). An 8-byte slot is not possible: a record without its in-bucket id is 81 bits.
+- **Alternatives examined and rejected:** a global bitmap of seen ids (shared, needs locked updates, larger than L2); a Bloom pre-filter (helps when most rows are dropped; here 96% survive); two-pass partitioning (break-even at best at this size).
+- Sources: vldb.org/pvldb/vol8/p934-schuhknecht.pdf; cs.columbia.edu/~orestis/sigmod14I.pdf; vldb.org/cidrdb/papers/2019/p133-zhang-cidr19.pdf; Balkesen ICDE 2013; complang.tuwien.ac.at/anton/unaligned-stores.
+
+### 21.6 What this means for a target of 0.27
+
+The searches found no technique worth tens of milliseconds. The candidates above are each a few ms at best, except row 2, which is large but depends on a mount option we cannot see. If the board keeps the best of several noisy draws, repeated submission of the same build is the largest remaining lever.
 
 ## Next passes
 
