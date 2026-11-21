@@ -78,6 +78,14 @@ v21p                       wall min 299.0 med 302.1 max 303.8 | setup=0.0 parse=
 
 Experiment 17: on 9363748 (`v21p`), seed 20. (a) The other eleven variants in upstream's probe set (`v/18, b13, c2, dt, e2, fr, k, m1, m2, mn, o2`), built as they are, 7 rounds: all slower than `v21p` (199.4 / 200.0): 18 204.4, b13 201.0, c2 206.6, dt 212.5, e2 205.8, fr 205.5, k 211.0, m1 209.8, m2 215.4, mn 215.8, o2 209.0. They are older states of the same pipeline. (b) Runtime knobs, 6 rounds each, control 196.0 / 200.3: `XL_RECYCLE=0` 205.1 (ev3a +8); `XL_QORD=0/1` 222 / 219 (parse +23); `XL_RELK`, `XL_IOADV`, `XL_R3`, `XL_DONATE`, `XL_POPW=1`, `XL_FA=1`, `XL_PSETUP=0`, `XL_FREE=0`, `XL_FRLAG=0/4`, `XL_CH=32768/131072`, `XL_PF=0/1` all 195.3 to 200.5 at the minimum and 199.3 to 202.2 at the median, i.e. no different from the control. Rejected, nothing changed.
 
+Fresh numbers for 9363748 (`v21p`), research 18.1. One run each, VM tmpfs, 8 CPUs.
+
+- 20M seed 20: `s.list=0.7 s.mmap=1.0 s.sample=0.9 maps+keys=0.3 lookups=0.0 parse=150.4 ev3a=34.7 stitch=0.1 ev3b=2.4 write=7.3 total=197.8`; user 1.32 s, sys 0.24 s, elapsed 0.19 s; peak RSS 1,366 MB (was about 620 MB on the old source; counts the mapped input); minor faults 29,462, major 0; `nb=769 nub=386`.
+- 10M seed 3: `parse=75.4 ev3a=19.6 ev3b=0.6 write=4.6 total=103.3`; user 0.66, sys 0.14; peak RSS 714 MB; minor faults 15,619; `nb=396 nub=199`. Parse per event is the same at 10M and 20M (7.0 against 7.2 ns per event line per 8 threads-wall), so the staging footprint is not costing at 20M.
+- `perf record -F 4000 -g`, 20M, self time: `k_free::ev_loop` 29.8%, `parse::Ctx::ev_batch` 12.2%, `events::stage3::{closure#2}` 8.9%, kernel `kernel_init_pages` 7.8% (3.0 under `ev_batch`, 0.85 `links::bucket`, 0.84 `ck_batch`, 0.80 `Part::flush_early`), `links::bucket` 5.0%, `k_free::cl_loop` 4.4%, `ck_batch` 2.2%, `events::run_clicks` 1.9%, `events::walk_runs` 1.7%, `links::sort_users` 1.0%, `events::pass_b` 1.0%, `k_free::ev_purchase` 0.85%, kernel `do_user_addr_fault` 0.8%, `zap_present_ptes` 0.7%. The binary is 83.5% of samples, the kernel the rest. Page zeroing fell from 11.1% to 7.8%; input unmapping is nearly gone.
+
+Upstream note: `jason-scheffel/express-lane` added, at 612962f (16:23), a notice in every file opting the repository out of use by other teams and their tools during the event. Nothing has been taken from it at or after that commit, and nothing more will be.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
