@@ -600,6 +600,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
     let floor = d.as_ptr();
     let ceil = unsafe { floor.add(d.len()) };
     let unknown = ctx.cat_unknown as u32;
+    let tsbl = ts_bl();
     scan_lines::<7>(d, start, end, |f| {
         if f[0].is_empty() {
             return;
@@ -614,7 +615,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let Some(ts) = parse_ts_fast(f[2], floor, ceil) else { break 'v };
+            let Some(ts) = (if tsbl { parse_ts_bl(f[2], floor, ceil) } else { parse_ts_fast(f[2], floor, ceil) }) else { break 'v };
             if ts < ws || ts >= we || (ingest as i64 + ws_s) * 1000 - ts > DAY_MS {
                 break 'v;
             }
@@ -638,13 +639,14 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
 fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<CRec>], bs: &mut Blocks) {
     let cws = ctx.ws - WEEK_MS;
     let we = ctx.we;
+    let tsbl = ts_bl();
     let floor = d.as_ptr();
     let ceil = unsafe { floor.add(d.len()) };
     scan_lines::<4>(d, start, end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let Some(ts) = parse_ts_fast(f[3], floor, ceil) else { return };
+        let Some(ts) = (if tsbl { parse_ts_bl(f[3], floor, ceil) } else { parse_ts_fast(f[3], floor, ceil) }) else { return };
         if ts < cws || ts >= we {
             return;
         }

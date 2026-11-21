@@ -226,6 +226,17 @@ pub struct Mapped {
 
 /// I/O strategy, from env IOMODE: 0 none, 1 whole-file WILLNEED at open,
 /// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread.
+#[inline(always)]
+pub fn flat16() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("FLAT16").map(|v| v == "1").unwrap_or(false))
+}
+#[inline(always)]
+pub fn ts_bl() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("TSBL").map(|v| v == "1").unwrap_or(false))
+}
+
 pub fn io_mode() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
@@ -514,6 +525,19 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
             let o = off as u32;
             let mut x = sm;
             let mut i = 0usize;
+            if flat16() {
+                // two rounds unconditionally (pos has slack): no exit mispredict
+                unsafe {
+                    let d = pp.add(k);
+                    let mut j = 0;
+                    while j < 16 {
+                        *d.add(j) = o + x.trailing_zeros();
+                        x &= x.wrapping_sub(1);
+                        j += 1;
+                    }
+                }
+                i = 16;
+            }
             while i < cnt {
                 unsafe {
                     let d = pp.add(k + i);
