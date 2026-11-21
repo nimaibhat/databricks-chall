@@ -42,6 +42,15 @@ runone() { # ds label envs keep
   if [ -n "$keep" ]; then sudo chmod -R a+rwX $out; rm -rf /tmp/out_${ds}_$label; mv $out /tmp/out_${ds}_$label; else sudo rm -rf $out; fi
   sudo rm -rf $scr $out.err
 }
+# fixtures against the binary inside each image named in IMG_FIX
+pip install -q polars pyarrow >/dev/null 2>&1
+for label in ${IMG_FIX:-}; do
+  rm -rf /tmp/imgbin; mkdir -p /tmp/imgbin
+  cid=$(docker create "sut:$label"); docker cp $cid:/sessions /tmp/imgbin/sessions >/dev/null; docker rm $cid >/dev/null
+  git worktree prune; rm -rf /tmp/fx; ref=$(grep "^$label|" bench/variants.txt | cut -d'|' -f2); git worktree add -f /tmp/fx "$ref" -q
+  (cd /tmp/fx && python3 scripts/run_fixtures.py fixtures -- /tmp/imgbin/sessions 2>&1 | tail -1 | sed "s/^/IMGFIX $label /")
+  git worktree remove --force /tmp/fx
+done
 : > /tmp/results.txt
 # fixed container cost: the first image with no data (the binary exits at once)
 first_label=$(echo "${V[0]}" | cut -d'|' -f1)
@@ -50,8 +59,8 @@ for i in 1 2 3 4 5 6 7; do
   docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus $N --memory 14g --memory-swap 14g --user 1000:1000 -v $HOME/d0:/data:ro --tmpfs /output:rw,size=64m,mode=1777 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=$N "sut:$first_label" >/dev/null 2>&1
   t1=$(date +%s.%N); echo "EMPTY $(echo "$t1 - $t0" | bc)"
 done
-for ds in d20 d60; do
-  R=$R20; [ $ds = d60 ] && R=$R60
+for ds in d1 d20 d60; do
+  R=$R20; [ $ds = d60 ] && R=$R60; [ $ds = d1 ] && R=${R1:-0}
   [ "$R" -gt 0 ] || continue
   # only this dataset in the page cache, so the larger one is not evicted mid-run
   sync; sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'; 
@@ -83,7 +92,7 @@ for (ds,lab),v in rows.items():
 PY
 echo "=== output equality vs first variant"
 first=$(echo "${V[0]}" | cut -d'|' -f1)
-for ds in d20 d60; do
+for ds in d1 d20 d60; do
  for v in "${V[@]}"; do
   label=$(echo "$v" | cut -d'|' -f1)
   [ -d /tmp/out_${ds}_$label ] || continue
