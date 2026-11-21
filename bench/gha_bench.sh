@@ -5,7 +5,7 @@
 set -u
 DATA=~/data
 N=$(nproc)
-R=${R:-5}
+R=${R:-3}
 pip install -q duckdb >/dev/null 2>&1
 mapfile -t V < <(grep -v '^#' bench/variants.txt | grep -v '^$')
 declare -A IMG

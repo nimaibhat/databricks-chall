@@ -1,7 +1,2 @@
 # label|ref|build-args|env
-c35753a|35753a0||
-cb3c1d3|b3c1d38||
-c06ec14|06ec14c||
 main|main||
-main_io4|main||IOMODE=4
-main_io2|main||IOMODE=2
