@@ -200,6 +200,28 @@ Read: `OVERNIGHT_LOG.md` (experiment 1), `events.rs:234-262` (`scatter_chunk`), 
 - **`release_part`** (`sys.rs:188`, called once per thread from `stage3b`): frees the event arena in 2 MiB units, about 160 huge pages in 8 calls. Cheap, and it is what keeps `_exit` short.
 - **Serial stitch** (`events.rs:2293-2313`): a loop over about 830 buckets and one sort of at most twice that many entries. Microseconds.
 
+## Iteration 4 (2026-11-21): a correction to 2.2/3.1, and two diagnostics that cost no code
+
+### 4.1 Correction: "parse is waiting" was stated too strongly
+
+2.2 and 3.1 compared one hardware thread's instruction rate with what a whole core can do. The 8 threads are 4 cores with two hyperthreads each, and two busy siblings each get roughly 55 to 65% of a core. So about 0.8 instructions per cycle per thread is about 1.6 per core, which is ordinary for vector-heavy code that competes for the same two or three execution ports (the multiplies and shuffles here), and does not by itself show memory or kernel waits. The ranking of the table stands on other grounds (rows 1 and 2 cannot change output and are cheap to test), but treat "memory-bound" as open until one of the two diagnostics below is in the log.
+
+### 4.2 Diagnostic A: one run with 4 threads on 4 separate cores
+
+`NCPU=4` with the affinity mask restricted to one hyperthread per core (`taskset -c 0-3` if siblings are 0/4, 1/5, ...; check `/sys/devices/system/cpu/cpu0/topology/thread_siblings_list`).
+- If parse takes about 1.25 to 1.35 times the 8-thread time, the second hyperthread adds the usual 25 to 35% and parse is limited by execution resources: instruction count and the licence question (row 3) matter most.
+- If it takes under 1.15 times, the cores are already starved for something shared (memory bandwidth, the kernel's page-table lock, shootdowns): rows 1 and 2 matter most.
+- This is a measurement only. The scorer has 8 CPUs and the default stays 8.
+
+### 4.3 Diagnostic B: `perf stat` on the baseline, if the VM exposes the PMU
+
+`perf stat -e task-clock,cycles,instructions,page-faults,context-switches,dTLB-load-misses,tlb:tlb_flush -a -- ./pipeline ...` and the user/system split from `\time -v`. `m5zn.2xlarge` is not a metal instance, so hardware counters may be absent; `task-clock`, `page-faults`, the `tlb:tlb_flush` tracepoint and user/system time work regardless and are the ones that decide rows 1 and 2: system time during parse above about 10 ms of wall equivalent says the mapping and zeroing paths are worth the A/B; under 3 ms closes them.
+
+### 4.4 Memory traffic in parse (my arithmetic, from sizes in the code and the log)
+
+- Read: 1.8 GB of input. Written: about 400 MB of records with non-temporal stores (`parse.rs:94-159`). Zeroed by the kernel first: the same 400 MB, when each 2 MiB block is populated (`parse.rs:180`). Total about 2.6 GB in 146 ms, 18 GB/s across 4 cores.
+- That is within what this class of machine streams, but it is not small, and the scorer's host is shared by 32 vCPUs. The 400 MB that is written twice (once as zeros, once as records) is the only part that could be removed, and only by writing fewer or smaller records; fresh anonymous memory cannot be had without the clear. Records are 16 bytes (`Rec`, `main.rs`), holding the slot, ingest time, timestamp, user and kind; I see no field that can be dropped without re-reading input later. **Closed** unless a later pass over `events.rs` shows a field the fast path never reads.
+
 ## Next passes (in this order)
 
 1. `events.rs` `stage3a` and `core.rs`: the 35 ms stage, pass by pass.
