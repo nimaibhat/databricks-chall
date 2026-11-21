@@ -1,8 +1,2 @@
 # label|ref|build-args|env
-main|origin/gate-main-0e964c1||
-xk|origin/gate-xk-b5ee589||
-xk_t1|origin/gate-xk_t1-b5ee589||NCPU=1
-xk_t2|origin/gate-xk_t2-b5ee589||NCPU=2
-xk_t8|origin/gate-xk_t8-b5ee589||NCPU=8
-xk_ab|origin/gate-xk_ab-b5ee589||DENSE_ABANDON=1
-xk_vp0|origin/gate-xk_vp0-b5ee589||VPARSE=0
+pgo|origin/gate-pgo-b5ee589||
