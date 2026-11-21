@@ -681,6 +681,8 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<
                 return;
             }
             tab.prefetch(h);
+            // the dedup key's partition is already known: fetch its stage line
+            eb.prefetch((hk(eid) >> sh1) as usize);
             let slot = rn & (RING - 1);
             if rn >= RING {
                 let old = ring[slot];

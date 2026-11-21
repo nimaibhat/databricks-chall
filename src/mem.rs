@@ -205,12 +205,13 @@ impl<T: Copy> Scatter<T> {
                 let next = at.add(1);
                 *self.cur.get_unchecked_mut(p) = next;
                 if (next as usize) & (STG - 1) == 0 {
+                    // a full stage: four 32-byte streaming stores (both ends
+                    // are 64-byte aligned)
                     use std::arch::x86_64::*;
                     let dst = (next as *mut u8).sub(STG);
                     let mut i = 0;
                     while i < STG {
-                        _mm_stream_si128(dst.add(i) as *mut __m128i, _mm_load_si128(st.add(i) as *const __m128i));
-                        _mm_stream_si128(dst.add(i + 16) as *mut __m128i, _mm_load_si128(st.add(i + 16) as *const __m128i));
+                        _mm256_stream_si256(dst.add(i) as *mut __m256i, _mm256_load_si256(st.add(i) as *const __m256i));
                         i += 32;
                     }
                 }
@@ -222,6 +223,16 @@ impl<T: Copy> Scatter<T> {
             }
             at
         }
+    }
+    /// Fetches partition `p`'s stage line ahead of a push that is known to come.
+    #[inline(always)]
+    pub fn prefetch(&self, p: usize) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let at = *self.cur.get_unchecked(p) as usize;
+            crate::keys::prefetch(self.stage.add(p * STG + (at & (STG - 1) & !63)));
+        }
+        let _ = p;
     }
     /// Makes the non-temporal stores of this thread visible to others.
     #[inline(always)]
