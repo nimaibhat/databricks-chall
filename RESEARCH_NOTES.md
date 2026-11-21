@@ -214,6 +214,50 @@ Sources were opened by a research agent and are linked per claim. Items it could
 
 Not opened or not verified: the readahead clamp on GCP persistent disk; the THP setting on the scorer image; gVisor's support for `MADV_POPULATE_READ`; any measurement of read against mmap on an n2 VM; huge-page zeroing cost (only a search snippet, so no number is recorded here).
 
+---
+
+## Iteration 4 (2026-11-21): primary sources on per-line decode cost
+
+Opened by a research agent; links per claim. Gain figures are arithmetic on the sources' numbers, not measurements of this code. No single item here is worth more than about 5% of the line.
+
+### 4.1 Three-test quote rule with PEXT (a simpler form of 2.1's test)
+
+- **Idea.** With `S` = separator bits including the line's newline, `q` = quote bits, `starts = (S << 1) | 1` and `ends = S >> 1`, a line is well quoted exactly when all three hold: `q & !(starts | ends) == 0` (no stray quote), `q & starts & ends == 0` (no one-byte `"` field), and `pext(q, starts) == pext(q << 1, S)` (a field opens iff it closes). Bit j of the first PEXT says whether field j is quoted, which gives the branch-free strip.
+- **Source.** Derived by the agent, with no published measurement. It was checked by brute force against the `split` rule on all 88,572 strings over `{a , "}` up to 10 bytes with no mismatch, in a Python model of a single mask word; the script is at `/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/chk/q.py`. cherylaurelia's borrow-subtraction form (entry 2.1) is an independent statement of the same rule and is in a scored repo.
+- **Here.** Replaces the quote-count word loop and the 14 ring lookups per event line at `parse.rs:602-638`. Lines span two or three ring words, so the masks must be assembled into 128 bits per line; keep the current loop for longer lines.
+- **Expected gain.** 3 to 5% of the line.
+- **Risk.** Medium. The two-word Rust version is untested; extend `fuzz_scan` to N = 7 first.
+
+### 4.2 One branch for F1 and F2
+
+- **Idea.** `parse_ts_fast` branches three ways on a shuffled 58/10/32 mix. Merge F1 and F2 into one path: the same `civil_swar`, with the offset computed from the tail word and masked to zero for `Z`. That leaves a single 68/32 branch against F3.
+- **Sources.** A 50% unpredictable branch cost 15 cycles against 3.3 predictable on Skylake ([Lemire, 2019](https://lemire.me/blog/2019/10/15/mispredicted-branches-can-multiply-your-running-times/)). Removing about one miss per two rows cut cycles 15.4% while instructions rose, in [Wuerthinger's 1brc-steps](https://github.com/thomaswue/1brc-steps) v10. Counter-evidence: another 1BRC author cut misses from 148M to 4.1M with no runtime gain ([curiouscoding](https://curiouscoding.nl/posts/1brc/)), and Vibhor7-7's branch-free timestamp experiments 5 and 11 measured 0% (entry in 1.2's source).
+- **Here.** `parse.rs:922-941`. This is smaller than the `TSBL` design, which also folds F3 in and whose only measurement so far is invalid (see the finding at the top of this file).
+- **Expected gain.** 1 to 3% of the line, sign uncertain.
+- **Risk.** Low: the exact `parse_ts` fallback stays, and `ts_fuzz` already covers both forms.
+
+### 4.3 Measured cost of small-set string checks (supports 2.2)
+
+- On Ice Lake, load-8-bytes-and-compare took 2.6 ns per string against 18 ns for direct compares and 7.1 ns for gperf ([Lemire, 2022](https://lemire.me/blog/2022/12/30/quickly-checking-that-a-string-belongs-to-a-small-set/)). The audit priced the type match here at 0.5 ns per line, so the compiler is probably already doing this for `main.rs:622-629`; worth at most 1 to 2%.
+
+### 4.4 Separator index by compress instead of a `tzcnt` loop
+
+- **Sources.** On Skylake-X a `tzcnt` loop took 4.4 cycles per index, simdjson's unrolled loop 3.6, and `vpcompressd` 2.4 with no mispredictions ([Lemire, 2022](https://lemire.me/blog/2022/05/06/fast-bitset-decoding-using-intel-avx-512/)). simdjson's Ice Lake kernel uses one `_mm512_maskz_compress_epi8` per 64-byte block ([`src/icelake.cpp`](https://raw.githubusercontent.com/simdjson/simdjson/master/src/icelake.cpp)).
+- **Here.** `parse.rs:524-562`. A block holds about 6 separators, so the gain is at most 2% of the line. The byte form needs VBMI2, which Cascade Lake lacks, and any 512-bit form pays the frequency cost in 4.5.
+- **Verdict.** Not worth a runtime-dispatched kernel.
+
+### 4.5 512-bit instructions on Cascade Lake cost more than the scanner can gain
+
+- On Skylake-SP class cores one light 512-bit instruction drops the core from 3.2 to 2.8 GHz, with about 20 µs lost per transition and 680 µs of hysteresis; 256-bit light instructions cause no change ([Downs, 2020](https://travisdowns.github.io/blog/2020/01/17/avxfreq1.html)). Ice Lake client parts lose 100 MHz with one core active and nothing with more ([Downs, 2020](https://travisdowns.github.io/blog/2020/08/19/icl-avx512-freq.html)); server parts were not measured there.
+- **Here.** The `XCPU=x86-64-v4` path in `masks64` (`parse.rs:407-415`) saves well under 1% of the line's instructions. The track page says scorers are "Cascade Lake or newer", so the default `x86-64-v3` build is the right one; this closes the AVX-512 scanner question unless the scoreboard shows otherwise.
+
+### 4.6 Closed by this iteration
+
+- **Two lines interleaved per thread.** 1BRC gains came from codes at IPC near 2 and about 20 cycles per row ([curiouscoding](https://curiouscoding.nl/posts/1brc/): 1.34 to 1.23 s with four rows in flight). This line is about 1,400 instructions, so the limit is instruction count, not latency chains.
+- **SWAR price parse.** Only 3% of lines reach `parse_price`; under 0.2%.
+
+Not opened: Muła's articles (certificate error), the simdjson and simdcsv papers, Agner Fog's manuals. No source measures licence behaviour on Cascade Lake or Ice Lake Xeon specifically.
+
 ## Next iteration
 
 - Re-read `OVERNIGHT_LOG.md` if it exists and drop anything it marks tried.
