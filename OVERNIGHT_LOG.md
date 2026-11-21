@@ -69,8 +69,10 @@ From experiment 27 on, the bench drops the page cache before each dataset: with 
 | 36 | control | Same build with output on tmpfs instead of the runner's disk | 0.991 / 0.927 (post-exit 0.122 -> 0.046); fastest public build 0.906 in the same run | 2.644 / 2.441 (0.276 -> 0.060); fastest public build 2.458 | | **in-process we are level with the fastest public build; what is left of the gap is the flush of our output (22 / 63 MB against its about 8 MB) after exit, on runners with a slow disk** |
 | 37 | switch only | `OUTSYNC=1` (fdatasync from the writer threads) and `OUTSYNC=2` (ask for writeback to start, at the end) on a slow-disk runner (9V45) | 1.212 / 1.185 / 1.156 | 3.218 / 3.279 / 3.251 | | the flush is disk-bound, about 300 MB/s: syncing in-process only moves the time (out 0.089 -> 0.307 s at 60M); starting writeback early helps at 20M (-4.7%) and blocks at 60M. On fast-disk runners (7763, 6975P) none of it matters (post-exit 0.04 to 0.08 s). So the flush has to overlap with computation: experiment 39 |
 | 38 | merged with #39 | Parquet: 2048-row index pages; `campaign_daily` with dictionary runs and INT32 counts (output 22 -> 21 MB, 63 -> 60 MB) | 1.212 / 1.191 (9V45) ; 1.212 / 1.212 (6975P) | 3.218 / 3.192 ; 3.317 / 3.316 | | inside the range; carried as the base of #39 |
-| 39 | `7170d01` | `user_daily` written as 32K-row groups from the workers during the sessions phase, background thread asks for writeback (`sync_file_range`) | 1.433 / 1.422 (7763) ; 1.239 / 1.222 (6975P) | 3.970 / 3.953 ; 3.421 / 3.374 | 0.456 / 0.455 | kept (-1.0% to -1.4% even on fast disks: the encode work moves into the sessions phase and the output phase drops from 0.04 / 0.10 s to 0.002 s); the slow-disk case it was built for has not come up yet |
+| 39 | `7170d01` | `user_daily` written as 32K-row groups from the workers during the sessions phase, background thread asks for writeback (`sync_file_range`) | 1.433 / 1.422 (7763) ; 1.239 / 1.222 (6975P) | 3.970 / 3.953 ; 3.421 / 3.374 | 0.456 / 0.455 | kept (-1.0% to -1.4% even on fast disks: the encode work moves into the sessions phase and the output phase drops from 0.04 / 0.10 s to 0.002 s); confirmed on a slow-disk runner type in row 39b |
 | 40 | same image | Variants of #39: 8K-row groups; no writeback hints; one group at the end | 1.432 / 1.427 / 1.432 (7763); 1.217 / 1.210 / 1.215 (6975P) | 3.940 / 3.925 / 3.960 ; 3.352 / 3.341 / 3.376 | | all within noise of each other on fast disks; default stays 32K rows with hints |
+| 41 | not merged | Arena blocks of 8 KiB and 16 KiB instead of 32 KiB (17% less arena touched at 8 threads) | 1.160 / 1.172 / 1.167 (9V74, n=9) | 3.153 / 3.185 / 3.184 | | rejected: about 1% slower |
+| 39b | confirmation | Streamed output (#39) on a slow-disk runner type (EPYC 9V74): time after exit | 0.043 s (it was 0.127 s on this runner type in experiment 33's run) | 0.053 s (was 0.300 s) | | the flush now overlaps with the sessions phase, as intended; wall 1.160 / 3.153 s there |
 
 ## Current phase profile (`a88caa3`)
 
@@ -103,9 +105,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Profile-guided optimisation as the final step (measured -1.9% / -1.5%, experiment 33): regenerate the profile from this source, build the image with it, gate the image's binary (fixtures, 1M / 20M / 60M equality against the non-PGO build), A/B.
+1. Profile-guided optimisation as the final step (measured -1.9% / -1.5%, experiment 33): the profile for this source is generated; two A/B runs are in flight with the gate on the image's binary (fixtures, 1M / 20M / 60M equality against the non-PGO build).
 2. On Intel runners we are still 10 to 14% behind the fastest public build (level on Zen 5): kernel page zeroing is 7% of CPU there and the pread copy 4.5%; look for memory that can be reused instead of freshly faulted, and at 24-byte click records.
-3. Re-measure streamed output on a slow-disk runner when one comes up (9V45 / 9V74 / 8573C).
+3. Read-range size against the scorer's smaller L2 (Cascade Lake has 1 MiB per core): `CHUNKKB` 64 and 128 against 256 as free variants in the PGO run.
 
 ## Setup notes
 
