@@ -1,2 +1,4 @@
 # label|ref|build-args|env
-pgo|origin/gate-pgo-ad951c5||
+main|origin/gate-main-73f27d0||
+s52p|origin/gate-s52p-665d9e5||
+s51p|origin/gate-s51p-6377d01||
