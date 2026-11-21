@@ -1,4 +1,3 @@
 # label|ref|build-args|env
 main|origin/gate-main-29d252c||
 s54p|origin/gate-s54p-b62475f||
-s53p|origin/gate-s53p-ad1a222||
