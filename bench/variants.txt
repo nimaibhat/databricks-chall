@@ -1,4 +1,4 @@
 # label|ref|build-args|env
-p1|origin/gate-p1-a87bd35||
-p2|origin/gate-p2-7102772||
-p3|origin/gate-p3-7102772||
+final|main||
+cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+vibhor|ext:Vibhor7-7/shopping-sessions||
