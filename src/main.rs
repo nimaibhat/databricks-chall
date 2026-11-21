@@ -413,6 +413,9 @@ fn main() {
             parse_events(&ctx, d, s, e, unsafe { ebl.get(t) }, unsafe { sbl.get(t) }, bs, abase);
             chunk_done(&ev_m, c.file as usize, c.start, c.end);
         } else {
+            if diag_stage() != 0 {
+                return;
+            }
             let (d, s, e) = chunk_data(&cl_m, c.file as usize, c.start, c.end, buf);
             parse_clicks(&ctx, d, s, e, unsafe { cbl.get(t) }, bs);
             chunk_done(&cl_m, c.file as usize, c.start, c.end);
@@ -422,6 +425,9 @@ fn main() {
     let eparts = PerThread::from_vec(transpose(ebl.into_inner(), 1usize << p1_bits()));
     let cparts = transpose(cbl.into_inner(), 1usize << p2_bits());
     eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
+    if diag_stage() != 0 {
+        std::process::exit(0);
+    }
 
     let sparts = transpose(sbl.into_inner(), 1usize << p2_bits());
 
@@ -526,7 +532,13 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<D
     let tab = &ctx.links;
     let mut ring = [PendE::default(); RING];
     let mut rn = 0usize;
+    let stage = diag_stage();
+    let mut sink = 0u64;
     scan_lines::<7>(d, start, end, |f| {
+        if cfg!(feature = "diag") && stage == 1 {
+            sink = sink.wrapping_add(f[6].len() as u64);
+            return;
+        }
         if f[0].is_empty() {
             return;
         }
@@ -535,11 +547,19 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<D
             Some(v) => (v - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
         };
+        if cfg!(feature = "diag") && stage == 2 {
+            sink = sink.wrapping_add(eid).wrapping_add(ingest as u64);
+            return;
+        }
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
             let Some(ts) = (if tsbl { parse_ts_bl(f[2], floor, ceil) } else { parse_ts_fast(f[2], floor, ceil) }) else { break 'v };
+            if cfg!(feature = "diag") && stage == 3 {
+                sink = sink.wrapping_add(eid).wrapping_add(ingest as u64).wrapping_add(ts as u64);
+                return;
+            }
             if ts < ws || ts >= we || (ingest as i64 + ws_s) * 1000 - ts > DAY_MS {
                 break 'v;
             }
@@ -555,11 +575,25 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<D
             let pc = if price != 0 { (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown) } else { 0 };
             let user = pack_fast(f[1], ceil);
             let h = hk(user);
+            if cfg!(feature = "diag") && stage == 4 {
+                sink = sink.wrapping_add(eid).wrapping_add(ingest as u64).wrapping_add(ts as u64).wrapping_add(pc as u64).wrapping_add(h);
+                return;
+            }
             tab.prefetch(h);
             let slot = rn & (RING - 1);
             if rn >= RING {
                 let old = ring[slot];
-                emit_event(tab, &old, eb, sb, bs, sh1, sh2, abase);
+                if cfg!(feature = "diag") && stage >= 5 {
+                    let pr = tab.get(old.user, old.h).unwrap_or(old.user);
+                    sink = sink.wrapping_add(pr);
+                    if stage >= 6 {
+                        let hp = hk(pr);
+                        let at = unsafe { sb.get_unchecked_mut((hp >> sh2) as usize) }.push_at(SRec { person: pr, ts: old.ts, pc: old.pc }, bs);
+                        sink = sink.wrapping_add(at as u64);
+                    }
+                } else {
+                    emit_event(tab, &old, eb, sb, bs, sh1, sh2, abase);
+                }
             }
             ring[slot] = PendE { user, h, eid, ts: (ts - ws) as u32, pc, ingest };
             rn += 1;
@@ -568,8 +602,23 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<D
         // an invalid copy still takes part in dedup
         unsafe { eb.get_unchecked_mut((hk(eid) >> sh1) as usize) }.push(DRec { eid, ingest, loc: 0 }, bs);
     });
+    std::hint::black_box(sink);
+    if cfg!(feature = "diag") && stage != 0 {
+        return;
+    }
     for p in &ring[..rn.min(RING)] {
         emit_event(tab, p, eb, sb, bs, sh1, sh2, abase);
+    }
+}
+
+/// Diagnostic stage (feature `diag` only): 0 = full run.
+#[inline(always)]
+fn diag_stage() -> u32 {
+    if cfg!(feature = "diag") {
+        static S: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *S.get_or_init(|| std::env::var("STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    } else {
+        0
     }
 }
 
