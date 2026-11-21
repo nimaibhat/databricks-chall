@@ -13,6 +13,8 @@ one() { # label dir bin extra-cargo-args
   NCPU=1 DATA_DIR=$HOME/dev OUTPUT_DIR=/tmp/o valgrind --tool=cachegrind --branch-sim=yes --cache-sim=yes --cachegrind-out-file=/tmp/cg_$label.out ./target/release/$bin 2>&1 | grep -E "I +refs|D +refs|D1 +misses|LLd misses|LL misses|Branches|Mispred|rror|valgrind:" | sed "s/^/CG $label /"
   ls /tmp/o/*/ | head -3 | sed "s/^/CG $label out: /"
   cg_annotate /tmp/cg_$label.out --show=Ir,D1mr,D1mw,DLmr,DLmw,Bcm,Bim 2>/dev/null | grep -vE "^$" | head -75 | cut -c1-230 | sed "s/^/CGF $label /"
+  cg_annotate /tmp/cg_$label.out --show=Ir,Bcm --annotate=yes > /tmp/ann_$label.txt 2>/dev/null
+  awk '/^-- (Auto|User)-annotated source: /{f=$NF; sub(/.*\//,"",f); ln=0; next} /^-- line /{ln=$3+0-1; next} f!="" && !/^--/ {ln++} /^ *[0-9,]+ \(/{n=$1; gsub(/,/,"",n); if (n+0>=1000000 && f!="") {line=$0; sub(/^ *[0-9,]+ +\([^)]*\) +[0-9,.]+( +\([^)]*\))? */,"",line); printf "%d %s:%d | %s\n", n, f, ln, substr(line,1,120)}}' /tmp/ann_$label.txt | sort -rn | head -170 | sed "s/^/CGL $label /"
 }
 W=$GITHUB_WORKSPACE
 rm -rf /tmp/t2; git -C $W worktree prune; git -C $W worktree add -f /tmp/t2 origin/main -q
