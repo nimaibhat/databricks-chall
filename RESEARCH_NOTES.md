@@ -10,7 +10,7 @@ Research-only notes for the optimizing session. Nothing here has been built or b
 |---|---|---|---|---|---|
 | 1 | Look up the product category only for purchase rows (3% of events) | `parse_events`, `main.rs:632` | Removes one dense-table load + digit conversion from 97% of valid event lines; audit put this lookup at 37 to 40 ns of a 163 ns line before `1c4fa8e` | None: the category byte is read only when `price != 0` | [1.1](#11-product-lookup-only-for-purchases) |
 | 2 | Software write-combining with non-temporal stores for the 512-way scatters | `BList::push` in `mem.rs:128`, callers in `parse_events`, `parse_clicks`, `dedup_partition` | Competitor measured -12% total, -16% parse on an Ice Lake Xeon (the scorer's class); -6% on Zen 4 | Low: a flush bug loses or duplicates records, which the 20M cross-check catches | [1.2](#12-write-combining-buffers-with-non-temporal-stores) |
-| 3 | Route valid events straight to their user partition at parse; dedup only marks losers | `parse_events`, `dedup_partition`, `resolve_partition` | Removes dedup pass 2 (a second 512-way scatter of every survivor); competitors report a 19 to 26 ms dedup phase at 20M | Medium: restructures phase 3; invalid copies must still take part in dedup | [1.3](#13-dedup-that-marks-losers-in-place) |
+| 3 | Dedup without a key table: two-bit counters find the few repeated ids, only those are sorted (step 1, drop-in); then route valid events straight to their user partition and mark losers in place (step 2) | `dedup_partition`, `main.rs:694`; step 2 also `parse_events`, `resolve_partition` | Step 1 shrinks the per-partition table from 2 to 4 MB to about 170 KB; step 2 removes the second 512-way scatter. Competitors report 19 to 36 ms dedup phases at 20M | Step 1 low (same winner rule, same pass 2); step 2 medium | [9.1](#91-two-bit-counters-instead-of-a-key-table), [1.3](#13-dedup-that-marks-losers-in-place) |
 | 4 | Sort 8-byte `(ts << 32) \| pc` keys per person instead of 16-byte `SRec`s | `process_partition`, `main.rs:814-830` and `:893-896` | Estimate 10 to 25% of the sessions phase, 2 to 4% of wall; halves the scratch buffer | None: `person` is constant within a group and equal-`ts` order does not affect any output | [7.1](#71-sort-8-byte-keys-per-person) |
 | 5 | Known-date table for F1/F2 timestamps and `ingest_ts` | `civil_swar` and `parse_ingest_s`, `parse.rs:772` and `:889` | Estimate 2 to 5% of parse CPU; three competitors ship it | Low: exact 11-byte compare, full parser on a miss | [1.4](#14-known-date-table-for-timestamps) |
 
@@ -409,6 +409,22 @@ From reading `src/` against the audit and competitor commits. At a 0.6 s target 
 - `flat16()` (`parse.rs:528`) is a `OnceLock` read per 64-byte block inside `scan_lines`; hoist it to the top of the function, as `ts_bl()` already is in `parse_events`.
 - **Expected gain.** Under 1%; listed because it is free while those lines are being edited for ideas 1.1 and 1.2.
 - **Risk.** None.
+
+---
+
+## Iteration 9 (2026-11-21): a drop-in dedup that needs no key table
+
+### 9.1 Two-bit counters instead of a key table
+
+- **Idea.** Only 2 to 4% of event ids repeat, so the work is finding them. Scan the partition against an array of two-bit saturating counters indexed by key hash ("seen once", "seen again"). Scan again and collect the records whose slot was hit more than once. Sort only those by `(event_id, ingest)`; in each run of one id the first wins and the rest are losers.
+- **Source.** [Vibhor7-7 `src/dedup.rs`](https://github.com/Vibhor7-7/shopping-sessions/blob/1359a83/src/dedup.rs) (whole file, 90 lines). It sizes the array at 16 slots per record ("keeps chance collisions near 6%"), takes the slot from the hash bits just below the partition bits, and marks a loser by writing a dropped marker into its event record. A winner that is an invalid copy has no event record, and every later copy is still dropped, which is the dedup-before-validation rule. Introduced in `b58dc53` (experiment 14, -1.5% total together with a link-table change). cherylaurelia used the same scheme ("a cache-sized bit filter finds the keys seen twice; those few are sorted", `src/main.rs` header) at 0.24 CPU-s for the phase at 20M before replacing it with the tag-line table (0.19, then 0.149 CPU-s; entry 1.3). micah-andelman `5c2f4b5` is a third instance ("1M-bit filter per bucket; only possibly-repeated event ids go through the exact table").
+- **Here.** This replaces only pass 1 of `dedup_partition` (`main.rs:708-728`); the `dead` bitmap and pass 2 stay as they are, so it can ship before idea 1.3.
+  - Counters: `(n * 16).next_power_of_two()` slots at 2 bits. For a 42,000-record partition at 20M that is 1,048,576 slots or 256 KB; at 8 slots per record it is 128 KB with about 12% chance collisions. Either fits L2, against the 2 MB `KMap<u64>` now (4 MB at 60M).
+  - Slot: `(hk(eid) << p1_bits()) >> (64 - slot_bits)`, the bits below the partition bits.
+  - Scan 1 over the block lists updates the counters. Scan 2 pushes `(eid, ingest, i)` for every record whose slot says "seen again". Sort that list by `(eid, ingest, i)`; in each run of equal `eid`, set the `dead` bit of every entry after the first.
+  - Sorting on `i` last keeps the first-seen copy among equal `ingest` values, which is exactly what the current `r.ingest < cur` test does (`main.rs:717`), so the output is bit-identical even for copies that tie.
+- **Expected gain.** Pass 1 stops missing the cache (the audit charges `dedup_partition` with 24.6% of all L1 read misses for 4% of instructions), at the price of one extra sequential read of the partition. Estimate 30 to 50% of the dedup phase, 3 to 5% of wall, more at 60M where the current table is 4 MB.
+- **Risk.** Low. All copies of an id share a slot, so none can be missed; false suspects are harmless because the sort separates them by `eid`. The existing gate (fixtures E-series, dev answer, 20M cross-check at `NCPU` 1, 2 and 8) covers it. One thing to check by hand: a partition where one id makes up a large share of records (cherylaurelia tested "one event_id on 1/3 of all events") makes the suspect list long, which is slow but still correct.
 
 ## Next iteration
 
