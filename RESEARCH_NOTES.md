@@ -870,10 +870,24 @@ Opened by a research agent (kernel `master`, not the 7.0 tag the scorer is repor
 - TejasviniChawla `99963ee`: a benchmark of parse stages isolated with `black_box`; `9338c54`: an `EXIT_NOW` switch and a CI job that measures container overhead. No results recorded yet.
 - In this repo: `e7a116f` (00:22) implemented entries 1.1 and 8.2 and the log (00:35) records it as kept at -2.3%. The log also notes that on its second runner (Xeon 8573C) container start and stop alone took about 0.5 s against about 0.2 s on the first; that fixed part is where a cost after exit (20.1) would hide.
 
+---
+
+## Iteration 21 (2026-11-21, 00:50): how a `pread` reader is built when nothing is mapped
+
+For the `pread` A/B (entry 1.5, now a runner-up). Source: [Vibhor7-7 `src/reader.rs`](https://github.com/Vibhor7-7/shopping-sessions/blob/80df6c5/src/reader.rs) `walk`, lines 161 to 254; that build reads 256 KB blocks and is 1.59 s on the log's runner.
+
+### 21.1 Ranges by byte offset, lines owned by their first byte, a carried tail
+
+- **Ranges without touching the file.** A file is cut into byte ranges by arithmetic alone. A line belongs to the range that holds its first byte: a range skips the line it starts inside (it begins reading one byte early, so if that byte is a newline a line starts exactly at the range start) and reads past its own end to finish its last line. "That is exact because only `\n` ends a line." The header is the skipped line of the range at offset 0.
+- **Blocks.** Each thread owns one buffer with a few readable bytes in front (so a one-byte look-behind is always in bounds) and vector-overread room behind. Per step it `pread`s one block after the bytes it still holds, scans, hands complete lines to the parser, then moves the unfinished last line to the front (`copy_within`) and reads the next block behind it. At end of file a missing final newline is appended in the buffer, so the last line needs no special path.
+- **Here.** `IOMODE=4` (`parse.rs:258-275`) reads one precomputed chunk per call, and the chunks come from `chunks_of` (`parse.rs:361-380`), which finds newlines by reading the mapping. So today's `pread` mode still maps every file, touches a page at each 4 MB boundary, and pays the mapping's teardown at exit (entry 3.2). A fair A/B of "no mapping" needs three changes: `Mapped::open` must not map in this mode (file lengths from `metadata`), chunks become plain byte ranges with the ownership rule above applied inside the worker, and the read unit drops to 256 to 512 KB with the tail carried as described. The arena estimate at `main.rs:379-382` only needs the byte counts.
+- **What it removes.** All `madvise` calls, all 4 KiB PTE setup for 1.9 GB (20M) or 5.5 GB (60M) of file pages, and their teardown at exit; what it adds is one copy of the input through L2.
+- **Expected gain.** Still unknown in sign (entry 11.2: TejasviniChawla -10% and sys time halved, Vibhor7-7 "mmap 11 to 17% slower on a virtual machine" in its README, against three teams that preferred mappings). The log's one-thread run shows sys time at only 0.27 s of 5.0 s on the EPYC runner, so the kernel share is small there; it may be larger on the scorer's VM.
+- **Risk.** Low to medium. The scanner sees buffers whose first line start and last line end are arbitrary, which `scan_lines` already supports through `start`/`end`; the new part is the ownership rule at range edges. A test with ranges of a few bytes (Vibhor7-7 and Th3r0n both fuzz with chunk sizes down to 1 byte) exercises every edge.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
 
-- Vibhor7-7's reader (`src/reader.rs` from line 161): how 256 KB blocks carry partial lines, for the `pread` A/B.
 - micah-andelman `scan2` and joch44 `split_masked`: two more implementations of the mask split to compare with 14.1.
 - New repos and scores from the public search API.
