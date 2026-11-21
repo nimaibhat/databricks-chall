@@ -1136,6 +1136,29 @@ Read: `origin/gate-s9-61cb613` (`parse.rs`, `main.rs`, `keys.rs`, `mem.rs`; line
 - Record sizes: 16-byte dedup and event records in all three.
 - Scatter: same 128-byte stages for the 16-byte streams; Vibhor uses 256-bit streaming stores (top-five item 5).
 
+## Iteration 29 (2026-11-21, 02:00): what the teammate branch measured, and what is still worth taking
+
+Source: `saran/work` history through `f042e9f`, local interleaved runs on a 20M set (8 threads, i7-13700H) and the board scores of that line (1.61 s, then 1.29 s, then 1.32 s). The branch's source now matches `main`. Details and the "do not take" list are in `FINDINGS.md`.
+
+### 29.1 30-minute bins are the one untried change with a measurement
+
+- Experiment 9 kept 8-byte keys, interval assists and largest-partition-first, and said bins were not tried.
+- On the old `process_partition` (`f042e9f`), persons with more than 16 events were not sorted. Each event went to bin `ts / 1_800_000`, which stored min, max, count and the head of a purchase chain. A session broke only between occupied bins, when `bin.min - previous max > 1_800_000`. Smaller persons used an insertion sort.
+- Measured, interleaved, old pipeline: phase 4 about 130 ms to 100 ms, whole run about 780 ms to 740 ms. Correctness held (tests, 36 fixtures, reference answers).
+- **Here.** Sessions are about 0.28 s of the 1.73 s run, so a 25% cut of that phase is a few percent of wall. Port the bin walk onto the current `process_partition` without dropping the 8-byte keys or the interval assists. Keep it only if a same-run x86 docker measurement beats `fe79ca9` on both sizes.
+- **Risk.** A bin that spans a timestamp exactly on the 30-minute boundary must not merge two sessions. The rule is the min/max test above, not "one bin is one session".
+
+### 29.2 Confirmed, so they are not open
+
+- Resolving the person during the parse, then marking losers in place, is the right shape. The same design on the old pipeline was correct and about 100 ms slower, because the lookup was added before the scanner got cheaper. Experiment 2 showed the same shape (+2% alone, a win once the scanner landed). Do not revisit it.
+- A bitmap prefilter in front of dedup does not move the board by itself (1.32 s vs 1.29 s on the old line). `fe79ca9` already kept it for the phase time.
+- `pread` into a reused buffer was not faster than mmap on the runner (experiments 6, 8, 14) and the scoring hosts are bare-metal `runc`, not the cloud VM where Vibhor saw mmap cost 7.5%. Leave `IOMODE` at 3.
+- Shrinking the event record to 28 bytes was about 1%. TejasviniChawla measured the same and dropped it (entry 25.3).
+
+### 29.3 The 2× target is not one change
+
+`fe79ca9` at 1.736 s against cherylaurelia at 1.118 s in the log's latest comparison is 1.55×, not 2×. Parse is 57% of that wall. The two stages still far from Vibhor7-7 are the scan (34.5 ns per line here, 11.9 ns there) and the link lookup (14.9 ns vs 7.5 ns), entries 24.1–24.4. The largest single untried item with a same-machine measurement is still in-build PGO, −5% (entry 25.1). The halves field split, the four-wide link probe, and the bins in 29.1 are the rest of the stack. None of them doubles the program. A 2× result would have to come from that stack plus whatever the post-exit 0.40 s / 1.10 s turns out to be, and the log says `pread` and releasing the arena do not change the post-exit time.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
