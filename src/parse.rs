@@ -660,9 +660,14 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
             let rest = unsafe { std::slice::from_raw_parts(base.add(ls), len - ls) };
             let l = memchr::memchr(b'\n', rest).unwrap_or(rest.len());
             ls += l + 1;
-            if !split(&rest[..l], &mut fields) {
+            // split into a separate array and copy by value: `fields` itself
+            // never escapes, so the compiler can keep the fast path's fields
+            // in registers instead of storing and reloading them
+            let mut tmp: [&'a [u8]; N] = [&[]; N];
+            if !split(&rest[..l], &mut tmp) {
                 continue;
             }
+            fields = tmp;
         } else {
             let ll = nw.trailing_zeros(); // line length, 0..=127
             let below = (1u128 << ll) - 1;
