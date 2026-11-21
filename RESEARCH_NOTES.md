@@ -1663,6 +1663,22 @@ Run [44889522320](https://github.com/nimaibhat/databricks-chall/actions/runs/448
 - JuanQuenga's 0.88 s board claim against 1.427 s here (ours 0.946) is one more sign that a single board score is loose, or that its scored commit is not this head.
 - Nothing further to take from the shortlist: no build to copy from is ahead of us on this runner.
 
+## Iteration 43 (2026-11-21, 05:20): user and system time of the three fastest builds, native and in the container
+
+Run [44891360079](https://github.com/nimaibhat/databricks-chall/actions/runs/44891360079) on `bench-ext` (`bench/sys.sh`), EPYC 9V45, 4 vCPU, 20M, warm, binaries copied out of each image and run under `/usr/bin/time`, five runs each (ranges). Ours is `d9e7a12`.
+
+| Native, 20M | wall | user | sys | minor faults | peak RSS |
+|---|---|---|---|---|---|
+| Vibhor7-7 `765c6e2` | 0.70 | 2.44-2.48 | 0.24-0.28 | 5 k | 1.28 GB |
+| cherylaurelia `2e4261f` | 0.71-0.72 | 2.52-2.57 | 0.20-0.24 | 37 k | 1.09 GB |
+| ours | 0.75-0.78 | 2.61-2.76 | 0.23-0.27 | 1.4 k | 1.21 GB |
+
+- **In-process we are 5% behind cherylaurelia and 8% behind Vibhor7-7; all of it is user time** (2.66 against 2.56 and 2.46 CPU-seconds). System time is the same 0.25 s for all three, so I/O mode, page faults and huge pages have nothing left to give against these builds.
+- **The container adds nothing to the process**: cherylaurelia under the scorer's flags has the same user, sys and faults as native (0.72 s, 2.60, 0.23), and a 14 GB memory cgroup changes nothing for any of the three. (The wrapper could not run inside our and Vibhor7-7's images, which have no libc.)
+- **About 0.19 to 0.22 s of every build's `docker run` wall is outside the process on this runner** (0.946 - 0.76 for ours, 0.942 - 0.72 for cherylaurelia in iteration 42). That is a fifth of the wall and the same for everyone; Vibhor7-7's larger output adds to it.
+- **A measurement artifact to know about**: the build listed first in `variants.txt` runs first after the `cat` that warms the page cache and is 20% slower in-process on that run (ours: 0.98 s with 1.04 s of system time, against 0.78 s and 0.25 s warm). It is excluded from the medians, but the `ERR` phase lines of iterations 35 and 40 come from that run, so our phases there are overstated relative to the other builds'.
+- **What is left**: 0.2 CPU-seconds of user time against Vibhor7-7, which is the remaining parse diet of 38 (time-of-day check, room checks, type dispatch, repeated hash) and the mask early-exit of 39. Nothing structural.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
