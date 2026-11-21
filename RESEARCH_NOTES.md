@@ -1607,6 +1607,39 @@ Run [44887057968](https://github.com/nimaibhat/databricks-chall/actions/runs/448
 - **Sessions plus output is 0.30 s here against cherylaurelia's 0.25 s**; on the 9V74 run of iteration 35 it was level. Zen 3 has the smaller L2 (512 KB), which fits the optimizer's finding that sort time is in groups of 8 to 31 events.
 - `hansliu-dev/676767` at its new head is still 20% slower than our pick; whatever scored for team 67 is not this code. Scaled from Vibhor7-7's 0.76 s, our pick is near 0.83 s.
 
+## Iteration 41 (2026-11-21, ~04:45): survey of the other public entries
+
+`gh search repos` (nine queries, updated since 2026-11-19) returned 224 repos; 192 were new to us and the 122 not written in Python, JavaScript or C# were shallow-cloned into the scratchpad `repos2/` and triaged by script (source size, commits, engine dependencies, intrinsics, score claims in logs and notes). Nothing was built or run. No score below was verified.
+
+**No public repo claims a score under 0.76 s.** The board leaders (0.42 s now; 0.59, 0.62, 0.63, 0.64, 0.65, 0.70 at 01:30 ET per [JuanQuenga `docs/SPEED_REVIEW.md`](https://github.com/JuanQuenga/buildathon-shopping-sessions/blob/5f6718c/docs/SPEED_REVIEW.md); "leaders 0.63 to 0.70" in ParishruthiGanesh's handoff) are not among the public repos we can identify, and no repo names team 67. The best public claims remain Vibhor7-7 0.76 s, then JuanQuenga 0.88 s (29th), micah-andelman 1.04 s, krishchopda 1.17 s.
+
+Shortlist for the x86 bench, ranked by evidence then by sophistication (all hand-written native, no engine, Dockerfile at the root):
+
+| Repo @ head | Lang | Claim | Techniques seen | Bench note |
+|---|---|---|---|---|
+| JuanQuenga/buildathon-shopping-sessions `5f6718c` | Rust | 0.88 s on the board | pread, write-combining, persistent pool, independent speed review | copies `.cargo`; target CPU not checked |
+| zlyuan9/shopping-sessions `cf57464` | Rust | 0.37 to 0.44 s native at 8 threads on its own machine (links 30 ms, parse 250, dedup 50, persons 75) | committed `pgo.profdata`, streaming stores, radix, huge pages, static `scratch` image | builds standalone |
+| AndrewRecinos/shopping-sessions `e276166` | Rust | about 0.64 s "local pinned" | cached-date timestamps, SWAR event type, musl static image | builds standalone |
+| Britogus7/Shopping-Sessions `bf00497` | Rust | none | 9.3k lines: AVX2 and AVX-512 paths, `pext`, streaming stores, huge pages, radix | x86-64-v3 |
+| Louise-Ruza/shopping-sessions `247fdc3` | Rust | none | PGO in the Dockerfile, streaming stores, `pext`, huge pages | PGO at build |
+| himanshu-thalor/shopping-sessions `01ba5ce` | C++ | none | g++ with PGO and `-mtune=cascadelake`, AVX-512 paths, radix | x86-64-v3 |
+| Warrior-hound/shopping-sessions `c7e9a33` | Rust | none | streaming stores, `pext`, huge pages | x86-64-v3 by default |
+| KennethLei1492/Databricks---Shopping-Sessions `7315a2a` | Rust | none; dedup phase 0.40 to 0.04 s locally | 16-byte dedup scatter with a bitmap, mimalloc | x86-64-v3 |
+
+Not benchable on the AMD runners: Alexis-CAPON/shopping-sessions `1b0b7b7` builds with `target-cpu=cascadelake` (AVX-512) and a committed profile.
+
+### 41.1 What the independent speed review of a 0.88 s entry says about the scorer
+
+- **Source.** [JuanQuenga `docs/SPEED_REVIEW.md`](https://github.com/JuanQuenga/buildathon-shopping-sessions/blob/5f6718c/docs/SPEED_REVIEW.md) (01:40 ET, measured on at most 2 cores of a shared laptop; proportions only).
+- **Teardown left to the kernel is serial and inside the scorer's clock**: a build that `mem::forget`s its arenas and mappings spent 111 to 121 ms after `main` at 20M against 8 to 10 ms for one that freed them; 0.22 µs per 4 KiB page, 58 ms per GB, one thread. **Here**: `main` exits through `process::exit` with everything leaked, and `AREL=1` (parallel release) measured no change on the runners (experiment 14), where the arena is huge-page backed. The review's point is that the answer depends on whether the scorer grants huge pages, which no one has seen. `AREL=1` costs nothing when pages are huge and saves about 58 ms per GB when they are not, so making it the default is a hedge with no downside on the evidence so far. Risk to exactness: none.
+- **A warm-cache probe before starting read-ahead threads** (`preadv2` with `RWF_NOWAIT` on the first 256 KiB): they measured 1.86 against 1.62 s of kernel time with and without `fadvise` on a warm cache. **Here**: `RA=0` measured no difference (experiment 12), so nothing to take.
+- **Scorer topology for local benches**: 4 cores with 2 hyperthreads each; a Cascade Lake core has 1 MiB of L2 shared by both threads, so the per-thread parse working set (read chunk plus write-combining lines) should stay under 512 KiB. **Here**: the 256 KiB pread range plus 512 x 128 B x 2 stages is about 400 KiB per thread, inside that bound; at 60M with more partitions it would not be.
+- Their estimate of the scorer's fixed container cost is 0.05 to 0.10 s; one local CPU-second of parallel work is worth about 0.18 s of scorer wall, serial work one for one.
+
+### 41.2 What the survey does not show
+
+No public entry does something structurally different from the designs already compared (parse-time person lookup, one scatter, narrow dedup stream, per-person sessions, encoded Parquet). Nothing found skips work the rules allow, pins threads, or uses an output or exit trick beyond those in 20, 29 and 31. The 0.42 s on the board is therefore unexplained by public code; the x86 bench of the shortlist above is the remaining way to find a faster public design.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
