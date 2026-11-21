@@ -1,7 +1,7 @@
 //! Output accumulators and the two Parquet tables.
 use std::path::Path;
 
-use crate::keys::{key_bytes, Key};
+use crate::keys::{key_bytes, KMap, Key};
 use crate::pq::{self, Column, Enc, Idx, Logical, Values};
 use crate::Ctx;
 
@@ -60,6 +60,10 @@ fn write_users(path: &Path, rows: &[URow], cats: &[Vec<u8>]) {
     let mut se = Vec::with_capacity(n);
     let mut ev = Vec::with_capacity(n);
     let mut rv = Vec::with_capacity(n);
+    let mut ri: Vec<u32> = Vec::with_capacity(n);
+    let mut rdict: Vec<i64> = vec![0];
+    let mut rmap = KMap::<u32>::with_capacity(n / 8 + 16);
+    rmap.entry(0, 0);
     let mut def = Vec::with_capacity(n);
     let mut ci = Vec::new();
     for r in rows {
@@ -74,6 +78,12 @@ fn write_users(path: &Path, rows: &[URow], cats: &[Vec<u8>]) {
         days.push((r.day - dmin) as u32);
         se.push(r.sessions);
         ev.push(r.events);
+        // revenue: 0 for most rows; a dictionary in order of first appearance
+        let (slot, new) = rmap.entry(r.revenue, rdict.len() as u32);
+        if new {
+            rdict.push(r.revenue as i64);
+        }
+        ri.push(*rmap.val_mut(slot));
         rv.push(r.revenue as i64);
         if r.top == u16::MAX {
             def.push(false);
@@ -93,7 +103,12 @@ fn write_users(path: &Path, rows: &[URow], cats: &[Vec<u8>]) {
         Column { name: "day", logical: Logical::Date, def: None, enc: Enc::Dict { dict: Values::I32((dmin..=dmax).collect()), idx: Idx::Each(days) } },
         count_column("sessions", se),
         count_column("events", ev),
-        Column { name: "revenue_cents", logical: Logical::None, def: None, enc: Enc::Plain(Values::I64(rv)) },
+        // dictionary only when it is clearly smaller than 8 bytes a row
+        if rdict.len() * 8 + n * 3 < n * 6 {
+            Column { name: "revenue_cents", logical: Logical::None, def: None, enc: Enc::Dict { dict: Values::I64(rdict), idx: Idx::Each(ri) } }
+        } else {
+            Column { name: "revenue_cents", logical: Logical::None, def: None, enc: Enc::Plain(Values::I64(rv)) }
+        },
         Column { name: "top_category", logical: Logical::Utf8, def: Some(def), enc: Enc::Dict { dict: Values::Str { bytes: cb, ends: ce }, idx: Idx::Each(ci) } },
     ];
     pq::write(path, &cols, n).expect("write user_daily");
