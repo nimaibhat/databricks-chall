@@ -1,3 +1,5 @@
 # label|ref|build-args|env
-old06ec|06ec14c||
-main|main||
+base|main||
+flat16|main||FLAT16=1
+tsbl|main||TSBL=1
+both|main||FLAT16=1 TSBL=1
