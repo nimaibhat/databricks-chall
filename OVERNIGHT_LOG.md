@@ -83,6 +83,10 @@ From experiment 27 on, the bench drops the page cache before each dataset: with 
 | 49 | `dc58e98` | #47 + #48 with a regenerated profile against the previous pick (final check, image gates) | 1.461 / 1.442 (Xeon 8370C); 1.353 / 1.364 (7763; same code path measured 1.352 in that run) | 4.122 / 3.934 ; 3.709 / 3.663 | | kept (-1.3% / -4.6% on Ice Lake, -1.2% at 60M on Zen 3) |
 | 50 | not merged | `PREFAULT=2`: finish the arena pre-fault on all threads right before the parse (after the union-find window) | 1.496 / 1.479 (Xeon 8573C, n=7; ranges 1.491-1.615 / 1.472-1.530); 1.094 / 1.097 (9V74) | 3.981 / 3.960 ; 2.952 / 2.991 | n/a | rejected: inside the range on Intel, nothing on AMD. Same run, pre-fault as merged against off on the Xeon 8573C: 1.521 -> 1.496 s and 4.058 -> 3.981 s (third Intel model with a gain) |
 | 51 | not committed | SIMD ID packing in the link parser instead of the scalar packer | not run | not run | link parse 11.5-13 ms both ways | rejected on the Mac: no difference (the link parse is bound by its list pushes, not by packing) |
+| 52 | analysis | Per-phase logs of the two fastest public builds on the same runner as ours (EPYC 9V74), in-process seconds at 20M / 60M | links 0.060 / cheryl 0.034 / Vibhor 0.040; parse 0.590 / 0.576 / 0.558; dedup 0.059 / 0.060 / 0.049; sessions+output 0.221 / 0.206 / 0.188; in-process total 0.932 / 0.876 / 0.838; `docker run` wall 1.082 / 1.114 / 1.266 | links 0.201 / 0.091 / 0.136; parse 1.752 / 1.850 / 1.696; dedup 0.160 / 0.154 / 0.131; sessions 0.664 / 0.584 / 0.551; total 2.779 / 2.679 / 2.517; wall 2.917 / 3.073 / 3.458 | | in-process we are 4 to 6% behind cherylaurelia and 10% behind Vibhor7-7, in the link build and the sessions phase; we lead on wall because of what happens outside the process (static binary on an empty image, 21 MB of output written during the run against their output flushed after exit) |
+| 53 | not merged | Link files read with page-aligned preads instead of a mapping | 1.516 / 1.515 (Xeon 8573C); 1.135 / 1.139 (Xeon 6975P-C) | 4.034 / 4.016 ; 3.076 / 3.069 | link parse 12 ms both | rejected: no difference |
+| 54 | not merged | Sessions without the per-person sort: counting pass by half-hour bin, stable counting pass by person, sessions from bin runs (differential test against sorted sessions passes) | 1.343 / 1.349 (7763; sessions 0.284 -> 0.292); 1.300 / 1.282 (Xeon 8573C; 0.263 -> 0.260) | 3.638 / 3.662 (0.868 -> 0.885) ; 3.374 / 3.386 | sessions 0.447 / 0.422 at one thread | rejected: the extra pass costs what the sort saved (slower on Zen 3, level on the Xeon) |
+| 55 | not committed | Link build around one concurrent ID table (no shard lists, no interning pass) | not run | not run | ID translation 57 ms against 13 ms for intern + translate at 20M; 185 against 41 ms at 60M | rejected on the Mac: a table larger than the cache loses to the per-shard maps |
 
 ## Current phase profile (`dc58e98`)
 
@@ -115,9 +119,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Sessions phase on small-L2 CPUs (0.30 s at 20M and 0.91 s at 60M on Ice Lake, a quarter of in-process time): the per-thread campaign-day array is 900 KB of 32-byte cells hit once or twice per session; 16- or 20-byte cells would keep it in L2.
-2. The link build on Ice Lake is 0.12 s at 20M and 0.37 s at 60M (0.08 / 0.25 s on Zen 3): the serial union-find and the shard interning are the candidates; union-find on the table's own slots (RESEARCH_NOTES 36).
-3. Remaining parse items from RESEARCH_NOTES 38/39 (fourth 32-byte mask block only when needed, fewer hash evaluations in dedup). Every source change needs a regenerated profile (`PGO_REF`) and the image-binary gate before it can replace the pick.
+1. Link build (0.20 s at 60M against 0.09 to 0.14 s for the public builds, experiment 52): the serial union-find is the largest piece on Intel (95 ms at 60M); a lock-free parallel union on the dense numbers would cut it but removes the idle window the Intel pre-fault uses, so both have to be measured together.
+2. Sessions phase (0.66 s at 60M against 0.55 to 0.58 s): bins and radix sort did not pay (experiments 35, 54); what is left is the grouping (hash per event) and the campaign-day cells.
+3. Fewer bytes per record (24-byte clicks, 12-byte events) to cut page zeroing on Intel (7% of CPU there).
 
 ## Setup notes
 
