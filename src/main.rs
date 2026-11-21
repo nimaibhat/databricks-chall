@@ -126,7 +126,7 @@ pub struct Ctx {
 // ---------------------------------------------------------------------------
 // Phase 1: links
 // ---------------------------------------------------------------------------
-fn build_links(data: &Path, threads: usize) -> LinkTab {
+fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> LinkTab {
     let t0 = Instant::now();
     let paths = list_csv(&data.join("links"));
     let m = Mapped::open(&paths);
@@ -235,7 +235,20 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
         }
         x
     }
+    // The union pass is serial. Meanwhile the other threads fault in the
+    // start of the record arena, which the parse threads would otherwise
+    // have to wait for page by page.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let pf_next = AtomicUsize::new(0);
     let mut nmoved = 0usize; // IDs that are not a root = unions made
+    std::thread::scope(|sc| {
+    if prefault > 0 {
+        for _ in 1..threads {
+            sc.spawn(|| {
+                while !stop.load(Ordering::Relaxed) && arena.populate_step(&pf_next, prefault) {}
+            });
+        }
+    }
     for v in &ipairs {
         for (j, &(a, b)) in v.iter().enumerate() {
             // serial and cache-bound: fetch the next pairs' entries early
@@ -258,6 +271,8 @@ fn build_links(data: &Path, threads: usize) -> LinkTab {
             }
         }
     }
+    stop.store(true, Ordering::Relaxed);
+    });
     let uf_time = t_uf.elapsed();
     let t_union = t0.elapsed();
     let t_name = t0.elapsed();
@@ -379,6 +394,19 @@ fn load_catalogs(data: &Path) -> Catalogs {
     Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels }
 }
 
+/// True on an Intel x86-64 CPU (CPUID vendor string).
+fn is_intel() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let r = unsafe { std::arch::x86_64::__cpuid(0) };
+        r.ebx == u32::from_le_bytes(*b"Genu") && r.edx == u32::from_le_bytes(*b"ineI") && r.ecx == u32::from_le_bytes(*b"ntel")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 fn epoch() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
@@ -446,7 +474,18 @@ fn main() {
     // ---- phase 1 (the catalogs load on a side thread meanwhile)
     let (links, cats) = std::thread::scope(|sc| {
         let h = sc.spawn(|| load_catalogs(&data));
-        let links = build_links(&data, threads);
+        // At most three quarters of what the estimate says will be used.
+        // On by default on Intel CPUs only: zeroing pages at first touch
+        // inside the parse loop costs them far more than doing it here
+        // (measured: -3% at 20M, -4% at 60M on a Xeon), while on AMD Zen the
+        // slower link build outweighs it (+1%). PREFAULT=1 / 0 forces it.
+        let on = match env("PREFAULT", "").as_str() {
+            "1" => true,
+            "0" => false,
+            _ => is_intel(),
+        };
+        let prefault = if on { (ev_bytes / 78 * 32 + cl_bytes / 47 * 32) * 3 / 4 } else { 0 };
+        let links = build_links(&data, threads, &arena, prefault);
         (links, h.join().expect("catalogs"))
     });
     let Catalogs { products, cat_set, cat_unknown, campaigns, camp_names, camp_channels } = cats;
