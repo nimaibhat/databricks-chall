@@ -203,12 +203,13 @@ pub fn prefetch<T>(p: *const T) {
 }
 
 /// Global user -> person table. Holds only IDs whose person differs from
-/// themselves, so a miss means "this ID is its own person". Buckets of four
-/// 16-byte slots (one cache line), key 0 = empty (no ID packs to 0 except the
-/// empty string, which is never looked up). Inserts are lock-free so the table
-/// is filled in parallel; lookups happen only after the build.
+/// themselves, so a miss means "this ID is its own person". A bucket is one
+/// cache line: four keys, then their four people; key 0 = empty (no ID packs
+/// to 0 except the empty string, which is never looked up). A lookup compares
+/// the four keys at once. Inserts are lock-free so the table is filled in
+/// parallel; lookups happen only after the build.
 pub struct LinkTab {
-    base: *mut [u64; 2],
+    base: *mut [u64; 8],
     nb_mask: usize,
     shift: u32,
 }
@@ -219,26 +220,28 @@ impl LinkTab {
     pub fn new(n: usize) -> LinkTab {
         let slots = (n * 2).next_power_of_two().max(64);
         let bytes = slots * 16;
+        const ALIGN: usize = 2 << 20;
         let base = unsafe {
             let p = libc::mmap(
                 std::ptr::null_mut(),
-                bytes,
+                bytes + ALIGN,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
                 0,
             );
             assert!(p != libc::MAP_FAILED, "link table mmap");
+            let b = (p as usize + ALIGN - 1) & !(ALIGN - 1);
             #[cfg(target_os = "linux")]
-            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
-            p as *mut [u64; 2]
+            libc::madvise(b as *mut _, bytes, libc::MADV_HUGEPAGE);
+            b as *mut [u64; 8]
         };
         let nb = slots / 4;
         LinkTab { base, nb_mask: nb - 1, shift: 64 - nb.trailing_zeros() }
     }
     #[inline(always)]
     pub fn prefetch(&self, h: u64) {
-        prefetch(unsafe { self.base.add(((h >> self.shift) as usize) * 4) });
+        prefetch(unsafe { self.base.add((h >> self.shift) as usize) });
     }
     /// Concurrent insert of a key that is not in the table yet.
     pub fn insert(&self, k: Key, v: Key) {
@@ -246,32 +249,47 @@ impl LinkTab {
         assert!(k != 0);
         let mut b = (hk(k) >> self.shift) as usize;
         loop {
+            let line = unsafe { &*(self.base.add(b) as *const [AtomicU64; 8]) };
             for i in 0..4 {
-                let slot = unsafe { self.base.add(b * 4 + i) };
-                let key = unsafe { &*(slot as *const AtomicU64) };
-                if key.load(Ordering::Relaxed) == 0 && key.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                    unsafe { (*(slot as *const [AtomicU64; 2]))[1].store(v, Ordering::Relaxed) };
+                if line[i].load(Ordering::Relaxed) == 0 && line[i].compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    line[4 + i].store(v, Ordering::Relaxed);
                     return;
                 }
             }
             b = (b + 1) & self.nb_mask;
         }
     }
-    /// The person of `k` if it differs from `k`. `h` = hk(k).
+    /// The person of `k` (which is `k` itself when it is not in the table).
+    /// `h` = hk(k).
     #[inline(always)]
-    pub fn get(&self, k: Key, h: u64) -> Option<Key> {
+    pub fn person(&self, k: Key, h: u64) -> Key {
         let mut b = (h >> self.shift) as usize;
         loop {
-            for i in 0..4 {
-                let s = unsafe { *self.base.add(b * 4 + i) };
-                if s[0] == k {
-                    return Some(s[1]);
+            let line = unsafe { &*self.base.add(b) };
+            #[cfg(target_arch = "x86_64")]
+            let (hit, free) = unsafe {
+                use std::arch::x86_64::*;
+                let keys = _mm256_loadu_si256(line.as_ptr() as *const __m256i);
+                let hit = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(k as i64)))) as u32;
+                let free = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_setzero_si256()))) as u32;
+                (hit, free)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let (hit, free) = {
+                let (mut hit, mut free) = (0u32, 0u32);
+                for i in 0..4 {
+                    hit |= ((line[i] == k) as u32) << i;
+                    free |= ((line[i] == 0) as u32) << i;
                 }
-                if s[0] == 0 {
-                    return None;
-                }
+                (hit, free)
+            };
+            // which of the four it is (slot 0 when none: the value is then unused)
+            let v = unsafe { *line.get_unchecked(4 + (hit.trailing_zeros() & 3) as usize) };
+            if (hit | free) != 0 {
+                // hits and misses alternate unpredictably: select, do not branch
+                return std::hint::select_unpredictable(hit != 0, v, k);
             }
-            b = (b + 1) & self.nb_mask;
+            b = (b + 1) & self.nb_mask; // a full line without the key: rare
         }
     }
 }
@@ -420,11 +438,11 @@ mod tests {
                 }
             });
             for (&k, &v) in &m {
-                assert_eq!(t.get(k, hk(k)), Some(v));
+                assert_eq!(t.person(k, hk(k)), v);
             }
             for _ in 0..20_000 {
                 let k = if rnd() % 2 == 0 { 1 + rnd() % 200 } else { rnd() | 1 };
-                assert_eq!(t.get(k, hk(k)), m.get(&k).copied(), "n {n} k {k}");
+                assert_eq!(t.person(k, hk(k)), m.get(&k).copied().unwrap_or(k), "n {n} k {k}");
             }
         }
     }

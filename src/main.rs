@@ -575,10 +575,8 @@ const RING: usize = 16;
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn emit_event(tab: &LinkTab, p: &PendE, eb: &mut Scatter<DRec>, sb: &mut Scatter<SRec>, bs: &mut Blocks, sh1: u32, sh2: u32, abase: usize) {
-    let (person, hp) = match tab.get(p.user, p.h) {
-        Some(v) => (v, hk(v)),
-        None => (p.user, p.h),
-    };
+    let person = tab.person(p.user, p.h);
+    let hp = hk(person);
     let at = sb.push((hp >> sh2) as usize, SRec { person, ts: p.ts, pc: p.pc }, bs);
     let loc = ((at as usize - abase) / 16) as u32 + 1;
     eb.push((hk(p.eid) >> sh1) as usize, DRec { eid: p.eid, ingest: p.ingest, loc }, bs);
@@ -651,7 +649,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut Scatter<
             if rn >= RING {
                 let old = ring[slot];
                 if cfg!(feature = "diag") && stage >= 5 {
-                    let pr = tab.get(old.user, old.h).unwrap_or(old.user);
+                    let pr = tab.person(old.user, old.h);
                     sink = sink.wrapping_add(pr);
                     if stage >= 6 {
                         let hp = hk(pr);
@@ -692,10 +690,8 @@ fn diag_stage() -> u32 {
 
 #[inline(always)]
 fn emit_click(tab: &LinkTab, p: &PendC, cb: &mut Scatter<CRec>, bs: &mut Blocks, sh2: u32) {
-    let (person, hp) = match tab.get(p.user, p.h) {
-        Some(v) => (v, hk(v)),
-        None => (p.user, p.h),
-    };
+    let person = tab.person(p.user, p.h);
+    let hp = hk(person);
     cb.push((hp >> sh2) as usize, CRec { person, cid: p.cid, ts: p.ts, camp: p.camp }, bs);
 }
 
