@@ -1,4 +1,5 @@
 # label|ref|build-args|env
-p1|origin/gate-p1-a87bd35||
-p2|origin/gate-p2-cd1b266||
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+main|origin/gate-main-35484b1||
+s37|origin/gate-s37-2864507||
+mainc128|origin/gate-mainc128-35484b1||CHUNKKB=128
+mainc64|origin/gate-mainc64-35484b1||CHUNKKB=64
