@@ -1,2 +1,4 @@
 # label|ref|build-args|env
-cg|origin/gate-cg-07eeb0c||
+s22|origin/gate-s22-07eeb0c||
+s23|origin/gate-s23-3bc664d||
+s24|origin/gate-s24-424c5bf||
