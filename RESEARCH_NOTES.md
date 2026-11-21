@@ -11,10 +11,10 @@ Research-only notes for the optimizing session. Nothing here has been built or b
 | 1 | Look up the product category only for purchase rows (3% of events) | `parse_events`, `main.rs:632` | Removes one dense-table load + digit conversion from 97% of valid event lines; audit put this lookup at 37 to 40 ns of a 163 ns line before `1c4fa8e` | None: the category byte is read only when `price != 0` | [1.1](#11-product-lookup-only-for-purchases) |
 | 2 | Software write-combining with non-temporal stores for the 512-way scatters | `BList::push` in `mem.rs:128`, callers in `parse_events`, `parse_clicks`, `dedup_partition` | Competitor measured -12% total, -16% parse on an Ice Lake Xeon (the scorer's class); -6% on Zen 4 | Low: a flush bug loses or duplicates records, which the 20M cross-check catches | [1.2](#12-write-combining-buffers-with-non-temporal-stores) |
 | 3 | Route valid events straight to their user partition at parse; dedup only marks losers | `parse_events`, `dedup_partition`, `resolve_partition` | Removes dedup pass 2 (a second 512-way scatter of every survivor); competitors report a 19 to 26 ms dedup phase at 20M | Medium: restructures phase 3; invalid copies must still take part in dedup | [1.3](#13-dedup-that-marks-losers-in-place) |
-| 4 | Known-date table for F1/F2 timestamps and `ingest_ts` | `civil_swar` and `parse_ingest_s`, `parse.rs:772` and `:889` | Estimate 2 to 5% of parse CPU; three competitors ship it | Low: exact 11-byte compare, full parser on a miss | [1.4](#14-known-date-table-for-timestamps) |
-| 5 | Split each line from its own comma and quote masks (no separator index, no quote ring) | `scan_lines`, `parse.rs:486-654` | Competitor A/B ratios 0.90 to 0.95 of total; a second team measured the index design 6% slower than stepping per delimiter | Medium to high: this routine decides which lines are malformed; the existing fuzz test is the net | [2.1](#21-split-each-line-from-its-own-masks) |
+| 4 | Sort 8-byte `(ts << 32) \| pc` keys per person instead of 16-byte `SRec`s | `process_partition`, `main.rs:814-830` and `:893-896` | Estimate 10 to 25% of the sessions phase, 2 to 4% of wall; halves the scratch buffer | None: `person` is constant within a group and equal-`ts` order does not affect any output | [7.1](#71-sort-8-byte-keys-per-person) |
+| 5 | Known-date table for F1/F2 timestamps and `ingest_ts` | `civil_swar` and `parse_ingest_s`, `parse.rs:772` and `:889` | Estimate 2 to 5% of parse CPU; three competitors ship it | Low: exact 11-byte compare, full parser on a miss | [1.4](#14-known-date-table-for-timestamps) |
 
-Runners-up, in order: `pread` in L2-sized blocks ([1.5](#15-pread-in-l2-sized-blocks), demoted in iteration 2: three teams measured mmap faster, two measured `read` faster), sessions from 30-minute bins instead of a sort ([1.6](#16-sessions-from-30-minute-bins)), one-multiply hash ([1.7](#17-one-multiply-hash)), smaller Parquet ([1.8](#18-smaller-parquet-output)), `readahead(2)` tuning for a cold cache ([1.9](#19-cold-cache-read-ahead)).
+Runners-up, in order: splitting each line from its own masks ([2.1](#21-split-each-line-from-its-own-masks), 3 to 8% but it rewrites the routine that decides which lines are malformed), `pread` in L2-sized blocks ([1.5](#15-pread-in-l2-sized-blocks), demoted in iteration 2: three teams measured mmap faster, two measured `read` faster), sessions from 30-minute bins instead of a sort ([1.6](#16-sessions-from-30-minute-bins)), one-multiply hash ([1.7](#17-one-multiply-hash)), smaller Parquet ([1.8](#18-smaller-parquet-output)), `readahead(2)` tuning for a cold cache ([1.9](#19-cold-cache-read-ahead)).
 
 ## A finding to act on before trusting the TSBL toggle
 
@@ -338,6 +338,53 @@ Opened by a research agent; links per claim. The sources support the plan in 1.2
 - **`movdir64b`, `clzero`, `rep movsb`.** The first is absent before Sapphire Rapids and the second is AMD-only ([GCC x86 options](https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html)); `rep movsb` is slower than non-temporal copies and only competitive from 256 bytes.
 
 Not found: any measurement of non-temporal stores under hyperthread contention, in a VM, or Zen against Intel beyond Vibhor7-7's A/B.
+
+---
+
+## Iteration 7 (2026-11-21): sorting, union-find, dedup tables and hyperthreads
+
+Opened by a research agent; links per claim. The primary sources have few numbers at this workload's sizes, so the two strongest leads come from reading `src/` against them.
+
+### 7.1 Sort 8-byte keys per person
+
+- **Idea.** After the counting-sort scatter, every record in a group has the same `person`. Scatter only `(ts as u64) << 32 | pc as u64` into `ev` and sort plain `u64`s.
+- **Sources.** Rust's `sort_unstable` uses insertion sort up to 20 elements, and its sorting-network small sort is only used when `size_of::<T>() <= 8` ([core sort source](https://doc.rust-lang.org/src/core/slice/sort/unstable/mod.rs.html), [smallsort.rs](https://doc.rust-lang.org/src/core/slice/sort/shared/smallsort.rs.html)); a 16-byte `SRec` never takes the network path. Sorting networks beat insertion sort by at least 1.76x for 6 to 16 elements of (key, reference) pairs ([Bingmann et al.](https://ar5iv.labs.arxiv.org/html/2002.05599)).
+- **Here.** `Scratch.ev` becomes `Vec<u64>`; the scatter at `main.rs:820-828` writes the packed word; `sort_unstable_by_key(|r| r.ts)` at `:895` becomes `sort_unstable()`; the sweep at `:911-943` reads `ts = (w >> 32) as u32` and `pc = w as u32`. `person` already comes from `gkeys[g]` (`:901`). Insertion sort then moves half the bytes, groups of 21 or more get the network path, and `ev` drops to 0.3 to 1 MB per partition, which matters because two hyperthreads share each L2.
+- **Expected gain.** 10 to 25% of the sessions phase, so 2 to 4% of wall. This is the agent's estimate, not a measurement.
+- **Risk.** None to exactness. Sorting the whole word orders equal-`ts` events by `pc` instead of arbitrarily; events with equal `ts` always share a session, and the count, revenue and category sums do not depend on order.
+
+### 7.2 Whale groups
+
+- At 1M keys vqsort reaches 628 MB/s on AVX2 against 118 MB/s for `std::sort` ([Blacher et al.](https://ar5iv.labs.arxiv.org/html/2205.05982)), but Rust's ipnsort is already about 1.6x pdqsort and catches Intel's AVX-512 sort at 1M ([sort-research-rs](https://github.com/Voultapher/sort-research-rs/blob/main/writeup/intel_avx512/text.md)). With 7.1 a whale is a plain `u64` sort, where vqsort would give roughly 2x on 5 to 10% of events: about 1% of wall for a C++ dependency. `speedups.md` already rejected this; the numbers confirm it.
+- A hand-written 3-pass LSD radix on `ts` for groups above about 1,000 elements avoids the dependency; ska_sort falls back to comparison sort below 128 elements ([Skarupke](https://probablydance.com/2016/12/27/i-wrote-a-faster-sorting-algorithm/)). No source measures it at this size; micah-andelman's partition-wide radix gained about 10% of the person stage (entry 1.6).
+
+### 7.3 Union-find: prefetch before changing the algorithm
+
+- **Sources.** Cache misses decide union-find performance, and checking the immediate parent first improves every variant ([Alistarh et al.](https://ar5iv.labs.arxiv.org/html/1911.06347)). Rem's algorithm with splicing averaged 28% faster than rank with path halving on graphs of 64K to 1.5M vertices ([slides](https://api.sambuz.com/doc/experiments-on-union-find-algorithms-for-the-disjoint-set-presentation-696884) for Patwary et al.; the paper itself was not opened).
+- **Here.** The serial loop at `main.rs:231-243` costs 40 to 120 ns per edge by the audit's timings. That is high for a `parent` array of about 7 MB: ids are numbered in hash-shard order while `ipairs` are in file order, so each edge makes two random loads. Cheapest first:
+  1. Prefetch `parent[a]` and `parent[b]` 8 to 16 edges ahead. Most finds are 0 or 1 hops, so this should hide most of the misses.
+  2. Split the `t_uf` timer. It also covers first touch of about 35 MB (`parent`, `all_keys`, `name`) and the random `name[r]` pass at `:249-256`, which may be the larger part.
+  3. Only then consider parallel CAS unions; `speedups.md` rejected those and nothing here changes that.
+- **Expected gain.** 1 to 3% of wall, less once links run beside the parse (queued).
+- **Risk.** None for the prefetch.
+
+### 7.4 Dedup: lookahead prefetch is not a reliable win at 2 to 4 MB
+
+- On a 2 MB table that fits the last-level cache, group prefetching was 32% slower than no prefetching and only AMAC gained (21%); the large gains (2.8x to 4.3x) are at 2 GB ([Kocberber et al.](https://www.vldb.org/pvldb/vol9/p252-kocberber.pdf)). Out-of-order execution already overlaps about 5 probes ([Cimple](https://ar5iv.labs.arxiv.org/html/1807.01624)).
+- **Here.** A prefetch in pass 1 of `dedup_partition` is worth 0 to 20% of that phase and could be negative, which agrees with `speedups.md`. cherylaurelia's dedup prefetch (`838452e`, entry 1.7) gained in a design with a far smaller table. The better lever is footprint: the 16-byte keys of idea 1.3, or an 8-byte slot holding a 32-bit tag and a 32-bit record index, verified against the record on a tag match.
+
+### 7.5 Hyperthreads
+
+- Radix joins gain little from SMT because siblings share caches and TLBs, and where two threads share an L2 its effective size per thread is halved ([Balkesen et al., ICDE 2013](https://www.comp.nus.edu.sg/~hebs/course/cs6284/papers/Balkesen-icde2013.pdf)). No source gives a measured sizing rule.
+- **Here.** Count 512 KB, not 1 MB, as the per-thread L2 budget on Cascade Lake. That is one more argument for 7.1 and for the smaller dedup records in 1.3, and against raising the write-combining stage past 4 lines (entry 6.1).
+
+Not opened: the Patwary et al. paper, absolute cycle tables in Bingmann et al., single-thread tables in ConnectIt.
+
+### 7.6 Generator source (read directly, `generator.zip`)
+
+- IDs are a one-letter prefix (`e`, `u`, `k`) plus lowercase base 36 of a scrambled 40-bit number (`text.rs` `base36`, `scramble`), so at most 9 bytes; products are `p<n>` and campaigns `c_<n>` (`main.rs` `write_lookups`). Lines are shuffled within each file (`write_part`), so there is no time or user locality to exploit, and a last-value cache is useless while a table keyed by date still works (idea 1.4).
+- `ingest_ts` is whole seconds and usually minutes after `ts` (`user.rs` `ingest`), so both timestamps of a line usually share a date. With idea 1.4 the second lookup of a line almost always hits the entry the first one just used.
+- Nothing else in the generator supports a new specialised path; the dirt rates are per seed, as the rules say.
 
 ## Next iteration
 
