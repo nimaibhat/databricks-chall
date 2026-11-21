@@ -13,7 +13,7 @@
 //!   5. Parquet output
 use mimalloc::MiMalloc;
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mem::HugeAlloc = mem::HugeAlloc(MiMalloc);
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -494,7 +494,7 @@ fn main() {
     let sparts = transpose(sbl.into_inner().into_iter().map(|s| s.finish()).collect(), 1usize << p2_bits());
 
     // ---- phase 3: dedup per eid partition; losers are marked dead in place
-    let dscr = PerThread::new(threads, DedupScratch::default);
+    let dscr = PerThread::new(threads, || DedupScratch { map: None, seen: Vec::with_capacity(1 << 17), twice: Vec::with_capacity(1 << 17) });
     let p1 = p1_bits();
     par_for(1usize << p1, threads, |t, p| {
         let lists = unsafe { eparts.get(p) };
@@ -515,7 +515,15 @@ fn main() {
         a.users.reserve(nev / 4 / threads + 1024);
         a
     });
-    let pscr = PerThread::new(threads, Scratch::default);
+    // the scatter targets start at 1 MiB so that they sit on huge pages
+    let pscr = PerThread::new(threads, || Scratch {
+        gmap: Some(KMap::<u32>::with_capacity(1 << 15)),
+        gid: Vec::with_capacity(1 << 18),
+        ev: Vec::with_capacity(1 << 17),
+        cgid: Vec::with_capacity(1 << 18),
+        cl: Vec::with_capacity(1 << 16),
+        ..Scratch::default()
+    });
     let ptimes = std::sync::Mutex::new(Vec::new());
     // largest partitions first, so a whale's partition is never the last one running alone
     let mut order: Vec<usize> = (0..1usize << p2_bits()).collect();

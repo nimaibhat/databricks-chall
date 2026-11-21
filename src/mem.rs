@@ -4,6 +4,87 @@
 //! phase become the output buffers of the next without touching fresh pages.
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Global allocator: allocations of 1 MiB and more get their own mapping,
+/// 2 MiB aligned and marked for transparent huge pages (the kernel's default
+/// mode only gives huge pages to memory that asks); the rest go to mimalloc.
+/// Large buffers here are scatter targets and tables read at random, where
+/// 4 KiB pages mean a TLB miss per access.
+pub struct HugeAlloc(pub mimalloc::MiMalloc);
+
+const BIG: usize = 1 << 20;
+const HUGE: usize = 2 << 20;
+
+#[inline(always)]
+fn big_len(size: usize) -> usize {
+    (size + HUGE - 1) & !(HUGE - 1)
+}
+
+unsafe fn big_alloc(size: usize) -> *mut u8 {
+    let len = big_len(size);
+    let p = libc::mmap(std::ptr::null_mut(), len + HUGE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+    if p == libc::MAP_FAILED {
+        return std::ptr::null_mut();
+    }
+    let p = p as usize;
+    let b = (p + HUGE - 1) & !(HUGE - 1);
+    // give back the unused head and tail so that freeing is one munmap of `len`
+    if b > p {
+        libc::munmap(p as *mut _, b - p);
+    }
+    let tail = (p + len + HUGE) - (b + len);
+    if tail > 0 {
+        libc::munmap((b + len) as *mut _, tail);
+    }
+    #[cfg(target_os = "linux")]
+    libc::madvise(b as *mut _, len, libc::MADV_HUGEPAGE);
+    b as *mut u8
+}
+
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    #[inline]
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= BIG && l.align() <= HUGE {
+            big_alloc(l.size())
+        } else {
+            self.0.alloc(l)
+        }
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= BIG && l.align() <= HUGE {
+            big_alloc(l.size()) // a fresh mapping is zero
+        } else {
+            self.0.alloc_zeroed(l)
+        }
+    }
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if l.size() >= BIG && l.align() <= HUGE {
+            libc::munmap(p as *mut _, big_len(l.size()));
+        } else {
+            self.0.dealloc(p, l)
+        }
+    }
+    #[inline]
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let big_old = l.size() >= BIG && l.align() <= HUGE;
+        let big_new = new_size >= BIG && l.align() <= HUGE;
+        if !big_old && !big_new {
+            return self.0.realloc(p, l, new_size);
+        }
+        if big_old && big_new && big_len(l.size()) == big_len(new_size) {
+            return p; // still fits its mapping
+        }
+        let nl = std::alloc::Layout::from_size_align_unchecked(new_size, l.align());
+        let q = self.alloc(nl);
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, l.size().min(new_size));
+            self.dealloc(p, l);
+        }
+        q
+    }
+}
+
 pub const BLK: usize = 32 * 1024;
 
 pub struct Arena {
@@ -260,6 +341,29 @@ impl<T: Copy> Scatter<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The allocator across the 1 MiB boundary: contents survive growth and
+    /// shrinking, zeroed memory is zero, blocks are usable to their last byte.
+    #[test]
+    fn huge_alloc_roundtrip() {
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..700_000u64 {
+            v.push(i * 3);
+        }
+        assert!(v.iter().enumerate().all(|(i, &x)| x == i as u64 * 3));
+        v.truncate(1000);
+        v.shrink_to_fit();
+        assert!(v.iter().enumerate().all(|(i, &x)| x == i as u64 * 3));
+        let z = vec![0u8; 5 << 20];
+        assert!(z.iter().all(|&b| b == 0));
+        let mut w = vec![7u8; (3 << 20) + 5];
+        *w.last_mut().unwrap() = 9;
+        w.extend_from_slice(&[1; 4 << 20]);
+        assert_eq!(w[(3 << 20) + 4], 9);
+        assert_eq!(w[0], 7);
+        assert_eq!(*w.last().unwrap(), 1);
+        let b: Box<[u32]> = vec![5u32; 1 << 19].into_boxed_slice();
+        assert_eq!(b[(1 << 19) - 1], 5);
+    }
     /// Scatter against a plain Vec per partition: same records, same order,
     /// and every returned address holds its record after `finish`.
     #[test]
