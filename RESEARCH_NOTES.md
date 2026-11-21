@@ -968,7 +968,7 @@ Read from `parse.rs:477-587` at `40e0519` (commit `6c99487`).
   No discrepancy found. The branch also strengthened `fuzz_scan`.
 - **Trim 1: 128-bit shifts and bit scans in the field loop** (`:571-584`). `m.trailing_zeros()` and `m &= m - 1` on a `u128`, and `(q >> fs) as u32` with a variable shift of a `u128`, each compile to several instructions with a branch or conditional move, six or seven times per line. cherylaurelia's version works on the two 64-bit halves separately (comma offsets from each word, merged by a shift of `8 * popcount(c0)`; quoted flags through `pext`/`pdep`), which keeps every operation a single 64-bit instruction (entry 2.1, lines 1352 to 1380 of their `src/main.rs`). TejasviniChawla measured its own `u64`-halves splitter at only 1 ns per line better (entry 22.1), so this is small.
 - **Trim 2: three blocks recomputed per refill.** Each refill restarts at the current block and recomputes the masks of blocks that the previous segment already covered as its three look-ahead blocks: about 5% more `masks64` calls than needed. Carrying the last three words forward removes it.
-- **Expected gain.** A few percent of the scanner at most; listed for completeness now that the scanner is the newest code.
+- **Expected gain.** Stated here at first as a few percent of the scanner at most. The stage profile in the 01:05 log shows that was an underestimate for trim 1: see [24.2](#242-the-scanners-field-loop-is-most-of-its-cost), which counts about 200 of the scanner's roughly 300 instructions per line in this loop.
 
 ---
 
@@ -1012,6 +1012,11 @@ Sources: this repo's log; [TejasviniChawla notes](https://github.com/TejasviniCh
 - What differs from the version that works (entry 18.1): the slot layout interleaves key and value, so a lookup is up to four compare-and-branch steps on a result that is a hit 39% of the time; and each pending record is 40 bytes copied into and out of the ring. Vibhor7-7 keeps the parsed record where it is and stores only the home index in the ring, compares four keys with one vector instruction and selects without a branch.
 - Also possible: the table is sized at 2 to 4 times the moved IDs (`LinkTab::new`, load 0.25 to 0.5). At 20M that is 32 MB; Vibhor7-7 found a table twice as large was slower (entry 18.1). A load near 0.5 at the bucket level, by sizing from the exact count, halves the footprint in the worst case of the power-of-two rounding.
 - **Expected gain.** 4 to 6 ns of the 130 ns line.
+
+### 24.5 New competitor commits this cycle
+
+- [Th3r0n `4984586`](https://github.com/Th3r0n/shopping-sessions/commit/4984586): "Dedup: 8-byte slots, loser bitmap, sequential second pass; renamed-key filter before name lookups", and `3a5f347` "Drop the input prefetch experiment". The 8-byte slot is the tag-plus-index layout mentioned in entry 7.4; the renamed-key filter is the bit filter of entry 13.1. No numbers in the commits.
+- [TejasviniChawla `4325cc0`](https://github.com/TejasviniChawla/shopping-sessions/commit/4325cc0): "PGO Docker build with fallback; mmap no-populate toggle; skip mirrored links in union-find; barrier idle instrumentation; heavy persons scheduled first", followed by `dea9bea` "PGO steps in a traced script so failures show in the build log". Two things for entry 16.4: they generate the profile inside the Docker build (so the toolchain always matches) and fall back to a plain build if any PGO step fails, which removes the build-failure risk at the cost of build time (the scorer allows 10 minutes); and a second team is now adopting PGO.
 
 ## Next iteration
 
