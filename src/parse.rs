@@ -224,19 +224,14 @@ pub struct Mapped {
     pub files: Vec<File>,
 }
 
-/// I/O strategy, from env IOMODE: 0 none, 1 whole-file WILLNEED at open,
-/// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread.
-#[inline(always)]
-pub fn flat16() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("FLAT16").map(|v| v == "1").unwrap_or(false))
-}
 #[inline(always)]
 pub fn ts_bl() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("TSBL").map(|v| v == "1").unwrap_or(false))
 }
 
+/// I/O strategy, from env IOMODE: 0 none, 1 whole-file WILLNEED at open,
+/// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread.
 pub fn io_mode() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
@@ -466,22 +461,18 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
-pub fn masks64_pub(b: &[u8]) -> (u64, u64, u64) {
-    assert!(b.len() >= 64);
-    unsafe { masks64(b.as_ptr()) }
-}
-
-const SEG: usize = 32; // blocks per segment (2 KiB)
-const QR: usize = 64; // quote-mask ring, in blocks
+/// Mask words per segment: 4 KiB of input, 1.6 KiB of masks, all in L1.
+const SEGW: usize = 64;
 
 /// Calls `f` with the N fields of every well-formed line in `data[start..end]`.
-/// Lines start at `start` and none crosses `end`.
+/// Lines start at `start` and none crosses `end` (the last one may lack its
+/// newline). Bytes of `data` after `end` are never interpreted.
 ///
-/// Per 2 KiB segment: SIMD masks per 64-byte block; the positions of all
-/// separators (comma | newline) are flattened branch-free into `pos`, and each
-/// newline records its rank there. A line is well-formed only if it holds
-/// exactly N separators; its fields are cut from `pos` and quote-checked with
-/// bit tests on a ring of quote masks. Long lines take the scalar path.
+/// Stage 1 keeps the comma, quote and newline bitmasks of a 4 KiB segment.
+/// Stage 2 handles one line at a time from a 128-bit window of those masks
+/// taken at the line start: the newline bit gives the length, the comma count
+/// the field count, and one expression decides whether every quote wraps a
+/// whole field. Lines of 128 bytes or more take the scalar `split`.
 #[inline(always)]
 pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = end - start;
@@ -489,168 +480,109 @@ pub fn scan_lines<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, 
         return;
     }
     let base = unsafe { data.as_ptr().add(start) };
+    let avail = data.len() - start; // readable bytes from `base`
     let nblocks = len.div_ceil(64);
     let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut pos: Vec<u32> = vec![0; SEG * 64 + 256];
-    let mut nl = [(0u32, 0u32); SEG * 64 + 2];
-    let mut qr = [0u64; QR];
+    let mut cm = [0u64; SEGW + 3];
+    let mut qm = [0u64; SEGW + 3];
+    let mut nm = [0u64; SEGW + 3];
     let mut tail = [0u8; 64];
-    let mut k = 0usize; // entries in pos
+    let mut seg0 = usize::MAX; // block held in word 0 of the masks
     let mut ls = 0usize; // current line start
-    let mut ls_rank = 0usize; // index in pos of the current line's first separator
-    let qbit = |qr: &[u64; QR], p: usize| -> u64 { (qr[(p >> 6) % QR] >> (p & 63)) & 1 };
-    let flat = flat16();
-    let mut seg = 0usize;
-    while seg < nblocks {
-        let seg_end = (seg + SEG).min(nblocks);
-        if pos.len() < k + (seg_end - seg) * 64 + 64 {
-            pos.resize(k + (seg_end - seg) * 64 + 256, 0);
+    while ls < len {
+        let blk = ls >> 6;
+        if seg0 == usize::MAX || blk - seg0 >= SEGW {
+            seg0 = blk;
+            for i in 0..SEGW + 3 {
+                let b = seg0 + i;
+                let (mut c, mut q, mut n) = (0u64, 0u64, 0u64);
+                if b < nblocks {
+                    let off = b * 64;
+                    (c, q, n) = if off + 64 <= avail {
+                        unsafe { masks64(base.add(off)) }
+                    } else {
+                        let rem = avail - off;
+                        unsafe { std::ptr::copy_nonoverlapping(base.add(off), tail.as_mut_ptr(), rem) };
+                        for x in tail[rem..].iter_mut() {
+                            *x = 0;
+                        }
+                        unsafe { masks64(tail.as_ptr()) }
+                    };
+                    if off + 64 > len {
+                        // bytes at and after `end` belong to someone else
+                        let keep = (1u64 << (len - off)) - 1;
+                        c &= keep;
+                        q &= keep;
+                        n &= keep;
+                    }
+                }
+                if b == len >> 6 {
+                    n |= 1u64 << (len & 63); // the end terminates an unfinished last line
+                }
+                cm[i] = c;
+                qm[i] = q;
+                nm[i] = n;
+            }
         }
-        let pp = pos.as_mut_ptr();
-        let mut nn = 0usize;
-        for b in seg..seg_end {
-            let off = b * 64;
-            let (c, q, n) = if off + 64 <= len {
-                unsafe { masks64(base.add(off)) }
-            } else {
-                let rem = len - off;
-                unsafe { std::ptr::copy_nonoverlapping(base.add(off), tail.as_mut_ptr(), rem) };
-                for x in tail[rem..].iter_mut() {
-                    *x = 0;
-                }
-                unsafe { masks64(tail.as_ptr()) }
-            };
-            qr[b % QR] = q;
-            let sm = c | n;
-            let cnt = sm.count_ones() as usize;
-            let o = off as u32;
-            let mut x = sm;
-            let mut i = 0usize;
-            if flat {
-                // two rounds unconditionally (pos has slack): no exit mispredict
-                unsafe {
-                    let d = pp.add(k);
-                    let mut j = 0;
-                    while j < 16 {
-                        *d.add(j) = o + x.trailing_zeros();
-                        x &= x.wrapping_sub(1);
-                        j += 1;
-                    }
-                }
-                i = 16;
-            }
-            while i < cnt {
-                unsafe {
-                    let d = pp.add(k + i);
-                    *d = o + x.trailing_zeros();
-                    x &= x.wrapping_sub(1);
-                    *d.add(1) = o + x.trailing_zeros();
-                    x &= x.wrapping_sub(1);
-                    *d.add(2) = o + x.trailing_zeros();
-                    x &= x.wrapping_sub(1);
-                    *d.add(3) = o + x.trailing_zeros();
-                    x &= x.wrapping_sub(1);
-                    *d.add(4) = o + x.trailing_zeros();
-                    x &= x.wrapping_sub(1);
-                    *d.add(5) = o + x.trailing_zeros();
-                    x &= x.wrapping_sub(1);
-                    *d.add(6) = o + x.trailing_zeros();
-                    x &= x.wrapping_sub(1);
-                    *d.add(7) = o + x.trailing_zeros();
-                    x &= x.wrapping_sub(1);
-                }
-                i += 8;
-            }
-            // the first two newlines branch-free (nl has slack), the rest in a loop
-            let nc = n.count_ones() as usize;
-            let mut y = n;
-            let b0 = y.trailing_zeros();
-            y &= y.wrapping_sub(1);
-            let b1 = y.trailing_zeros();
-            y &= y.wrapping_sub(1);
-            unsafe {
-                *nl.get_unchecked_mut(nn) = (o + b0, (k + (sm & !(!0u64).wrapping_shl(b0)).count_ones() as usize) as u32);
-                *nl.get_unchecked_mut(nn + 1) = (o + b1, (k + (sm & !(!0u64).wrapping_shl(b1)).count_ones() as usize) as u32);
-            }
-            nn += nc.min(2);
-            while y != 0 {
-                let bit = y.trailing_zeros();
-                let below = sm & ((1u64 << bit) - 1);
-                nl[nn] = (o + bit, (k + below.count_ones() as usize) as u32);
-                nn += 1;
-                y &= y - 1;
-            }
-            k += cnt;
+        let w = blk - seg0;
+        let sh = (ls & 63) as u32;
+        // 128 mask bits starting at the line start
+        macro_rules! win {
+            ($m:ident) => {{
+                let (a, b, c) = unsafe { (*$m.get_unchecked(w), *$m.get_unchecked(w + 1), *$m.get_unchecked(w + 2)) };
+                let lo = (a >> sh) | ((b << 1) << (63 - sh));
+                let hi = (b >> sh) | ((c << 1) << (63 - sh));
+                (lo as u128) | ((hi as u128) << 64)
+            }};
         }
-        for &(p, r) in &nl[..nn] {
-            let p = p as usize;
-            let r = r as usize;
-            let nsep = r + 1 - ls_rank;
-            let line_start = ls;
-            let first = ls_rank;
-            ls = p + 1;
-            ls_rank = r + 1;
-            if nsep != N {
-                continue; // wrong field count, or an empty line
-            }
-            if p - line_start > (QR - 2) * 64 {
-                let line = unsafe { std::slice::from_raw_parts(base.add(line_start), p - line_start) };
-                if split(line, &mut fields) {
-                    f(&fields);
-                }
-                continue;
-            }
-            // quotes in [line_start, p)
-            let mut qcount = 0u32;
-            {
-                let w0 = line_start >> 6;
-                let w1 = (p - 1) >> 6;
-                let mut w = w0;
-                while w <= w1 {
-                    let mut m = qr[w % QR];
-                    if w == w0 {
-                        m &= !0u64 << (line_start & 63);
-                    }
-                    if w == w1 {
-                        let e = ((p - 1) & 63) as u32;
-                        m &= if e == 63 { !0 } else { (1u64 << (e + 1)) - 1 };
-                    }
-                    qcount += m.count_ones();
-                    w += 1;
-                }
-            }
-            let mut fs = line_start;
-            let mut bad = 0u64;
-            let mut seen = 0u32;
-            for i in 0..N {
-                let fe = unsafe { *pp.add(first + i) } as usize;
-                let flen = fe - fs;
-                let nz = (flen != 0) as u64;
-                let qa = qbit(&qr, fs) & nz;
-                let qz = qbit(&qr, fe.wrapping_sub(1).max(fs)) & nz;
-                bad |= (qa ^ qz) | (qa & (flen < 2) as u64);
-                seen += 2 * qa as u32;
-                let qa = qa as usize;
-                fields[i] = unsafe { std::slice::from_raw_parts(base.add(fs + qa), flen - 2 * qa.min(flen / 2)) };
-                fs = fe + 1;
-            }
-            if bad == 0 && seen == qcount {
+        let nw = win!(nm);
+        if nw == 0 {
+            // a line of 128 bytes or more
+            let rest = unsafe { std::slice::from_raw_parts(base.add(ls), len - ls) };
+            let l = memchr::memchr(b'\n', rest).unwrap_or(rest.len());
+            if split(&rest[..l], &mut fields) {
                 f(&fields);
             }
+            ls += l + 1;
+            continue;
         }
-        // carry the current line's separators to the front
-        if ls_rank > 0 {
-            pos.copy_within(ls_rank..k, 0);
-            k -= ls_rank;
-            ls_rank = 0;
+        let ll = nw.trailing_zeros(); // line length, 0..=127
+        let below = (1u128 << ll) - 1;
+        let c = win!(cm) & below;
+        let q = win!(qm) & below;
+        let lp = unsafe { base.add(ls) };
+        ls += ll as usize + 1;
+        // Quotes: with `d` = delimiters (commas and the line end), a field
+        // starts after each delimiter and ends before one. Every quote must
+        // be the first or last byte of a field (1), a one-byte field cannot
+        // be a quote (2), and a field opens with a quote iff it closes with
+        // one: subtracting the opening bits from the closing bits (moved onto
+        // the delimiter that follows) leaves a delimiter bit set exactly when
+        // some field has one without the other (3).
+        let d = c | (1u128 << ll);
+        let st = (d << 1) | 1;
+        let en = d >> 1;
+        let x = q & st;
+        let y = (q << 1) & d;
+        let bad = (q & !(st | en)) | (x & en) | (y.wrapping_sub(x) & d);
+        if c.count_ones() as usize != N - 1 || bad != 0 {
+            continue; // wrong field count (or an empty line), or a misplaced quote
         }
-        seg = seg_end;
-    }
-    if ls < len {
-        let line = unsafe { std::slice::from_raw_parts(base.add(ls), len - ls) };
-        if split(line, &mut fields) {
-            f(&fields);
+        let mut m = c;
+        let mut fs = 0u32;
+        for i in 0..N {
+            let fe = if i == N - 1 {
+                ll
+            } else {
+                let p = m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+                p
+            };
+            let qa = ((q >> fs) as u32) & 1; // quoted: drop the first and last byte
+            fields[i] = unsafe { std::slice::from_raw_parts(lp.add((fs + qa) as usize), (fe - fs - 2 * qa) as usize) };
+            fs = fe + 1;
         }
+        f(&fields);
     }
 }
 
@@ -672,15 +604,21 @@ mod tests {
         scan_lines::<N>(d, 0, d.len(), |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
         v
     }
-    #[test]
-    fn fuzz_scan() {
-        let mut x: u64 = 0x1234567;
-        let mut rnd = |n: u64| {
+    fn check<const N: usize>(d: &[u8]) {
+        assert_eq!(scalar::<N>(d), simd::<N>(d), "{:?}", String::from_utf8_lossy(d));
+    }
+    fn xs(seed: u64) -> impl FnMut(u64) -> u64 {
+        let mut x = seed;
+        move |n: u64| {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
             x % n
-        };
+        }
+    }
+    #[test]
+    fn fuzz_scan() {
+        let mut rnd = xs(0x1234567);
         let alphabet = b"ab,\"\n\r 1";
         for _round in 0..3000 {
             let mut d = Vec::new();
@@ -719,8 +657,129 @@ mod tests {
             if rnd(2) == 0 {
                 d.pop();
             }
-            assert_eq!(scalar::<4>(&d), simd::<4>(&d));
-            assert_eq!(scalar::<2>(&d), simd::<2>(&d));
+            check::<4>(&d);
+            check::<2>(&d);
+            check::<7>(&d);
+        }
+    }
+    /// Event-shaped lines: 7 fields, 20% quoted, lengths that put the line
+    /// end on every side of the 64- and 128-byte marks, plus damaged lines.
+    #[test]
+    fn fuzz_scan_events() {
+        let mut rnd = xs(0xC0FFEE);
+        for round in 0..4000 {
+            let mut d = Vec::new();
+            for _ in 0..(1 + rnd(120)) {
+                let nf = if rnd(25) == 0 { 5 + rnd(5) } else { 7 };
+                let stretch = match rnd(6) {
+                    0 => rnd(70),
+                    1 => 40 + rnd(60),
+                    _ => 0,
+                };
+                let mut line = Vec::new();
+                for i in 0..nf {
+                    if i > 0 {
+                        line.push(b',');
+                    }
+                    let q = rnd(5) == 0;
+                    if q {
+                        line.push(b'"');
+                    }
+                    let n = match i {
+                        0 | 1 => rnd(11),
+                        2 | 3 => [0, 13, 20, 25][rnd(4) as usize],
+                        4 => [4, 8, 0][rnd(3) as usize],
+                        5 => rnd(7) + if i == 5 { stretch } else { 0 },
+                        _ => rnd(6),
+                    };
+                    for _ in 0..n {
+                        line.push(b"e1u9-:TZ+ax0\r _"[rnd(15) as usize]);
+                    }
+                    if q {
+                        line.push(b'"');
+                    }
+                }
+                match rnd(40) {
+                    0 => {
+                        let i = rnd(line.len() as u64 + 1) as usize;
+                        line.insert(i, b'"');
+                    }
+                    1 => {
+                        let i = rnd(line.len() as u64 + 1) as usize;
+                        line.insert(i, b',');
+                    }
+                    2 if !line.is_empty() => {
+                        let i = rnd(line.len() as u64) as usize;
+                        line.remove(i);
+                    }
+                    3 => line.clear(),
+                    4 => line = b"\"".to_vec(),
+                    5 => line = b"\"\",\"\",\"\",\"\",\"\",\"\",\"\"".to_vec(),
+                    6 => line = b",,,,,,".to_vec(),
+                    _ => {}
+                }
+                d.extend_from_slice(&line);
+                d.push(b'\n');
+            }
+            if round % 3 == 0 {
+                d.pop();
+            }
+            check::<7>(&d);
+            check::<4>(&d);
+        }
+    }
+    /// Every string over a small alphabet up to 9 bytes, as a 2- and 3-field line set.
+    #[test]
+    fn exhaustive_small() {
+        let al = b"a,\"\n";
+        for n in 0..=9u32 {
+            for code in 0..4u32.pow(n) {
+                let mut d = Vec::with_capacity(n as usize);
+                let mut c = code;
+                for _ in 0..n {
+                    d.push(al[(c & 3) as usize]);
+                    c >>= 2;
+                }
+                check::<2>(&d);
+                check::<3>(&d);
+            }
+        }
+    }
+    /// A scan of a sub-range must not look at bytes outside it, wherever the
+    /// range starts and ends relative to the 64-byte blocks and the buffer end.
+    #[test]
+    fn scan_subrange() {
+        let mut rnd = xs(0xBEEF);
+        for _ in 0..3000 {
+            let mut d = Vec::new();
+            let mut starts = vec![0usize];
+            for _ in 0..(2 + rnd(60)) {
+                for i in 0..4 {
+                    if i > 0 {
+                        d.push(b',');
+                    }
+                    let q = rnd(4) == 0;
+                    if q {
+                        d.push(b'"');
+                    }
+                    let lim = if rnd(9) == 0 { 60 } else { 14 };
+                    for _ in 0..rnd(lim) {
+                        let al = if rnd(30) == 0 { 8 } else { 6 };
+                        d.push(b"abc019\" "[rnd(al) as usize]);
+                    }
+                    if q {
+                        d.push(b'"');
+                    }
+                }
+                d.push(b'\n');
+                starts.push(d.len());
+            }
+            let a = starts[rnd(starts.len() as u64) as usize];
+            let b = starts[rnd(starts.len() as u64) as usize];
+            let (a, b) = (a.min(b), a.max(b));
+            let mut got = Vec::new();
+            scan_lines::<4>(&d, a, b, |f| got.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>()));
+            assert_eq!(got, scalar::<4>(&d[a..b]));
         }
     }
 }
