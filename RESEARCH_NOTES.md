@@ -16,7 +16,9 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 | 4 | Dominant-shape fast path in the event scanner, **only if** the histogram of row 1 shows one or two shapes covering most lines | `k_free.rs` `ev_loop` | Unknown until the histogram exists; published gains for this trick are 15 to 25% of scan time in other parsers (quoted, different programs) | 1BRC write-ups (21.2) | Low if the fast path falls back to the existing code on any mismatch; it is new scanner code, so full gate | 21.2 |
 | 5 | Stage 3 dedup table with 12-byte slots (the arena record copied as is, widened in the compaction) | `events.rs:262` (`scatter_chunk12`) and the compaction after it | **My estimate** 1 to 2 ms, by proportion from the 3.5 ms measured for halving the table | Experiments 9 and 15; literature agrees the stage is L2-capacity-bound (21.5) | Row-sensitive: this code decides which duplicate survives. Ranked last for that reason | 20, 21.5 |
 
-Staging prefetch (19, change A) is demoted: the partitioning literature measures prefetch as neutral to negative below about 1,024 partitions (21.5). The 10M parse lap is still worth having.
+**Staging lead (19) closed by measurement:** the fresh 10M run gives the same parse time per event as 20M (7.0 against 7.2), so staging costs nothing at 20M; my extrapolation to zero buckets was wrong. Fresh profile of the shipped build (log): `ev_loop` 29.8%, `ev_batch` 12.2%, stage 3 closure 8.9%, page zeroing 7.8%, `links::bucket` 5.0%, `cl_loop` 4.4%; kernel 16.5% of samples in all; 29,462 faults. Still wanted from row 1: the shape histogram, the TLB interrupt count, and the `ev_loop` annotate.
+
+Staging prefetch (19, change A) was already demoted on the literature: the partitioning literature measures prefetch as neutral to negative below about 1,024 partitions (21.5). The 10M parse lap is still worth having.
 
 **All file and line references below iteration 18 are to the old source and are stale.**
 
