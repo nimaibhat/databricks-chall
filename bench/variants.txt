@@ -1,8 +1,7 @@
 # label|ref|build-args|env
-s7|origin/gate-s7-91d75a0||
-s8|origin/gate-s8-9df4591||
 s9|origin/gate-s9-61cb613||
-s9nora|origin/gate-s9nora-61cb613||RA=0
-s9p1_10|origin/gate-s9p1_10-61cb613||P1BITS=10
-s9p11|origin/gate-s9p11-61cb613||P1BITS=11 P2BITS=10
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
+s10|origin/gate-s10-8db173d||
+s10io4|origin/gate-s10io4-8db173d||IOMODE=4 CHUNKKB=1024
+s10arel|origin/gate-s10arel-8db173d||AREL=1
+s10both|origin/gate-s10both-8db173d||IOMODE=4 CHUNKKB=1024 AREL=1
+vibhor|ext:Vibhor7-7/shopping-sessions||
