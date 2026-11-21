@@ -20,6 +20,8 @@ Runners-up, in order: write-combining for event records ([1.2](#12-write-combini
 
 Closed: everything for a cold page cache (1.9, 3.1), because `/data` on the scorer is reported to be tmpfs.
 
+**Measure before ranking:** whether output size costs time after the process exits ([20.1](#201-output-bytes-may-be-paid-for-after-the-process-exits)). One team measured +0.15 s for 14 MB more output on a bind mount; this build writes about 96 MB at 20M. If that holds on the x86 runner, shrinking the output outranks everything except item 1.
+
 ## A finding to act on before trusting the TSBL toggle
 
 `parse_ts_bl` (`parse.rs:819`) still has the pre-fix mask: `SC = 0x0000_00FF_0000_0000` and fill `0x3000_0030_0000_0000` at lines 829, 834 and 837. That is the same bug `5b17560` fixed in `civil_swar`: the colon at byte 13 is not neutralized, so `digits8(c2)` is false, `civ_ok` is false, and every F1 and F2 input falls through to the scalar `parse_ts`. Tests pass because the fallback is exact. Any timing of `TSBL=1` so far measured the scalar parser plus wasted SWAR work, so a "TSBL is slower" verdict is not evidence about the branch-free design. The fix is the same three constants (`SC = 0x0000_00FF_0000_FF00`, separator `0x0000_003A_0000_3A00`, fill `0x3000_0030_0000_3000`) plus a test that asserts the non-fallback branch is taken.
@@ -674,7 +676,7 @@ Source: [cherylaurelia `src/main.rs`](https://github.com/cherylaurelia/builders-
 
 ---
 
-## Iteration 16 (2026-11-21, about 00:55): new competitor measurements since the first pass
+## Iteration 16 (2026-11-21): new competitor measurements since the first pass
 
 Sources: commits pushed after iteration 2 to joch44 (`e71539c`), Vibhor7-7 (`7a5ddaf`), Th3r0n (`6034d47`) and TejasviniChawla (`6925b5e`), pulled into the scratch clones. joch44's numbers are medians on an Ice Lake 8370C VM with 4 cores and 8 hyperthreads, interleaved, which is the closest public stand-in for the scorer; its v20 scored 1.60 s on the board against 1.73 s there.
 
@@ -718,7 +720,7 @@ Sources: commits pushed after iteration 2 to joch44 (`e71539c`), Vibhor7-7 (`7a5
 
 ---
 
-## Iteration 17 (2026-11-21, about 01:05): the sessions phase (16% of in-process time) and what the profile closes
+## Iteration 17 (2026-11-21): the sessions phase (16% of in-process time) and what the profile closes
 
 ### 17.1 Assist increments: 36.9 million scattered adds at 20M
 
@@ -737,12 +739,14 @@ Sources: commits pushed after iteration 2 to joch44 (`e71539c`), Vibhor7-7 (`7a5
 
 ### 17.3 Closed by the profile
 
-- **Output is 0.048 s of about 2.1 s in-process at 20M** (`OVERNIGHT_LOG.md`). Every Parquet idea (entries 1.8, 5.2, the queued INT32 and buffer reservation) is worth at most 1 to 2% in total and carries reader risk. Do not spend a submission on them. The one output item still worth doing is the zero-row `part-0` hazard in entry 5.4, which is about correctness on tiny inputs, not speed.
+*Partly retracted by [20.1](#201-output-bytes-may-be-paid-for-after-the-process-exits): the in-process output time is small, but another team measured a cost after exit that grows with output bytes.*
+
+- **Output is 0.048 s of about 2.1 s in-process at 20M** (`OVERNIGHT_LOG.md`), so the CPU cost of encoding is not worth attacking.
 - **Thread count, partition counts, chunk size**: three teams swept them and found nothing (entries 1.10, 11.3, 16.2).
 
 ---
 
-## Iteration 18 (2026-11-21, about 01:15): the link table that makes a parse-time lookup cheap
+## Iteration 18 (2026-11-21): the link table that makes a parse-time lookup cheap
 
 The log's first queued change resolves the person in the parse loop. Entry 14.2 lists who measured that as a win and who as a loss; this entry records how the version that works is built, from [Vibhor7-7 `src/links.rs`](https://github.com/Vibhor7-7/shopping-sessions/blob/7a5ddaf/src/links.rs) (1.59 s on the log's runner, board 0.82 s).
 
@@ -760,7 +764,7 @@ The log's first queued change resolves the person in the parse loop. Entry 14.2 
 
 ---
 
-## Iteration 19 (2026-11-21, about 01:30): a lower-risk scanner step, and small-group sorting
+## Iteration 19 (2026-11-21): a lower-risk scanner step, and small-group sorting
 
 ### 19.1 Keep the separator index; split all fields of a line at once around its delimiters
 
@@ -779,6 +783,32 @@ The log's first queued change resolves the person in the parse loop. Entry 14.2 
 - **Here.** After entry 7.1 the per-person sort at `main.rs:895` is over `u64` words whose top 32 bits are `ts`; a rank sort on the 32-bit `ts` followed by a permuting copy does the same job. The median person has 12 events and 3 sessions ([joch44 `DATA_PROFILE.md`](https://github.com/joch44/shopping-sessions/blob/e71539c/DATA_PROFILE.md)), so most groups fall in the 9-to-64 path, where the cost is quadratic: 12 keys need 24 vector compares.
 - **Expected gain.** 3 to 10% of the sessions phase, so at most 1.5% of wall. Do it after 7.1, which is larger and free.
 - **Risk.** None to exactness: any order of equal `ts` gives the same output (entry 7.1).
+
+---
+
+## Iteration 20 (2026-11-21, 00:35): output bytes, measured after exit
+
+### 20.1 Output bytes may be paid for after the process exits
+
+- **Source.** [TejasviniChawla `docs/NOTES.md`](https://github.com/TejasviniChawla/shopping-sessions/blob/9338c54/docs/NOTES.md), two entries pushed tonight: "FOUND: wall minus in-container gap depends on OUTPUT BYTES on the bind mount (docker flushes dirty pages at exit): uncompressed parquet (23 MB) costs +0.15 s vs Snappy (9 MB). tmpfs output: no gap." Then: Snappy writer "-5% in-container, -3% wall, exit gap gone"; dictionary `user_id` plus INT32 counts neutral on top of Snappy; and "CI gains translate to the scorer at about 40%: large fixed cost (container start + output flush) on the scorer."
+- **Counter-evidence.** Vibhor7-7 experiment 17: writing 222 MB to disk added about 35 ms after the process under GitHub's Docker (entry 1.8). The two measurements differ by more than an order of magnitude per MB, so this depends on the host's filesystem and writeback settings. The scorer's `/output` is reported as ext4 (entry 11.1); nobody has published the gap there.
+- **Why it matters here.** This build writes about 96 MB of `user_daily` at 20M (42.9 bytes per row, audit §3) and about 280 MB at 60M. cherylaurelia, the fastest build on the log's runner, writes 24.7 MB at 20M after `DELTA_BINARY_PACKED` and then shrinks `user_id` further with a run dictionary (`88ed99d`, `3458d27`). The log's own numbers leave room for this: 2.32 s for `docker run` against about 2.1 s in-process, with the difference attributed to "container start/exit".
+- **How to find out in one runner job.** Record three times per run: process start to the "done" line, "done" to process exit, and process exit to `docker run` returning. Then A/B (a) `/output` on the bind mount against a tmpfs mount, and (b) the normal output against the same binary with the `user_daily` write cut to a tenth of the rows (output is then wrong, so timing only). If the last interval moves with bytes, output size is a first-class cost; if not, entry 17.3 stands.
+- **If it does move, the order of work in `out.rs` and `pq.rs`** (bytes per row from entry 5.2; reader support from 5.1, all readable by the polars checker in `scripts/run_fixtures.py`):
+  1. INT32 PLAIN for `sessions` and `events`: 42.9 to about 35 B/row. No reader risk.
+  2. `DELTA_BINARY_PACKED` for `day`, `sessions`, `events`, `revenue_cents`: about 20 B/row down to about 3 to 4, since rows of one person are adjacent, `day` rises slowly and 82% of rows have zero revenue. Layout rules in entry 5.3.
+  3. `user_id`: 4-byte length prefix plus about 9 bytes per row today. `DELTA_LENGTH_BYTE_ARRAY` removes the prefixes (about 13 to about 9.2 B/row); a dictionary over runs of equal IDs removes the repeats (2,242,393 rows for about 667,000 people at 20M, so about 3.4 rows per person: roughly 13 to about 5 B/row).
+  4. `top_category` as a dictionary: about 2 B/row to about 0.1.
+  Steps 1 to 4 together are roughly 43 to about 10 B/row, in line with cherylaurelia's 24.7 MB.
+  A general compressor (Snappy) gets a similar size with one code path, but it needs either a crate or a hand-written encoder and a `codec` change in every column chunk.
+- **Expected gain.** Unknown until measured: between nothing (Vibhor7-7's Docker) and several tenths of a second (TejasviniChawla's bind mount, scaled to 96 MB).
+- **Risk.** Step 1 none. Steps 2 to 4 are the reader risk discussed in 5.1 to 5.3: read every output back with polars 2.1.0, pyarrow and duckdb, and keep the dev-answer comparison in the gate, since `compare.py` reads through polars.
+
+### 20.2 Other new commits
+
+- [Vibhor7-7 `80df6c5`](https://github.com/Vibhor7-7/shopping-sessions/commit/80df6c5) (experiment 23, no number yet): `ingest_ts` validity checked with ordinary compare-and-branch instead of a folded flag, because unlike `ts` its form is always F1 and the branches predict; its whole seconds come straight from the parse "instead of from multiplying by 1000 and dividing again". This repo already keeps ingest in seconds (`parse_ingest_s`).
+- TejasviniChawla `99963ee`: a benchmark of parse stages isolated with `black_box`; `9338c54`: an `EXIT_NOW` switch and a CI job that measures container overhead. No results recorded yet.
+- No new commits to `src/` or `OVERNIGHT_LOG.md` in this repo since 00:19.
 
 ## Next iteration
 
