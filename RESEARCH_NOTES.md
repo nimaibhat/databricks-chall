@@ -1334,6 +1334,22 @@ From this source, nothing structural: the design does more work per event than o
 
 Top five: unchanged; PGO stays first, and the huge-page allocator joins the optimizer's queued Vibhor7-7 item with this file as the reference.
 
+## Iteration 33 (2026-11-21, 02:45): hansliu-dev/676767 measured on x86; where our new pick stands
+
+Run [44879687999](https://github.com/nimaibhat/databricks-chall/actions/runs/44879687999) on `bench-ext`, EPYC 9V45, 4 vCPU, full `docker run` wall, interleaved, median of 7; empty container 0.15 s; all outputs equal.
+
+| Build | 20M | 60M |
+|---|---|---|
+| cherylaurelia `2e4261f` | 0.932 | 2.652 |
+| Vibhor7-7 `bee0cbf` (board 0.78 s for `fac219f`) | 1.161 | 3.294 |
+| ours `79cb1f5` | 1.247 | 3.560 |
+| hansliu-dev/676767 `68ea737` | 1.569 | 4.779 |
+
+- **The public `hansliu-dev/676767` is 26% slower than our pick**, as iteration 32 predicted from its code. It cannot be what scored 0.59 s; either that code is unpublished or the attribution to team 67 is wrong. Nothing more to take from it than PGO and the allocator (32).
+- **Our pick is now 7% behind Vibhor7-7** (it was 20% behind in iteration 27 with `0a06317`; different runner, so compare ratios only) and 34% behind cherylaurelia. Scaled from Vibhor7-7's 0.78 s, our pick would score about 0.84 s; one board score is good to about 20% (31).
+- **Post-exit time is still 0.185 s at 20M and 0.463 s at 60M on this runner** (pre 0.09), against about 0.06 s for an empty container's share: 35 MB of output still costs about 0.1 s at 20M and 0.4 s at 60M here. The remaining output shrink (delta encoding for `revenue_cents`, 30) is worth up to that.
+- Our phases here (20M): links 0.078, parse 0.639, dedup 0.057, sessions 0.173, output 0.024.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
