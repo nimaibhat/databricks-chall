@@ -226,10 +226,10 @@ pub struct Mapped {
 
 /// I/O strategy, from env IOMODE: 0 none, 1 whole-file WILLNEED at open,
 /// 2 per-chunk WILLNEED, 3 per-chunk MADV_POPULATE_READ, 4 per-chunk pread
-/// of a mapped file, 5 pread only (events and clicks are never mapped).
+/// of a mapped file, 5 (default) pread only: events and clicks are never mapped.
 pub fn io_mode() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
+    *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
 }
 
 /// Makes chunk bytes available. Returns (data, start, end) to scan.

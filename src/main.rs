@@ -442,7 +442,7 @@ fn main() {
     // chunk size: 4 MiB for mapped input; a pread buffer should stay in L2
     let chunk_kb: usize = env("CHUNKKB", match io_mode() {
         4 => "256",
-        5 => "512",
+        5 => "256",
         _ => "4096",
     })
     .parse()
