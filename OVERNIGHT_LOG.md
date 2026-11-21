@@ -61,6 +61,10 @@ From experiment 27 on, the bench drops the page cache before each dataset: with 
 | 28 | `75d054d` | Links: lookahead prefetch in pair translation and union-find | 1.520 / 1.519 (7763); 1.302 / 1.296 (6975P) | 4.220 / 4.179 ; 3.588 / 3.565 | links 0.041 / 0.039 | kept on the phase time (links -10% at 20M, -12% at 60M); wall -0.5% to -1.0% |
 | 29 | same image | Fewer partitions: `P1BITS/P2BITS` 8/8, 8/9, 9/8 against 9/9 | 1.519 / 1.538 / 1.531 / 1.516 | 4.179 / 4.256 / 4.213 / 4.274 | | rejected: parse unchanged, dedup and sessions slower |
 | 30 | `b2fa94d` | One-multiply hash; pext for the 6-bit squeeze in ID packing | 1.296 / 1.244 (6975P, n=9; ranges 1.290-1.316 / 1.218-1.260) | 3.565 / 3.456 (n=7; 3.537-3.587 / 3.375-3.475) | 0.460 / 0.456 | kept (-4.0%, -3.1%) |
+| 31 | not merged | Per-partition person table and dedup table started small (grow on demand) instead of a quarter / an eighth of the record count | 1.483 / 1.494 (7763, n=9) | 4.049 / 4.081 (dedup 0.240 -> 0.262) | sess 0.081 / 0.078 | rejected: no gain, dedup slower at 60M |
+| 32 | not merged | Scanner slow path fills a separate array so the fields array never escapes | 1.494 / 1.485 | 4.081 / 4.107 | parse 1.230 / 1.225 at one thread | rejected: no difference |
+| 33 | not merged yet | Profile-guided optimisation: profile from the 1M and 20M sets, generated in `rust:1.91-bookworm` on the runner, used through an optional `pgo.profdata` in the Dockerfile | 1.249 / 1.225 (9V74, n=9; ranges 1.244-1.315 / 1.215-1.240) | 3.445 / 3.392 (n=7; 3.437-3.528 / 3.370-3.397) | n/a | works (-1.9%, -1.5%); to be applied last, with a profile regenerated from the final source |
+| 34 | analysis | Sessions phase by step, Mac, one thread, 20M (thread-seconds): group 0.060, scatter 0.040, clicks 0.023, sort 0.155, sweep 0.136. Sort time by group size: under 8 events 1 ms, 8 to 31 41 ms, 32 to 127 19 ms, 128 to 2047 24 ms, 2048 and more 11 ms | | | | a coarse presort would cost about what the small sorts cost, so not built; radix for large groups built (next row) |
 
 ## Current phase profile (`a88caa3`)
 
@@ -93,9 +97,9 @@ The parallel research session keeps `RESEARCH_NOTES.md` (competitor techniques, 
 
 ## Next three ideas queued
 
-1. Smaller per-partition tables (the person table was sized for a quarter of the events, 512 KB, for about 2,000 people) and a fields array that never escapes (so it can stay in registers): both built and gated, x86 A/B next.
-2. Profile-guided optimisation as the last step, once the source settles (a competitor measured -2.7% / -4.1%): generate the profile in the Dockerfile's own toolchain image on the x86 runner, commit the merged profile, use it only if the file is present.
-3. Sessions phase without the per-person sort (half-hour bins), and a second look at the scatter pushes (about 9 and 6 ns per event on Zen 4 regardless of the partition count).
+1. Radix sort by timestamp for groups of 2048 events and more (whales, shared devices): built with a unit test, gated on both builds; x86 A/B running together with an output-on-tmpfs control for the time after exit.
+2. Profile-guided optimisation as the final step (measured -1.9% / -1.5%, experiment 33): regenerate the profile from the final source, rebuild, re-run the whole gate against the image's binary.
+3. Dedup key stream of 8 bytes (hash and index) with the full keys in a sequential per-thread log read only for suspected repeats; scanner stage C (packed offsets instead of a slice array).
 
 ## Setup notes
 
