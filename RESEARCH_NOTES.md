@@ -12,9 +12,11 @@ Re-ranked in iteration 31 against `OVERNIGHT_LOG.md` at 02:12. The pick is `79cb
 |---|---|---|---|---|---|
 | 1 | Profile-guided optimisation generated inside the Docker build, with a fallback to the plain build | `Dockerfile`, a new build script | Now measured by two teams: -5% (0.806 to 0.813 s against 0.839 to 0.861 s, same runner) and -2.7% / -4.1% (20M / 60M). Training on 1M or 3M events made no difference; about 23 s more build time | None to exactness. With the fallback and a non-empty-profile check, no build risk | [24.6](#246-a-pgo-recipe-that-cannot-break-the-build), [25.1](#251-pgo-a-second-measurement--5), [16.4](#164-profile-guided-optimisation-a-measured-3-to-4-reopening-a-rejected-item) |
 | 2 | Scanner diet in three stages on x86 only: branch-free field offsets with `pext`/`pdep` (A), masks at the line start (B), byte-packed fields to the row body (C) | `scan_lines` in `parse.rs` | About 85 instructions per line for stage A and 155 for all three, of about 315 in the scanner and 1,575 per line; expect -2% and -3 to -4% of wall on the runner. Experiment 22 (an array version, Mac only, one thread) does not test this | Low for A, medium for B and C; model-checked with 0 mismatches | [34](#iteration-34-2026-11-21-0300-a-staged-scanner-diet-for-x86-checked-against-split-why-experiment-22-says-little-about-x86), [24.2](#242-the-scanners-field-loop-is-most-of-its-cost) |
-| 3 | Sessions by half-hour bins and counting passes over a narrow `(group, ts offset)` list, instead of the per-person sort | `process_partition` in `main.rs` | Vibhor7-7 -2.7% for the bins; joch44 a further -4.5% of the phase from one read per survivor and -8% at 60M from u32 offsets. Sessions is 16% of in-process time here. Queued by the optimizer | Medium: u32 offsets need a fallback for windows over 49.7 days | [1.6](#16-sessions-from-30-minute-bins), [31.3](#313-sessions-phase-what-others-measured-since-iteration-17) |
-| 4 | Tune the scatter on Intel: 256-bit streaming stores, stage size sweep, plain stores for clicks | `Scatter::push` in `mem.rs` | The write-combining series gained far more on Intel than on Zen; a competitor gained -0.9% from stage size alone and found streaming clicks a loss | None | [23.2](#232-what-is-still-slow-on-that-branch) |
-| 5 | Finish the output shrink: `DELTA_BINARY_PACKED` for `revenue_cents`, `day` and the counts (35 MB to roughly 20 MB at 20M) | `pq.rs` `write`, `out.rs` | Post-exit time is 1 to 3 ms per MB on the runners (29.4); 0 to 0.05 s at 20M, more at 60M. Layout and golden vectors are in iteration 30; cherylaurelia's accepted writer uses it | None to values; a second encoding for the scorer's reader to accept | [30](#iteration-30-2026-11-21-0220-an-implementation-ready-spec-for-smaller-parquet-output-with-test-vectors) |
+| 3 | Links: lock-free union-find on the final table's own slots, on all threads with prefetch; no interning, no translation, no second insert | `build_links` in `main.rs`, `LinkTab` in `keys.rs` | Measured gap on one runner: ours 0.078 s, Vibhor7-7 0.044 s, cherylaurelia 0.033 s at 20M; 0.273 against 0.131 s at 60M. About -3% in-process | Low: same naming rule; interleavings model-checked, 0 mismatches in 6,000 cases | [36](#iteration-36-2026-11-21-0315-links-in-40-ms-instead-of-78-union-find-on-the-final-tables-own-slots) |
+| 4 | Sessions by half-hour bins and counting passes over a narrow `(group, ts offset)` list, instead of the per-person sort | `process_partition` in `main.rs` | Vibhor7-7 -2.7% for the bins; joch44 a further -4.5% of the phase from one read per survivor and -8% at 60M from u32 offsets. Sessions is 16% of in-process time here. Queued by the optimizer | Medium: u32 offsets need a fallback for windows over 49.7 days | [1.6](#16-sessions-from-30-minute-bins), [31.3](#313-sessions-phase-what-others-measured-since-iteration-17) |
+| 5 | Tune the scatter on Intel: 256-bit streaming stores, stage size sweep, plain stores for clicks | `Scatter::push` in `mem.rs` | The write-combining series gained far more on Intel than on Zen; a competitor gained -0.9% from stage size alone and found streaming clicks a loss | None | [23.2](#232-what-is-still-slow-on-that-branch) |
+
+Moved to runner-up in iteration 36 (was rank 5): finishing the output shrink with `DELTA_BINARY_PACKED` (iteration 30; time outside the process is now equal to cherylaurelia's, 35).
 
 Runners-up, in order: one-multiply hash ([1.7](#17-one-multiply-hash)); rank sort for small groups ([19.2](#192-branch-free-rank-sort-for-small-groups)); 30-minute bins ([1.6](#16-sessions-from-30-minute-bins)).
 
@@ -1453,6 +1455,48 @@ Run [44881605462](https://github.com/nimaibhat/databricks-chall/actions/runs/448
 - **Links is the cheapest remaining 4%.** Ours prints `parse 24.5, intern 46.9, xlate 69.7, union 90.3, total 106 ms` on the first run (0.078 median) plus `catalogs 21 ms`; Vibhor7-7 prints `catalog done at 8.4 ms; link parse 8.8, join 16.2, name 16.7 ms` (0.044 s for the phase), cherylaurelia 0.033 s for catalogs and links together. At 60M Vibhor7-7's links are 0.131 s against our 0.273 s. Entry 36 looks at why.
 - **Dedup and sessions are at parity**; half-hour bins (rank 3) can gain at most the 0.035 s difference unless it beats both competitors.
 - At 60M: cherylaurelia in-process 4.151 s on its first run (0.885 s of it before parse, a cold start), Vibhor7-7 3.113 s (links 0.131, parse 2.079, dedup 0.168, people 0.731); ours 4.05 s (0.273, 2.791, 0.202, 0.694 + 0.085).
+
+## Iteration 36 (2026-11-21, 03:15): links in 40 ms instead of 78: union-find on the final table's own slots
+
+Measured in iteration 35 on one runner at 20M: ours 0.078 s (first run 0.106 s, printed as cumulative `parse 24.5, intern 46.9, xlate 69.7, union 90.3, total 106 ms`), Vibhor7-7 0.044 s (`link parse 8.8, join 16.2, name 16.7 ms`), cherylaurelia 0.033 s with the catalogs. At 60M ours 0.273 s, Vibhor7-7 0.131 s. Both of their figures include building the table the parse phase later reads, so the work is the same as ours.
+
+### 36.1 Where our time goes, step by step (`build_links`, `main.rs:129-269`)
+
+| Our step | First run, ms | What it does | What both fast builds do instead |
+|---|---|---|---|
+| parse | 24.5 | Per line: pack two IDs, push the pair, then hash both IDs with `hk` and push each into one of 512 shard lists per thread (`main.rs:147-159`): three pushes and two hashes a line, 2,048 open list heads | Push the pair only. Vibhor7-7 [`links.rs` 122-138](https://github.com/Vibhor7-7/shopping-sessions/blob/bee0cbf/src/links.rs#L122-L138): 8.8 ms |
+| intern | 22.4 | One `KMap` per shard gives every distinct ID a dense number (`main.rs:170-185`) | Nothing: the ID's slot in the final table is its number |
+| xlate | 22.8 | Two hash lookups per pair to turn IDs into dense numbers (`main.rs:194-207`) | Nothing |
+| union | 20.6 | **One thread**: path-halving union-find over the dense numbers, a random read per step with no prefetch (`main.rs:215-237`) | All threads, lock-free, on the table's slots, each pair's two home lines prefetched 8 pairs ahead ([`links.rs` 251-267](https://github.com/Vibhor7-7/shopping-sessions/blob/bee0cbf/src/links.rs#L251-L267)); cherylaurelia the same with a three-step ring ([`main.rs` 1984-2030](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs#L1984-L2030)). 16.2 ms including the first touch of the table |
+| table | 15.7 | A second hash insert of every non-root ID into `LinkTab` (`main.rs:243-258`, `keys.rs:255`) | Two sequential passes over the table that turn parent pointers into names ([`links.rs` 271-322](https://github.com/Vibhor7-7/shopping-sessions/blob/bee0cbf/src/links.rs#L271-L322)): 16.7 ms |
+
+So 45 ms of our 106 (intern and xlate) is work the others do not have at all, and the union is serial where theirs is parallel. Every ID is hashed and probed three times here (shard, xlate, final insert) and once there.
+
+### 36.2 The design, in terms of this repo
+
+`LinkTab` already has the right layout (a line is four keys then four values, `keys.rs:211-292`). Use it as the union-find while building:
+
+1. **Parse**: keep only `p.push((a, b))`; delete `skeys`, the shard maps, `gidx`, `ipairs`, `all_keys`, `parent`.
+2. **Size**: `slots = (2 * npairs * 4 / 3).next_power_of_two()` (two new IDs per pair at most; 4 M slots, 64 MB at 20M, against 2 M slots today because roots are now stored too). Zero pages from `mmap`, `MADV_HUGEPAGE` as now.
+3. **Join, on all threads**: for each pair, 8 pairs ahead prefetch the two home lines; `slot(k)`: scan the line's four keys, return the slot whose key is `k`, else claim the first zero key by compare-and-swap, **and if the swap fails re-read: the winner may have stored the same `k`** (today's `LinkTab::insert` at `keys.rs:255-268` assumes distinct keys and must gain that check); next line when the line is full. The value word holds `parent slot + 1`, 0 for a root. `find` with path halving by compare-and-swap (a lost race is ignored). `join`: find both roots; equal, done; else compare-and-swap the value word of the root with the larger key (`key_cmp`) from 0 to `smaller + 1`; on failure retry from the finds.
+4. **Name, on all threads, two passes over disjoint ranges of lines**: pass 1 stores `root + 1` in every non-root's value word; pass 2 replaces each value word with the root's key, and a root's with its own key. Pass 2 reads only key words, which no longer change.
+5. **Lookup is unchanged**: `LinkTab::person` (`keys.rs:272-292`) returns the value on a hit and `k` on a miss; a root now hits and returns itself.
+
+Use acquire/release orderings as Vibhor7-7 does, not relaxed, so the arm64 gate is sound.
+
+### 36.3 Why the name stays exact
+
+Every link step goes from a larger key to a smaller one, so no cycle can form and each tree's root is its smallest key under `key_cmp`, the same rule `build_links` applies now (`main.rs:229`). Long IDs keep their registry keys and take `key_cmp_slow`, as now. Self-links and lines with an empty side are dropped at parse, as now; key 0 is never stored.
+
+Model check ([`chk2/linkuf.py`] in the scratchpad): the steps above as atomic operations under a random scheduler (1 to 7 workers, bursts of 1 to 50 steps), on random graphs, chains, stars, one big component and heavy duplicates, 2 to 1,500 IDs, tables down to half the recommended size; then the two naming passes and this repo's lookup rule. 6,000 cases, **0 mismatches** against "smallest ID of the connected component", and no key stored twice. It models interleavings of atomic steps, not weak memory ordering.
+
+### 36.4 Expected gain and what it costs
+
+- **About -35 ms at 20M (3% of 1.15 s in-process) and about -0.14 s at 60M (3.5%)**, taking Vibhor7-7's printed steps as the target: parse about 10, join about 16, name about 17 ms.
+- **The lookup table doubles to 64 MB at 20M** (load 0.29 instead of 0.41). Vibhor7-7 runs its parse against exactly that table and layout; fewer lines overflow, each lookup is still one cache miss, and the table is 32 huge pages. Expect no change in parse; the A/B will show it.
+- **Catalogs stay hidden**: 21 ms on the side thread (Vibhor7-7 8.4 ms) is still shorter than links.
+- **Risk**: low for values (model-checked, same naming rule); the new part is concurrency, which the fuzz test for links should cover by running the build at 1 and 8 threads against the present implementation on random graphs.
+- cherylaurelia goes one step further (the person is the slot number, and unlinked users are added to the same table during parse); that is a different pipeline and not proposed.
 
 ## Next iteration
 
