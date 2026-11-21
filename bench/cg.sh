@@ -14,9 +14,9 @@ one() { # label dir bin extra-cargo-args
   ls /tmp/o/*/ | head -3 | sed "s/^/CG $label out: /"
   cg_annotate /tmp/cg_$label.out --show=Ir,D1mr,D1mw,DLmr,DLmw,Bcm,Bim 2>/dev/null | grep -vE "^$" | head -75 | cut -c1-230 | sed "s/^/CGF $label /"
   (cg_annotate /tmp/cg_$label.out --show=Ir,Bcm --annotate=yes > /tmp/ann_$label.txt 2>/tmp/ann.err || cg_annotate /tmp/cg_$label.out --show=Ir,Bcm > /tmp/ann_$label.txt 2>>/tmp/ann.err); head -3 /tmp/ann.err | sed "s/^/CGE $label /"; wc -l < /tmp/ann_$label.txt | sed "s/^/CGE $label lines /"
-  grep -n "annotated source" /tmp/ann_$label.txt | head -6 | cut -c1-140 | sed "s/^/CGE $label /"
-  ln=$(grep -n "annotated source" /tmp/ann_$label.txt | head -1 | cut -d: -f1); [ -n "$ln" ] && sed -n "$((ln)),$((ln+14))p" /tmp/ann_$label.txt | cut -c1-160 | sed "s/^/CGE $label /"
-  awk '/^-- (Auto|User)-annotated source: /{f=$NF; sub(/.*\//,"",f); ln=0; next} /^-- line /{ln=$3+0-1; next} f!="" && !/^--/ {ln++} /^ *[0-9,]+ \(/{n=$1; gsub(/,/,"",n); if (n+0>=1000000 && f!="") {line=$0; sub(/^ *[0-9,]+ +\([^)]*\) +[0-9,.]+( +\([^)]*\))? */,"",line); printf "%d %s:%d | %s\n", n, f, ln, substr(line,1,120)}}' /tmp/ann_$label.txt | sort -rn | head -170 | sed "s/^/CGL $label /"
+  grep -n "nnotated source" /tmp/ann_$label.txt | head -6 | cut -c1-140 | sed "s/^/CGE $label /"
+  ln=$(grep -n "nnotated source" /tmp/ann_$label.txt | head -1 | cut -d: -f1); [ -n "$ln" ] && sed -n "$((ln)),$((ln+14))p" /tmp/ann_$label.txt | cut -c1-160 | sed "s/^/CGE $label /"
+  awk '/^-- .*[Aa]nnotated source( file)?: /{f=$NF; sub(/.*\//,"",f); ln=0; next} /^-- line /{ln=$3+0-1; next} f!="" && !/^--/ {ln++} /^ *[0-9,]+ \(/{n=$1; gsub(/,/,"",n); if (n+0>=1000000 && f!="") {line=$0; sub(/^ *[0-9,]+ +\([^)]*\) +[0-9,.]+( +\([^)]*\))? */,"",line); printf "%d %s:%d | %s\n", n, f, ln, substr(line,1,120)}}' /tmp/ann_$label.txt | sort -rn | head -170 | sed "s/^/CGL $label /"
 }
 W=$GITHUB_WORKSPACE
 rm -rf /tmp/t2; git -C $W worktree prune; git -C $W worktree add -f /tmp/t2 origin/main -q
