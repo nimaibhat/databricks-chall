@@ -1776,6 +1776,23 @@ Nothing here is a 30% idea on its own. The entry is level with ours on AMD, so i
 - **Consequence for ranking.** Byte-count items move up and instruction items down: smaller records (48), `_exit` without unmapping and with the arena released by `MADV_DONTNEED` only if that is measured faster, peak memory as a first-class number in every A/B. Our peak is about 1.1 GB at 20M; Js-Hwang1's 12-byte events and Vibhor7-7's 1.14 GB are the comparisons. None of this can be sized without a Cascade Lake machine (47.2) or a probe submission that reports `rusage`, fault counts and phase stamps from the dev-set run.
 - Vibhor7-7 experiments 35 to 37 (offset timestamps finished in the parse, campaign cells side by side): each under 1%, not ranked.
 
+## Iteration 50 (2026-11-21, 09:05): a measured fixed cost on the scorer, which corrects iteration 49
+
+`OVERNIGHT_LOG.md` unchanged since experiment 62; pick `73f8661`.
+
+### 50.1 The scorer's fixed part is about 0.1 s (a competitor's timing probe)
+
+- [Th3r0n `BENCH.md` at `48e7c1c`](https://github.com/Th3r0n/shopping-sessions/blob/48e7c1c/BENCH.md), "Scorer probes": a build that sleeps for 10 times its own time-to-output scored 10.28 s, so on the hidden 20M set "own time T ~0.92 s (fixed + 11 T), vs ~0.56 s locally: 1.63x; fixed cost ~0.1 s. So the score is almost all our process time, on CPUs about 1.6x slower than the local i7 for this code."
+- **This corrects 49.** The part of a board score outside the process is about 0.1 s, not 0.3 to 0.5 s. The "half-size gains" that Vibhor7-7 and Th3r0n saw come from the scorer's CPU being slower in a way that does not scale evenly across their code, not from an avoidable fixed block. The leader's 0.31 s is therefore about 0.2 s of process time on that CPU, and ours about 0.72 s: a factor of 3.5 in compute. No rearrangement of memory teardown or flushing explains that; it is a faster pipeline.
+- What survives from 47 and 49: our build loses about 30% against Vibhor7-7 going from the Zen 5 runner to the scorer, so some of our code is disproportionately slow on Cascade Lake with 8 threads on 4 cores. Th3r0n's own probes point the same way for their code: "storing into fresh memory is what costs" (`55311cf`), and they added a `MADV_POPULATE_WRITE` pre-fault as a result (`9cd9445`), which this repo has had on Intel since experiment 48.
+
+### 50.2 The probe method works on the hidden data, and this repo can use it
+
+- **Idea.** The score is the only number returned from the hidden 20M run, but it is a clock. A build that sleeps `k x (time of one phase)` before exiting turns the score into that phase's time on the scorer: `phase = (score - 0.82) / k`. With `k = 10` and phases of 0.05 to 0.45 s the run stays under 20 s, so it is still the middle of three. A rejected or slow probe never replaces the best score; each costs one of two hourly slots.
+- **Here.** `main.rs` already stamps every phase for its stderr line. A `PROBE=parse|dedup|sessions|links|total` env set in the Dockerfile (as Th3r0n does with `SS_PROBE`) would sleep 10 times the named stamp difference just before exit. The same switch can A/B a setting on the scorer in one submission each: `THREADS=4` against 8, `IOMODE` (mapped tmpfs against `pread`), `PREFAULT`, partition bits, non-temporal stores off.
+- **Expected gain.** None by itself; it is the measurement that tells which phase is 30% slower on the scorer than the runners predict, at 20M on the real machine. Four probes (parse, sessions, links, total) take two hours of slots.
+- **Risk.** None to exactness (the output is written before the sleep). The probe commits must never be left as the chosen commit for the final; the best score stays `73f8661`'s unless a later real submission beats it.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
