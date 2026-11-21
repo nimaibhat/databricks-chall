@@ -419,13 +419,14 @@ fn main() {
     }
     let ev_bytes: usize = if io5 { ev_in.bytes() } else { ev_m.maps.iter().map(|m| m.len()).sum::<usize>() };
     let cl_bytes: usize = if io5 { cl_in.bytes() } else { cl_m.maps.iter().map(|m| m.len()).sum::<usize>() };
-    // Records are never larger than twice the input (a valid event line of
-    // >= 35 bytes makes 32 bytes, an invalid one of >= 8 bytes makes 16, a
-    // valid click line of >= 20 bytes makes 32), plus one partial block per
-    // list. The reservation is address space only.
+    // An event line makes at most twice its size in records (a valid line of
+    // >= 35 bytes makes 32 bytes, an invalid one of >= 8 bytes makes 16); a
+    // valid click line makes 32 bytes and is at least 20 bytes for any window
+    // after 2001, 8 bytes in the extreme, hence four times the click bytes.
+    // Plus one partial block per list. The reservation is address space only.
     let partial = ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * BLK;
     let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + partial * 2 + (256 << 20);
-    let arena = Arena::new(2 * (ev_bytes + cl_bytes) + partial + (64 << 20), est * 3 / 2);
+    let arena = Arena::new(2 * ev_bytes + 4 * cl_bytes + partial + (64 << 20), est * 3 / 2);
     assert!(arena.cap() / 16 < u32::MAX as usize - 1, "input too large for 32-bit record indices");
     let abase = arena.base();
     eprintln!("mapped + arena at {:?}", t_start.elapsed());

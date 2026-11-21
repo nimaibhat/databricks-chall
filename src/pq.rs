@@ -416,5 +416,23 @@ pub fn write(path: &std::path::Path, cols: &[Column], rows: usize) -> std::io::R
     file.extend_from_slice(b"PAR1");
     let mut f = std::fs::File::create(path)?;
     f.write_all(&file)?;
+    // OUTSYNC (experiment): 1 = fdatasync here, on the writing thread;
+    // 2 = only start writeback (Linux)
+    match out_sync() {
+        1 => {
+            let _ = f.sync_data();
+        }
+        #[cfg(target_os = "linux")]
+        2 => unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::sync_file_range(f.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE);
+        },
+        _ => {}
+    }
     Ok(())
+}
+
+fn out_sync() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("OUTSYNC").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
