@@ -1056,6 +1056,15 @@ Sources: this repo's log; [TejasviniChawla notes](https://github.com/TejasviniCh
 - SsjRaz `38b9cd6`: "Batch linked ID interning by hash shard", which is what `build_links` already does.
 - Vibhor7-7 now runs unattended overnight cycles that never submit; its `probe` branch (a diagnostic build that fails the dev check on purpose to read the scorer's log) is still unsubmitted.
 
+---
+
+## Iteration 26 (2026-11-21, 01:35): anthonyteti/buildathon-shopping-sessions, checked at the user's request
+
+- **Repo.** [anthonyteti/buildathon-shopping-sessions at `5aa0ef6`](https://github.com/anthonyteti/buildathon-shopping-sessions/tree/5aa0ef6): Rust, 2,851 lines, 24 commits between 22:43 and 01:05 EST. No `TEAM.md`, and no team name or board score in the README, commit messages, `Cargo.toml` or the GitHub description, so it cannot be tied to any team from the repo alone.
+- **Design** (README and commit log): mapped input, links by union-find over sorted IDs, person resolved at parse, events scattered by `hash(event_id)` and deduped per partition (whole records in the table since `a96d6a9`), survivors scattered by person, per-partition sort and sliding 7-day window, own PLAIN Parquet writer. Tonight's commits add a date table, `pext` ID packing, a write-combining scatter with streaming stores, a huge-page bump arena, two-stage prefetch for person lookups and software prefetch of the input ahead of the scanner. Every one of these is already in this file; nothing new to take.
+- **Local timing (the one benchmark run by this session, on the user's instruction).** Built natively on the Mac in the scratchpad and run on `~/ss-data/d20` with `NCPU=8`, interleaved with this repo's current pick (`~/ss-data/bin/s7`, the date-table build), nine rounds, process wall time: median 0.54 s for both; best 0.47 s for theirs against 0.45 s for this repo's. The machine was busy with the optimizer's own runs (load average about 6, several multi-second outliers), so the two are indistinguishable here. Its output matched the golden 20M tables (`scripts/compare.py`: MATCH), and its `user_daily` is 75 MB against this repo's 96 MB.
+- **What that does not say.** The Mac is ARM: it has no streaming stores and hides the page-fault and TLB costs that matter on the scorer (entries 11.4, 25.2), so this is not a board prediction. A real comparison is one line in the optimizer's x86 bench (`bench/variants.txt` accepts `ext:owner/repo[@sha]`).
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
