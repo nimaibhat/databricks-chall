@@ -39,8 +39,6 @@ jobs:
           python3 scripts/run_fixtures.py fixtures -- ./target/release/sessions 2>&1 | tail -1 | sed 's/^/X86FIX /'
       - name: bench
         run: bash bench/gha_bench.sh
-      - name: cachegrind three builds
-        run: bash bench/cg.sh
       - name: perf
         run: bash bench/perf.sh
       - name: extra
