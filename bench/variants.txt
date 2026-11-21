@@ -1,4 +1,3 @@
 # label|ref|build-args|env
 main|origin/gate-main-8780fbb||
-cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
-vibhor|ext:Vibhor7-7/shopping-sessions||
+s46|origin/gate-s46-744bfba||
