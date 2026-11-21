@@ -16,6 +16,8 @@ Re-ranked in iteration 3 after the first entry in `OVERNIGHT_LOG.md`. Every item
 | 4 | Start writeback of each output file when it is complete (`sync_file_range`, no wait) | `pqw.rs:1087`, `:1111` | 0 on a fast disk; old experiment 39 measured post-exit 0.13 to 0.04 s at 20M (old code, another runner) | Quoted: old log experiment 39, old notes 29.4 | None | 1.5 |
 | 5 | Only if `XL_CH=32768` in row 1 shows a gain: release parsed input with one batched call per thread instead of one `madvise` per chunk | `parse.rs:2158-2163` | Bounded by row 1's result; **my estimate** under 1% | Quoted: SeongJae Park's series "mm/madvise: batch tlb flushes for MADV_DONTNEED and MADV_FREE" reports 6.9% to 40% less time for batched `process_madvise` ranges. I could not confirm which kernel release it landed in | None | 2.1 |
 
+**Measure the ceiling first:** 8.1 describes a touch-only run (`--features knobs`, `XL_SKIP=512`) whose `parse` lap is the entire cost of mapping and releasing the input. If that is small, rows 1 and 5 are closed in one run.
+
 **Cheapest next experiment (no rebuild):** `XL_CH`, `XL_RD` and `XL_REL` are read from the environment in the shipped binary (`parse.rs:1791`, `main.rs:355`; they are not behind the `knobs` feature), so two of row 1's three variants are one environment variable each on the binary the log already times: `XL_CH=32768`, `XL_CH=2048`, `XL_REL=0`, `XL_RD=128`. If a value wins, the change to ship is the default constant (`CH_DEFAULT`, `parse.rs:1800`), one line. `MADV_POPULATE_READ` is not in the code anywhere (checked: the only `madvise` advice values used are 4, 14, 15 and 23), so that variant is the one that needs a build.
 
 **Closed by measurement:** PGO (log experiment 1: 197.5 / 198.5 against 197.8 / 198.6 ms, parse 146.1 against 146.3). Consistent with 1.1's caution that the hot paths are already laid out by hand. Do not re-propose.
@@ -277,6 +279,45 @@ The shipped binary reads about 40 `XL_*` variables at start (`main.rs:305-362`, 
 - Run them in one interleaved loop with the baseline, as the log already does. Report each as min / median like experiment 1.
 - `XL_EXITPROF` (`sys.rs:561`, `tl` build) prints an exit profile; please include it with request 3. It is the only thing that can say how much of the 7.4 ms outside the three stages (3.1) is process exit.
 - I have not found what `XL_KP`, `XL_FIRST4K` and `XL_NOTOUCH` are for beyond their names; not proposed.
+
+## Iteration 8 (2026-11-21): the code already has a switch that measures row 1's ceiling; patch text for the populate variant
+
+Read: `parse.rs:2118-2190` (the per-chunk loop of `stage1`).
+
+### 8.1 Diagnostic C: touch-only parse (`XL_SKIP=512`), a direct measurement of the mapping cost
+
+`stage1` has a mode that replaces parsing with one byte read per 4 KiB page of the chunk and still does the per-chunk release (`parse.rs:2146-2153`, `SKIP & 512`). It is compiled only with `--features knobs` (`parse.rs:18-25`, `main.rs:358-361`).
+- Build once with `--features knobs` (a measurement build, never shipped), run with `XL_SKIP=512 XL_TIMING=1`, and read **only the `parse` lap**. Nothing is parsed, so later stages and the output are meaningless; the run may well end in the fallback. Ignore everything after the `parse` figure.
+- That lap is the whole cost of faulting in and releasing the input on 8 threads: the page faults, the PTE work and the shootdowns, with no parsing. **It is the ceiling for everything row 1 and row 5 can gain.** If it reads 3 ms, close both rows without further work. If it reads 10 ms or more (7% of parse, my estimate in 1.4), run it again with `XL_CH=32768` and with `XL_REL=0` to split faults from releases.
+- The same build with `XL_SKIP=512 XL_RD=128` gives the cost of the `pread` path's copy for comparison.
+
+### 8.2 Patch text for the populate-read variant of row 1 (for the coding agent to apply; I have not compiled it)
+
+In `stage1`, directly before the `if unsafe { SKIP } & 512 != 0 {` at `parse.rs:2146`, where `buf` is the chunk's line-aligned slice:
+
+```rust
+if popr() {
+    let a = buf.as_ptr() as usize & !4095;
+    let b = (buf.as_ptr() as usize + buf.len() + 4095) & !4095;
+    unsafe { madvise(a as *mut u8, b - a, 22) }; // MADV_POPULATE_READ, Linux 5.14+
+}
+```
+
+with a run-time switch beside `popw()` at `parse.rs:14`:
+
+```rust
+static POPR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn popr() -> bool {
+    *POPR.get_or_init(|| std::env::var("XL_POPR").is_ok_and(|v| v == "1"))
+}
+```
+
+- Default off, so the shipped behaviour is unchanged until the A/B says otherwise.
+- The return value is ignored on purpose: on an older kernel the call fails with `EINVAL` and the pages are faulted as before.
+- The range is rounded outwards, so it may populate one page that belongs to the neighbouring chunk; that is harmless (the neighbour finds it mapped, or re-faults it if this thread releases first).
+- The `use_rd` path (`parse.rs:2136-2139`) returns before this point, so the switch has no effect there.
+- Two notes on reading the result. The line scans at `parse.rs:2141-2142` (`next_line_start`) already touch the first and last page of the chunk before this call, so two fault-around windows are mapped either way. And with 8 MiB chunks the call maps 2,048 pages in one go, which then sit in the page tables for the roughly 0.6 ms the thread needs to parse them; that is fine for the TLB (4 KiB entries are filled on demand) but if it loses, try it with `XL_CH=2048` before closing it.
+- **Risk to output:** none. It changes when read-only input pages get mapped, not what is read.
 
 ## Next passes (in this order)
 
