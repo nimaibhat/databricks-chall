@@ -67,7 +67,11 @@ fn fx(k: Key) -> u64 {
 impl Dense {
     #[inline(always)]
     fn user_norm(&self, f: &[u8]) -> Option<(u64, u64)> {
-        let y = gen::id_value(f, b'u')?;
+        self.user_norm_r(f, false)
+    }
+    #[inline(always)]
+    fn user_norm_r(&self, f: &[u8], roomy: bool) -> Option<(u64, u64)> {
+        let y = gen::id_value_fast(f, b'u', roomy)?;
         let n = gen::unscramble(y, self.keys.user);
         let (i, a) = (n >> gen::ALIAS_BITS, n & ((1 << gen::ALIAS_BITS) - 1));
         (i < self.ucap && a < NALIAS).then_some((i, a))
@@ -429,7 +433,7 @@ impl<'a, 'x, 'b> LineSink<'a> for EvSink<'x, 'b> {
             Some(((ts - self.ws) as u32, pc))
         };
         let dn = self.dn;
-        let number = gen::id_value(f0, b'e').map(|y| gen::unscramble(y, dn.keys.event)).filter(|&n| n < dn.ecap);
+        let number = gen::id_value_fast(f0, b'e', F::ROOMY).map(|y| gen::unscramble(y, dn.keys.event)).filter(|&n| n < dn.ecap);
         if let Some(n) = number {
             let ing = if ingest == i32::MAX {
                 ING_NONE
@@ -444,7 +448,7 @@ impl<'a, 'x, 'b> LineSink<'a> for EvSink<'x, 'b> {
             let (w0, user) = match valid {
                 None => (u64::MAX, 0),
                 Some((ts, pc)) => {
-                    let u = match dn.user_norm(f1) {
+                    let u = match dn.user_norm_r(f1, F::ROOMY) {
                         Some((i, a)) => (i << 4) | a,
                         None => {
                             let idx = self.odd.len() as u64;
@@ -515,7 +519,7 @@ impl<'a, 'x, 'b> LineSink<'a> for CkSink<'x, 'b> {
         }
         let Some(camp) = self.ctx.campaigns.get(f.get(2), self.floor, F::ROOMY) else { return };
         let cid = pack_fast(f0, self.ceil, F::ROOMY);
-        match self.dn.user_norm(f1) {
+        match self.dn.user_norm_r(f1, F::ROOMY) {
             Some((i, a)) => {
                 let w1 = (((ts - self.cws) as u64) << 32) | ((camp as u64) << 16) | (a << UB) | (i & UMASK);
                 self.cb.push((i >> UB) as usize, [cid, w1], self.bs);
