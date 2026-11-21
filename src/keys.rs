@@ -133,11 +133,17 @@ pub fn pack_fast(s: &[u8], ceil: *const u8) -> Key {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if n <= 10 && (p as usize) + 16 <= ceil as usize {
         let Some((lo, hi)) = (unsafe { codes16(p, n) }) else { return pack_long(s) };
-        // first byte to the top, then 8 -> 6 bits per code in three merges
+        // first byte to the top, then 8 -> 6 bits per code: one bit-extract
+        // where the CPU has it, three shift-merges elsewhere
         let x = lo.swap_bytes();
-        let x = ((x & 0x3F00_3F00_3F00_3F00) >> 2) | (x & 0x003F_003F_003F_003F);
-        let x = ((x & 0x0FFF_0000_0FFF_0000) >> 4) | (x & 0x0000_0FFF_0000_0FFF);
-        let x = ((x & 0x00FF_FFFF_0000_0000) >> 8) | (x & 0x0000_0000_00FF_FFFF);
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        let x = unsafe { std::arch::x86_64::_pext_u64(x, 0x3F3F_3F3F_3F3F_3F3F) };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        let x = {
+            let x = ((x & 0x3F00_3F00_3F00_3F00) >> 2) | (x & 0x003F_003F_003F_003F);
+            let x = ((x & 0x0FFF_0000_0FFF_0000) >> 4) | (x & 0x0000_0FFF_0000_0FFF);
+            ((x & 0x00FF_FFFF_0000_0000) >> 8) | (x & 0x0000_0000_00FF_FFFF)
+        };
         return (x << 16) | ((hi & 0x3F) << 10) | ((hi & 0x3F00) >> 4) | n as u64;
     }
     let _ = ceil;
@@ -179,15 +185,16 @@ fn key_cmp_slow(a: Key, b: Key) -> Cmp {
     x.cmp(&y)
 }
 
-/// murmur3 fmix64: good high and low bits.
+/// Fold, one multiply, fold. Packed IDs keep their characters in the high
+/// bits, and a multiply only carries information upward, so the first fold
+/// brings the high half down before the multiply spreads it; the second fold
+/// makes the low bits (open-addressing slots) as good as the top ones
+/// (partitions, table buckets). A hash only steers where things go, never
+/// what the answer is.
 #[inline(always)]
 pub fn hk(k: Key) -> u64 {
-    let mut x = k;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    x ^ (x >> 33)
+    let x = (k ^ (k >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^ (x >> 32)
 }
 
 #[inline(always)]
@@ -408,6 +415,48 @@ impl<V: Copy + Default> KMap<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The hash must spread generator-shaped IDs (a letter plus base-36 of a
+    /// 40-bit number) evenly over partitions (top bits) and table slots (low bits).
+    #[test]
+    fn hash_spreads_ids() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let b36 = |mut v: u64| -> Vec<u8> {
+            let mut o = Vec::new();
+            loop {
+                o.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize]);
+                v /= 36;
+                if v == 0 {
+                    break;
+                }
+            }
+            o.reverse();
+            o
+        };
+        for (prefix, sequential) in [(b'u', false), (b'e', false), (b'k', true)] {
+            let n = 400_000usize;
+            let (mut top, mut low, mut mid) = (vec![0u32; 512], vec![0u32; 512], vec![0u32; 512]);
+            for i in 0..n {
+                let v = if sequential { i as u64 } else { rnd() & ((1 << 40) - 1) };
+                let mut id = vec![prefix];
+                id.extend_from_slice(&b36(v));
+                let h = hk(pack(&id));
+                top[(h >> 55) as usize] += 1;
+                low[(h & 511) as usize] += 1;
+                mid[((h << 9) >> 55) as usize] += 1;
+            }
+            let mean = (n / 512) as u32;
+            for part in [&top, &low, &mid] {
+                let (mn, mx) = (*part.iter().min().unwrap(), *part.iter().max().unwrap());
+                assert!(mn > mean * 7 / 10 && mx < mean * 13 / 10, "prefix {} seq {sequential}: min {mn} max {mx} mean {mean}", prefix as char);
+            }
+        }
+    }
     #[test]
     fn linktab_matches_hashmap() {
         let mut x: u64 = 0x2545_F491_4F6C_DD1D;
