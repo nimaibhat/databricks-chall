@@ -760,6 +760,9 @@ The log's first queued change resolves the person in the parse loop. Entry 14.2 
 
 ## Next iteration
 
-- Re-read `OVERNIGHT_LOG.md` (first seen in iteration 14; experiments table had only the baseline) and drop anything it marks tried.
-- Pull the competitor clones again for new commits and new scorer reports.
-- Still unread: enkyuan/polaris `OPTIMIZATION_RESEARCH.md` and `PERFORMANCE.md`, toM0dots logs, SsjRaz.
+Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
+
+- cherylaurelia's sessions phase (`src/main.rs` from line 2363): rank sort for small groups and the vector 7-day window, as a spec.
+- Vibhor7-7's reader (`src/reader.rs`): how 256 KB blocks carry partial lines, for the `pread` A/B.
+- micah-andelman `scan2` and joch44 `split_masked`: two more implementations of the mask split to compare with 14.1.
+- New repos and scores from the public search API.
