@@ -53,7 +53,9 @@ done
 for ds in d20 d60; do
   R=$R20; [ $ds = d60 ] && R=$R60
   [ "$R" -gt 0 ] || continue
-  cat $HOME/$ds/*/*.csv > /dev/null
+  # only this dataset in the page cache, so the larger one is not evicted mid-run
+  sync; sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'; 
+  cat $HOME/$ds/*/*.csv $HOME/$ds/*.csv > /dev/null; free -m | sed -n 2p | sed "s/^/MEM $ds /"
   for v in "${V[@]}"; do IFS='|' read -r label ref bargs envs <<< "$v"; runone $ds "$label" "$envs" keep; done
   for r in $(seq 1 $R); do for v in "${V[@]}"; do IFS='|' read -r label ref bargs envs <<< "$v"; runone $ds "$label" "$envs"; done; done
 done
