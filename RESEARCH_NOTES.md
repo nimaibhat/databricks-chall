@@ -12,9 +12,9 @@ Research-only notes for the optimizing session. Nothing here has been built or b
 | 2 | Software write-combining with non-temporal stores for the 512-way scatters | `BList::push` in `mem.rs:128`, callers in `parse_events`, `parse_clicks`, `dedup_partition` | Competitor measured -12% total, -16% parse on an Ice Lake Xeon (the scorer's class); -6% on Zen 4 | Low: a flush bug loses or duplicates records, which the 20M cross-check catches | [1.2](#12-write-combining-buffers-with-non-temporal-stores) |
 | 3 | Route valid events straight to their user partition at parse; dedup only marks losers | `parse_events`, `dedup_partition`, `resolve_partition` | Removes dedup pass 2 (a second 512-way scatter of every survivor); competitors report a 19 to 26 ms dedup phase at 20M | Medium: restructures phase 3; invalid copies must still take part in dedup | [1.3](#13-dedup-that-marks-losers-in-place) |
 | 4 | Known-date table for F1/F2 timestamps and `ingest_ts` | `civil_swar` and `parse_ingest_s`, `parse.rs:772` and `:889` | Estimate 2 to 5% of parse CPU; three competitors ship it | Low: exact 11-byte compare, full parser on a miss | [1.4](#14-known-date-table-for-timestamps) |
-| 5 | `pread` in L2-sized blocks instead of mapping the input (a new variant of `IOMODE=4`) | `chunk_data`, `parse.rs:246` | Competitor measured mmap 7.5% slower than `read` on a cloud VM; unmeasured here at 8 threads | Low to medium: line seams and the `floor`/`ceil` guards | [1.5](#15-pread-in-l2-sized-blocks) |
+| 5 | Split each line from its own comma and quote masks (no separator index, no quote ring) | `scan_lines`, `parse.rs:486-654` | Competitor A/B ratios 0.90 to 0.95 of total; a second team measured the index design 6% slower than stepping per delimiter | Medium to high: this routine decides which lines are malformed; the existing fuzz test is the net | [2.1](#21-split-each-line-from-its-own-masks) |
 
-Runners-up, in order: sessions from 30-minute bins instead of a sort ([1.6](#16-sessions-from-30-minute-bins)), one-multiply hash ([1.7](#17-one-multiply-hash)), smaller Parquet ([1.8](#18-smaller-parquet-output)), `readahead(2)` tuning for a cold cache ([1.9](#19-cold-cache-read-ahead)).
+Runners-up, in order: `pread` in L2-sized blocks ([1.5](#15-pread-in-l2-sized-blocks), demoted in iteration 2: three teams measured mmap faster, two measured `read` faster), sessions from 30-minute bins instead of a sort ([1.6](#16-sessions-from-30-minute-bins)), one-multiply hash ([1.7](#17-one-multiply-hash)), smaller Parquet ([1.8](#18-smaller-parquet-output)), `readahead(2)` tuning for a cold cache ([1.9](#19-cold-cache-read-ahead)).
 
 ## A finding to act on before trusting the TSBL toggle
 
@@ -138,6 +138,46 @@ These are in `speedups.md` already; the numbers are new.
 - **Zero-page IPIs.** cherylaurelia `c166174` cut TLB IPIs from 8,400 to 2,000 per run by filling tables with real writes instead of `vec![0; n]`. Here `KMap` writes `EMPTY` into every slot and `Acc.camp` is first touched by a write, so the pattern (first read of an untouched page, then a write, while other threads run) does not occur.
 - **Wider link table.** Vibhor7-7 experiment 7: twice the slots was 1.3% slower; building it cost more than the lookups saved.
 - **Scanner batch size.** micah-andelman swept 2 to 64 KB and found it flat; `SEG` here is 2 KiB.
+
+---
+
+## Iteration 2 (2026-11-21): scanner designs, and counter-evidence from the remaining repos
+
+Sources opened: `src/main.rs` of cherylaurelia at `2e4261f`, `src/scan.rs` of explorer-skp at `d58857c`, and the commit logs and notes of AbhirajTiwari12 (`13c214a`), joshuamuellenbach25 (`ef05a85`) and Eagle Eye (`9e3c34a`). `OVERNIGHT_LOG.md` still did not exist; `git log` showed no new source commits since `1c4fa8e`.
+
+### 2.1 Split each line from its own masks
+
+- **Idea.** Drop the per-segment separator index (`pos`), the newline list (`nl`) and the quote ring (`qr`). At each line start, load 64 bytes (128 if no newline is found), take the comma and quote masks below the first newline bit, and derive all N field offsets and lengths from those two words.
+- **Sources.**
+  - [cherylaurelia `src/main.rs`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs) lines 1254 to 1380 (`scan_lines`, `fast_split`). Field count is `popcount(c0) + popcount(c1) == N - 1`. Quote validity is one expression: with `b` = comma-or-newline bits, `s = (b << 1) | 1` (field starts) and `ends = b >> 1`, let `x = q & s` (opening quotes) and `y = (q << 1) & b` (closing quotes moved onto the delimiter after them); the line is well quoted exactly when `(q & !(s | ends)) | (x & ends) | ((y - x) & b) == 0`. The subtraction borrows across each quoted field, so an unmatched quote leaves a bit on a delimiter. Which fields are quoted comes from `pdep(pext(x, s), 0x0101...)`, added to the start offsets and subtracted twice from the lengths, with no per-field branch. Commit [`9307ad6`](https://github.com/cherylaurelia/builders-hackathon/commit/9307ad6): A/B ratios 0.904, 0.920, 0.950 of total run time (together with nibble-table ID packing).
+  - [explorer-skp `333fd23`](https://github.com/explorer-skp/buildathon-shopping-sessions/commit/333fd23): "Back to the block scanner: the index version measured 6% slower on x86 twice." The index version (`0a9f36d`: "delimiter index per block with a fixed unrolled write, lines taken N entries at a time") is the same shape as `scan_lines` here. Their block scanner ([`src/scan.rs`](https://github.com/explorer-skp/buildathon-shopping-sessions/blob/d58857c/src/scan.rs)) validates quotes per 64-byte block with a prefix-XOR parity mask and steps once per delimiter.
+  - [AbhirajTiwari12](https://github.com/AbhirajTiwari12/shopping-sessions-pipeline/commit/b7d6b76) tried a two-stage batched scanner (`ffa9796`), a gather-based field split (`09d73d6`) and a quote index (`1fed555`), and went back to the line-at-a-time scanner each time. [joshuamuellenbach25 `09fe36c`](https://github.com/joshuamuellenbach25/Databricks---Shopping-Sessions/commit/09fe36c): "Split each line from its comma and quote masks."
+  - Counter-evidence: [micah-andelman `b20e383`](https://github.com/micah-andelman/shopping-sessions/commit/b20e383) moved the other way, to a two-stage scanner with bulk positions and mask-based quote validation, as part of the 0.525 to 0.495 s bundle. So the index design is not always slower; what the winners share is quote validation by mask arithmetic on the whole line.
+- **Here.** `scan_lines` (`parse.rs:486-654`) spends the audit's 10.8% of instructions in the per-field quote loop at lines 621 to 635, which 79% of event lines take, plus the flatten loop at 541 to 562. The smaller step is to keep the index and replace only lines 602 to 638 with the borrow test on the line's quote and delimiter words (lines under 128 bytes; longer ones keep `split`). The larger step is the full line-at-a-time scanner. Either way a line of 77 bytes needs two 64-bit words, so the masks must be re-derived relative to the line start or shifted from the block masks.
+- **Expected gain.** 3 to 8% of wall for the full version, less for the quote test alone.
+- **Risk.** Medium to high. The rule to keep: a line passes only if it has exactly N fields and every quote is the first or last byte of a field of length at least 2 that has both; `""` is an empty field; a lone `"` field is malformed. `fuzz_scan` (`parse.rs:675`) already compares against `split` on quote-dense input; add 7-field cases and lines straddling 64 and 128 bytes before changing anything.
+
+### 2.2 Type dispatch by word compare
+
+- **Idea.** Decide `view`/`cart`/`purchase` from the field length and one unaligned 8-byte load, instead of slice pattern matches.
+- **Source.** [cherylaurelia `src/main.rs`](https://github.com/cherylaurelia/builders-hackathon/blob/2e4261f/src/main.rs) `fast_event`, lines 2118 to 2127: `match kl { 4 if w as u32 == "view" || w as u32 == "cart" => 0, 8 if w == "purchase" => ..., _ => invalid }`. The same function looks the category up only inside the purchase arm, which is idea 1.1.
+- **Here.** `main.rs:622-629`. The audit's microbench priced the type match at 0.5 ns per line, so this is only worth doing while editing those lines for 1.1.
+- **Expected gain.** Under 1%.
+- **Risk.** None if the length is checked first; the 8-byte load needs the same `ceil` guard as `pack_fast`.
+
+### 2.3 More evidence on reading the input (updates 1.5)
+
+- [AbhirajTiwari12](https://github.com/AbhirajTiwari12/shopping-sessions-pipeline/commit/5dad127) tried `pread` into a huge-page buffer twice (`e3be38a`, `a4ec2b1`) and returned to the file mapping both times. The same repo turned per-chunk pre-mapping off by default (`9bbd0da`).
+- [joshuamuellenbach25 `213ce9a`](https://github.com/joshuamuellenbach25/Databricks---Shopping-Sessions/commit/213ce9a): "Return to memory-mapped input; paired Linux container runs favored it over buffered reads."
+- [Eagle Eye README](https://github.com/shanmukha-here/eagle-eye-shopping-sessions/blob/9e3c34a/README.md): for cold inputs it tries aligned 2 MiB direct reads with a 4 KiB overlap and uses mappings for cached inputs. Its local board evicts the input before every run, so that team assumed a cold scorer; its best score was 1.01 s.
+- Tally: mmap won in three repos (AbhirajTiwari12, joshuamuellenbach25, micah-andelman), `read` won in two (Vibhor7-7 on a cloud VM, cherylaurelia). None of the mmap wins is stated to be on a VM. Idea 1.5 is demoted from the top five; it remains a scoreboard A/B candidate only if a submission slot is spare.
+
+### 2.4 Things other teams tried and reverted (do not spend time here)
+
+- Dedup resolved inside the table with 16-byte rows and no separate phase: reverted by [AbhirajTiwari12 `319b917`](https://github.com/AbhirajTiwari12/shopping-sessions-pipeline/commit/319b917); the similar 16-byte dedup record was rejected by micah-andelman. Idea 1.3 differs (the payload is written once to its final partition and touched again only for losers) and is used by cherylaurelia, explorer-skp and Vibhor7-7 (`src/pool.rs`: "every record has a global 32-bit index, so a later phase can point at one (the dedup phase does, to drop the losing copies)"), but treat it as the riskiest of the top five.
+- Half the threads: AbhirajTiwari12 `9088f00`, back to all threads in `13c214a`.
+- Two-stage link prefetch (filter word first): explorer-skp `c2a3163`, back to one stage in `f5d71b4`.
+- No transparent huge pages: AbhirajTiwari12 `e9056a1`, back to requesting them in `6aaf72c`.
 
 ## Next iteration
 
