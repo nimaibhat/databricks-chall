@@ -24,11 +24,12 @@ done
 runone() { # ds label envs keep
   ds=$1; label=$2; envs=$3; keep=${4:-}
   out=$(mktemp -d); scr=$(mktemp -d); chmod 777 $out $scr
-  ef=""; for e in $envs; do ef="$ef -e $e"; done
+  ef=""; omount="-v $out:/output"
+  for e in $envs; do if [ "$e" = "@tmpfs" ]; then omount="--tmpfs /output:rw,size=2g,mode=1777"; else ef="$ef -e $e"; fi; done
   t0=$(date +%s.%N)
   docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
     --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus $N --memory 14g --memory-swap 14g \
-    --user 1000:1000 -v $HOME/$ds:/data:ro -v $out:/output -v $scr:/scratch \
+    --user 1000:1000 -v $HOME/$ds:/data:ro $omount -v $scr:/scratch \
     -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=$N -e MEM_GB=24 $ef "sut:$label" \
     2> $out.err >/dev/null
   rc=$?
