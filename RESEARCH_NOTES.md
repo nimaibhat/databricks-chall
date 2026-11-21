@@ -740,6 +740,24 @@ Sources: commits pushed after iteration 2 to joch44 (`e71539c`), Vibhor7-7 (`7a5
 - **Output is 0.048 s of about 2.1 s in-process at 20M** (`OVERNIGHT_LOG.md`). Every Parquet idea (entries 1.8, 5.2, the queued INT32 and buffer reservation) is worth at most 1 to 2% in total and carries reader risk. Do not spend a submission on them. The one output item still worth doing is the zero-row `part-0` hazard in entry 5.4, which is about correctness on tiny inputs, not speed.
 - **Thread count, partition counts, chunk size**: three teams swept them and found nothing (entries 1.10, 11.3, 16.2).
 
+---
+
+## Iteration 18 (2026-11-21, about 01:15): the link table that makes a parse-time lookup cheap
+
+The log's first queued change resolves the person in the parse loop. Entry 14.2 lists who measured that as a win and who as a loss; this entry records how the version that works is built, from [Vibhor7-7 `src/links.rs`](https://github.com/Vibhor7-7/shopping-sessions/blob/7a5ddaf/src/links.rs) (1.59 s on the log's runner, board 0.82 s).
+
+### 18.1 One cache line per lookup: four keys, then their four people
+
+- **Layout.** The table is an array of 64-byte lines. Words 0 to 3 of a line hold four ID keys and words 4 to 7 the four people they map to (`id_word(at) = (at >> 2) * 8 + (at & 3)`, value four words on). A key of 0 means a free slot.
+- **Home.** `home(id) = (mix(id) >> shift) & !3`: every search starts at the first slot of a line, so the line that was prefetched is the line that is read.
+- **Lookup** (`person_at`): one 256-bit load of the four keys, `cmpeq` against the ID and against zero, two `movemask`s. If either mask is non-zero, take the first slot that is the ID or free, load its value, and return `select_unpredictable(found, person, id)`; an unlinked ID therefore costs the same as a linked one and there is no hit-or-miss branch to mispredict. Only a full line of four other keys goes to a cold out-of-line probe of the next line.
+- **Prefetch.** `prefetch(id)` returns `home` and issues the prefetch; the parser calls it for each line's user ID and consumes it 16 lines later (README: "each line asks for its cache line 16 lines before reading it").
+- **Measured there.** Prefetching the link join -1.7% (experiment 4); forcing the select instead of a branch -2% and -3.2% of parse (experiment 6); the four-plus-four line layout -1.5% (experiment 14); a table twice as large +1.3%, because building it cost more than the lookups saved (experiment 7).
+- **Union-find in the same table.** While the table is built, the value word holds the parent; the edge loop prefetches the home lines of the next edge's two IDs before processing the current one (`links.rs:260-261`), which is entry 7.3's prefetch.
+- **Here.** The current structure is 512 `KMap<Key>` shards of 16-byte `(key, value)` slots at load 0.25 to 0.5, about 64 MB at 20M, probed with a hit-or-miss branch (`keys.rs:202-214`). For a parse-time lookup the same data wants: one flat table, the 4+4 line layout, a load factor near 0.5 at the line level, self-named IDs left out (entry 13.1), `EMPTY` (`u64::MAX`) or 0 as the free marker, and a ring of 16 pending `(record, home)` pairs per parse thread. At 20M there are about 1.8M linked IDs (892,711 link lines); without the self-named ones roughly 1.1M, so about 2.2M slots or 35 MB at load 0.5. That still exceeds L2 by far, which is why the prefetch ring is not optional.
+- **Expected gain.** This is the enabling piece for deleting the resolve pass (0.175 s of about 2.1 s at 20M on the runner, 8%) when combined with 14.2; on its own it adds cost to the parse loop.
+- **Risk.** Low for the table itself: a lookup returns the same person as `KMap::get(...).unwrap_or(uid)`. The ring adds a flush at chunk end, where the last 16 records must be drained before the thread's lists are read.
+
 ## Next iteration
 
 - Re-read `OVERNIGHT_LOG.md` (first seen in iteration 14; experiments table had only the baseline) and drop anything it marks tried.
