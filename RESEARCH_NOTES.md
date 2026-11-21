@@ -1169,6 +1169,20 @@ The log's experiment 14 measures 0.40 s (20M) and 1.10 s (60M) between our last 
 - **Expected gain**: on the 9V74 runner up to 0.3 s of 1.74 s at 20M (-17%) and 0.9 s of 4.9 s at 60M if output shrinks to a fifth. On the scorer unknown; Vibhor7-7's log notes that about 0.36 s of its 0.78 s is spent where its own timer does not look.
 - **Risk to exactness**: none to the values if the readers accept the encodings; the scorer's reader is unknown, so INT32 counts and delta pages need the same reader checks as 20.4 and one submission to confirm.
 
+### 29.4 Confirmed by the optimizer's tmpfs variant (run 44877249301, EPYC 7763)
+
+Read from the run's printed summary; post-exit seconds, median of 5:
+
+| Variant | Output | 20M post | 60M post | 60M wall |
+|---|---|---|---|---|
+| `s10` (INT64 counts) | disk, about 280 MB at 60M | 0.084 | 0.465 | 5.045 |
+| `s11` (INT32 counts) | disk, about 230 MB | 0.081 | 0.348 | 4.952 |
+| `s11tmpfs` | tmpfs | 0.073 | 0.117 | 4.681 |
+
+- **Output bytes on disk are the cause.** At 60M the post-exit time falls from 0.348 to 0.117 s on tmpfs, and already from 0.465 to 0.348 s with the smaller INT32 files: about 1 ms per MB written on this runner. `AREL=1`, `IOMODE=4` and the mimalloc huge-page flag change nothing.
+- **The size of the effect is the runner's disk.** This 7763 runner shows nothing at 20M (0.08 s either way), as in my run; the 9V74 runner showed 0.31 s at 20M and 1.0 s at 60M (29.1). The scorer's disk is unknown, so the expected board gain from a fifth of the bytes is between nothing and 0.3 s at 20M.
+- **Order of work this implies** (sizes from 20.3): `DELTA_BINARY_PACKED` on `day`, `sessions`, `events`, `revenue_cents` first (78 to 42 MB, one encoder), then `DELTA_BYTE_ARRAY` on `user_id` and a dictionary for `top_category` (to about 18 MB).
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
