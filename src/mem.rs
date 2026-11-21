@@ -36,6 +36,28 @@ impl Arena {
         Arena { base: std::ptr::null_mut(), cap: 0, off: AtomicUsize::new(0) }
     }
 
+    /// Frees the used part of the arena with `threads` parallel madvise calls.
+    pub fn release_parallel(&self, threads: usize) {
+        #[cfg(target_os = "linux")]
+        {
+            let used = self.used().min(self.cap);
+            let per = (used / threads.max(1) + (2 << 20)) & !((2 << 20) - 1);
+            let base = self.base as usize;
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    let a = t * per;
+                    if a >= used {
+                        break;
+                    }
+                    let b = (a + per).min(used);
+                    s.spawn(move || unsafe {
+                        libc::madvise((base + a) as *mut _, b - a, libc::MADV_DONTNEED);
+                    });
+                }
+            });
+        }
+        let _ = threads;
+    }
     pub fn used(&self) -> usize {
         self.off.load(Ordering::Relaxed)
     }

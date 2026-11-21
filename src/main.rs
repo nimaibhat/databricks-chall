@@ -111,10 +111,10 @@ pub struct Ctx {
     pub we: i64,
     pub day0: i64,
     pub ndays: usize,
-    pub products: Catalog<u16>,
+    pub products: Catalog,
     pub cat_names: Vec<Vec<u8>>,
     pub cat_unknown: u16,
-    pub campaigns: Catalog<u32>,
+    pub campaigns: Catalog,
     pub camp_names: Vec<Vec<u8>>,
     pub camp_channels: Vec<Vec<u8>>,
     pub links: Vec<KMap<Key>>, // sharded by top bits of hk
@@ -274,6 +274,19 @@ fn build_links(data: &Path, threads: usize) -> (Vec<KMap<Key>>, u32) {
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+fn cpu() -> String {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        format!(
+            "[u {:.2} s {:.2} flt {}]",
+            ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6,
+            ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6,
+            ru.ru_minflt
+        )
+    }
+}
+
 fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
@@ -334,12 +347,12 @@ fn main() {
     let cat_index: HashMap<Vec<u8>, u16> =
         cat_set.iter().enumerate().map(|(i, c)| (c.clone(), i as u16)).collect();
     let cat_unknown = cat_index[&b"unknown"[..]];
-    let mut products = Catalog::<u16>::new(prod_rows.len());
+    let mut products = Catalog::new(prod_rows.len());
     for r in &prod_rows {
-        products.insert(&r[0], cat_index[&r[1]], true);
+        products.insert(&r[0], cat_index[&r[1]] as u32, true);
     }
     let camp_rows = read_small_csv(&data.join("campaigns.csv"));
-    let mut campaigns = Catalog::<u32>::new(camp_rows.len());
+    let mut campaigns = Catalog::new(camp_rows.len());
     let mut camp_names = Vec::new();
     let mut camp_channels = Vec::new();
     for r in &camp_rows {
@@ -348,6 +361,9 @@ fn main() {
             camp_channels.push(r[1].clone());
         }
     }
+
+    products.finish();
+    campaigns.finish();
 
     // map the inputs early so the arena can be sized
     let ev_m = Mapped::open(&list_csv(&data.join("events")));
@@ -360,7 +376,7 @@ fn main() {
 
     // ---- phase 1
     let (links, link_shift) = build_links(&data, threads);
-    eprintln!("phase1 done {:?}", t_start.elapsed());
+    eprintln!("phase1 done {:?} {}", t_start.elapsed(), cpu());
 
     let ctx = Ctx {
         ws,
@@ -397,15 +413,17 @@ fn main() {
         if c.kind == 0 {
             let (d, s, e) = chunk_data(&ev_m, c.file as usize, c.start, c.end, buf);
             parse_events(&ctx, d, s, e, unsafe { ebl.get(t) }, bs);
+            chunk_done(&ev_m, c.file as usize, c.start, c.end);
         } else {
             let (d, s, e) = chunk_data(&cl_m, c.file as usize, c.start, c.end, buf);
             parse_clicks(&ctx, d, s, e, unsafe { cbl.get(t) }, bs);
+            chunk_done(&cl_m, c.file as usize, c.start, c.end);
         }
     });
     std::mem::forget(iobufs);
     let eparts = PerThread::from_vec(transpose(ebl.into_inner(), P1));
     let cparts = transpose(cbl.into_inner(), P2);
-    eprintln!("phase2 parse {:?} (parse only {:?})", t_start.elapsed(), t_parse.elapsed());
+    eprintln!("phase2 parse {:?} (parse only {:?}) {}", t_start.elapsed(), t_parse.elapsed(), cpu());
 
     // ---- phase 3: dedup per eid partition, survivors partitioned by person
     let sbl = PerThread::new(threads, || (0..P2).map(|_| BList::<SRec>::new()).collect::<Vec<_>>());
@@ -418,7 +436,7 @@ fn main() {
         dedup_partition(lists, mp, dead, sb, bs);
     });
     let sparts = transpose(sbl.into_inner(), P2);
-    eprintln!("phase3 dedup {:?}", t_start.elapsed());
+    eprintln!("phase3 dedup {:?} {}", t_start.elapsed(), cpu());
 
     // ---- phase 3b: user -> person, per user-hash partition
     let sparts = PerThread::from_vec(sparts);
@@ -441,7 +459,7 @@ fn main() {
     for (p, v) in transpose(cmv.into_inner(), P2).into_iter().enumerate() {
         cparts[p].extend(v.into_iter().filter(|l| l.len > 0));
     }
-    eprintln!("phase3b resolve {:?}", t_start.elapsed());
+    eprintln!("phase3b resolve {:?} {}", t_start.elapsed(), cpu());
 
     // ---- phase 4: per person partition
     let ncamp = ctx.camp_names.len();
@@ -464,11 +482,11 @@ fn main() {
         eprintln!("phase4 partitions: total {} us, top: {:?}", tot, &v[v.len().saturating_sub(5)..]);
     }
     let accs = acc.into_inner();
-    eprintln!("phase4 sessions {:?} arena used {} MB of {} MB", t_start.elapsed(), arena.used() >> 20, (est * 3 / 2) >> 20);
+    eprintln!("phase4 sessions {:?} {} arena used {} MB of {} MB", t_start.elapsed(), cpu(), arena.used() >> 20, (est * 3 / 2) >> 20);
 
     // ---- phase 5: output
     out::write_all(&outdir, &ctx, accs);
-    eprintln!("done {:?}", t_start.elapsed());
+    eprintln!("done {:?} {}", t_start.elapsed(), cpu());
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();
         libc::getrusage(libc::RUSAGE_SELF, &mut ru);
@@ -477,6 +495,9 @@ fn main() {
             ru.ru_utime.tv_sec, ru.ru_utime.tv_usec, ru.ru_stime.tv_sec, ru.ru_stime.tv_usec,
             ru.ru_minflt, ru.ru_majflt, ru.ru_maxrss, threads
         );
+    }
+    if env("AREL", "0") == "1" {
+        arena.release_parallel(threads);
     }
     // everything is leaked to the kernel: no destructor walks
     std::process::exit(0);
@@ -518,7 +539,7 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, arena: &Arena) {
     run("price", lines, &mut |f| acc = acc.wrapping_add(parse_price(f[6]).unwrap_or(0) as u64));
     let floor = ev_m.maps[0].as_ptr();
     run("raw7 prod", lines, &mut |f| acc = acc.wrapping_add(raw7(f[5], floor).unwrap_or(0)));
-    run("prod get", lines, &mut |f| acc = acc.wrapping_add(ctx.products.raw.get(raw7(f[5], floor).unwrap_or(0)).unwrap_or(0) as u64));
+    run("prod get", lines, &mut |f| acc = acc.wrapping_add(ctx.products.get(f[5], floor).unwrap_or(0) as u64));
     run("person", lines, &mut |f| { let u = pack(f[1]); acc = acc.wrapping_add(ctx.person_h(u, hk(u))) });
     let (mut inl, mut remap, mut tot) = (0u64, 0u64, 0u64);
     for c in ch {
@@ -545,26 +566,6 @@ fn microbench(ctx: &Ctx, ev_m: &Mapped, arena: &Arena) {
     eprintln!("  full       {:.1} ns/line ({} lines, {})", t.elapsed().as_nanos() as f64 / lines as f64, lines, acc);
 }
 
-#[derive(Clone, Copy, Default)]
-struct EPend {
-    r: ERec,
-    uh: u64,
-    pk: u64,
-    ph: u64,
-    long: bool,
-}
-
-#[inline(always)]
-fn resolve_event(ctx: &Ctx, p: &EPend, eb: &mut [BList<ERec>], bs: &mut Blocks) {
-    let mut r = p.r;
-    if r.pc != INVALID {
-        let m = if p.long { &ctx.products.long } else { &ctx.products.raw };
-        let cat = m.get_h(p.pk, p.ph).unwrap_or(ctx.cat_unknown);
-        r.pc |= cat as u32;
-    }
-    unsafe { eb.get_unchecked_mut((hk(r.eid) >> P1_SHIFT) as usize) }.push(r, bs);
-}
-
 #[inline(never)]
 fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<ERec>], bs: &mut Blocks) {
     let ws = ctx.ws;
@@ -572,8 +573,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
     let ws_s = ws.div_euclid(1000);
     let floor = d.as_ptr();
     let ceil = unsafe { floor.add(d.len()) };
-    let mut ring = [EPend::default(); LAG];
-    let mut n = 0usize;
+    let unknown = ctx.cat_unknown as u32;
     scan_lines::<7>(d, start, end, |f| {
         if f[0].is_empty() {
             return;
@@ -583,7 +583,7 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
             Some(v) => (v.div_euclid(1000) - ws_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             None => i32::MAX,
         };
-        let mut e = EPend { r: ERec { eid, ingest, pc: INVALID, ..Default::default() }, ..Default::default() };
+        let mut r = ERec { eid, ingest, pc: INVALID, ..Default::default() };
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
@@ -600,31 +600,12 @@ fn parse_events(ctx: &Ctx, d: &[u8], start: usize, end: usize, eb: &mut [BList<E
                 },
                 _ => break 'v,
             };
-            e.r.ts = (ts - ws) as u32;
-            e.r.pc = price << 8;
-            let u = pack(f[1]);
-            e.r.person = u;
-            let (pk, long) = match raw7(f[5], floor) {
-                Some(k) => (k, false),
-                None => (pack(f[5]), true),
-            };
-            let ph = hk(pk);
-            e.pk = pk;
-            e.ph = ph;
-            e.long = long;
-            prefetch((if long { &ctx.products.long } else { &ctx.products.raw }).slot_ptr(ph));
+            r.ts = (ts - ws) as u32;
+            r.person = pack(f[1]);
+            r.pc = (price << 8) | ctx.products.get(f[5], floor).unwrap_or(unknown);
         }
-        let slot = n % LAG;
-        if n >= LAG {
-            resolve_event(ctx, &ring[slot], eb, bs);
-        }
-        ring[slot] = e;
-        n += 1;
+        unsafe { eb.get_unchecked_mut((hk(eid) >> P1_SHIFT) as usize) }.push(r, bs);
     });
-    let first = n.saturating_sub(LAG);
-    for i in first..n {
-        resolve_event(ctx, &ring[i % LAG], eb, bs);
-    }
 }
 
 #[inline(never)]
@@ -641,11 +622,7 @@ fn parse_clicks(ctx: &Ctx, d: &[u8], start: usize, end: usize, cb: &mut [BList<C
         if ts < cws || ts >= we {
             return;
         }
-        let camp = match raw7(f[2], floor) {
-            Some(k) => ctx.campaigns.raw.get(k),
-            None => ctx.campaigns.long.get(pack(f[2])),
-        };
-        let Some(camp) = camp else { return };
+        let Some(camp) = ctx.campaigns.get(f[2], floor) else { return };
         let u = pack(f[1]);
         let r = CRec { person: u, cid: pack(f[0]), ts, camp };
         unsafe { cb.get_unchecked_mut((hk(u) >> P2_SHIFT) as usize) }.push(r, bs);

@@ -282,18 +282,42 @@ pub fn raw7(s: &[u8], floor: *const u8) -> Option<u64> {
     Some(v | ((n as u64) << 56))
 }
 
-/// A lookup table for small catalogs: raw keys for IDs of at most 7 bytes,
-/// packed keys for the rest.
-pub struct Catalog<V: Copy + Default> {
-    pub raw: KMap<V>,
-    pub long: KMap<V>,
+/// A lookup table for small catalogs (values u32): a dense array for IDs of
+/// the canonical form `<prefix><decimal without leading zeros>` (the most
+/// common prefix in the catalog), raw keys for other IDs of at most 7 bytes,
+/// packed keys for the rest. Exact: every catalog ID of canonical form with a
+/// number below `dense.len()` is in `dense`, so a miss there is a real miss.
+pub struct Catalog {
+    pub raw: KMap<u32>,
+    pub long: KMap<u32>,
+    ids: Vec<Vec<u8>>,
+    prefix: Vec<u8>,
+    dense: Vec<u32>, // value + 1, 0 = absent
 }
-impl<V: Copy + Default> Catalog<V> {
+
+/// (prefix length, number) if `s` is non-digits followed by 1..=8 digits
+/// without a leading zero.
+fn canon_split(s: &[u8]) -> Option<(usize, u64)> {
+    let p = s.iter().position(|b| b.is_ascii_digit())?;
+    let d = &s[p..];
+    if d.is_empty() || d.len() > 8 || !d.iter().all(|b| b.is_ascii_digit()) || (d[0] == b'0' && d.len() > 1) {
+        return None;
+    }
+    Some((p, d.iter().fold(0u64, |n, &b| n * 10 + (b - b'0') as u64)))
+}
+
+impl Catalog {
     pub fn new(n: usize) -> Self {
-        Catalog { raw: KMap::with_capacity(n + 16), long: KMap::with_capacity(16) }
+        Catalog {
+            raw: KMap::with_capacity(n + 16),
+            long: KMap::with_capacity(16),
+            ids: Vec::new(),
+            prefix: Vec::new(),
+            dense: Vec::new(),
+        }
     }
     /// Inserts if absent; returns true if inserted.
-    pub fn insert(&mut self, s: &[u8], v: V, overwrite: bool) -> bool {
+    pub fn insert(&mut self, s: &[u8], v: u32, overwrite: bool) -> bool {
         let (m, k) = match raw7(s, s.as_ptr()) {
             Some(k) => (&mut self.raw, k),
             None => (&mut self.long, pack(s)),
@@ -302,6 +326,95 @@ impl<V: Copy + Default> Catalog<V> {
         if !ins && overwrite {
             m.slots[i].1 = v;
         }
+        if ins {
+            self.ids.push(s.to_vec());
+        }
         ins
+    }
+    fn map_get(&self, s: &[u8], floor: *const u8) -> Option<u32> {
+        match raw7(s, floor) {
+            Some(k) => self.raw.get(k),
+            None => self.long.get(pack(s)),
+        }
+    }
+    /// Builds the dense table; call after the last insert.
+    pub fn finish(&mut self) {
+        let mut cnt: HashMap<Vec<u8>, (usize, u64)> = HashMap::new();
+        for id in &self.ids {
+            if let Some((p, n)) = canon_split(id) {
+                let e = cnt.entry(id[..p].to_vec()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = e.1.max(n);
+            }
+        }
+        let Some((prefix, (c, maxn))) = cnt.into_iter().max_by_key(|(k, v)| (v.0, std::cmp::Reverse(k.clone()))) else {
+            return;
+        };
+        if maxn as usize > 4 * c + 4096 {
+            return; // too sparse
+        }
+        let mut dense = vec![0u32; maxn as usize + 1];
+        for id in &self.ids {
+            if let Some((p, n)) = canon_split(id) {
+                if id[..p] == prefix[..] {
+                    dense[n as usize] = self.map_get(id, id.as_ptr()).unwrap() + 1;
+                }
+            }
+        }
+        self.prefix = prefix;
+        self.dense = dense;
+    }
+    /// The value for `s`; bytes from `floor` up to `s` are readable.
+    #[inline(always)]
+    pub fn get(&self, s: &[u8], floor: *const u8) -> Option<u32> {
+        let pl = self.prefix.len();
+        let n = s.len();
+        if !self.dense.is_empty() && n > pl && n - pl <= 8 && s[..pl] == self.prefix[..] {
+            let k = n - pl;
+            let e = unsafe { s.as_ptr().add(n) };
+            if e as usize >= floor as usize + 8 {
+                let x = crate::parse::ld8(unsafe { e.sub(8) });
+                let keep = 8 - k;
+                let x = if keep == 0 { x } else { (x & (!0u64 << (8 * keep))) | (0x3030_3030_3030_3030 >> (8 * k)) };
+                if crate::parse::digits8(x) && (s[pl] != b'0' || k == 1) {
+                    let v = crate::parse::val8(x) as usize;
+                    if v < self.dense.len() {
+                        let d = unsafe { *self.dense.get_unchecked(v) };
+                        return d.checked_sub(1);
+                    }
+                }
+            }
+        }
+        self.map_get(s, floor)
+    }
+}
+
+#[cfg(test)]
+mod cat_tests {
+    use super::*;
+    #[test]
+    fn dense_exact() {
+        let mut c = Catalog::new(100);
+        for i in 0..200u32 {
+            c.insert(format!("p{i}").as_bytes(), i * 3, true);
+        }
+        c.insert(b"p0007", 999, true);
+        c.insert(b"x5", 555, true);
+        c.insert(b"averyveryverylongid", 777, true);
+        c.finish();
+        assert!(!c.dense.is_empty());
+        let probes: Vec<&[u8]> = vec![
+            b"p0", b"p7", b"p07", b"p0007", b"p199", b"p200", b"p1999", b"P7", b"p", b"", b"x5", b"p7 ",
+            b" p7", b"p-7", b"p12345678", b"p123456789", b"averyveryverylongid", b"pp7", b"p1a", b"p00",
+        ];
+        for pr in probes {
+            let mut buf = vec![b'#'; 16];
+            buf.extend_from_slice(pr);
+            buf.extend_from_slice(b",,,,,,,,");
+            let s = &buf[16..16 + pr.len()];
+            let exp = c.map_get(pr, pr.as_ptr());
+            assert_eq!(c.get(s, buf.as_ptr()), exp, "{:?}", std::str::from_utf8(pr));
+        }
+        assert_eq!(c.get(b"p7", b"p7".as_ptr()), Some(21));
     }
 }

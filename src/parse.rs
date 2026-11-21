@@ -266,6 +266,27 @@ pub fn chunk_data<'a>(m: &'a Mapped, file: usize, start: usize, end: usize, buf:
     let _ = (mode, buf);
     (map, start, end)
 }
+/// After a chunk is parsed: drop its page-table entries now, in parallel,
+/// instead of in the single-threaded teardown at exit. Re-touching a dropped
+/// page just maps the page-cache page again, so this is always safe.
+pub fn chunk_done(m: &Mapped, file: usize, start: usize, end: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if io_mode() != 4 && *D.get_or_init(|| std::env::var("DROP").map(|v| v == "1").unwrap_or(false)) {
+            let map: &[u8] = &m.maps[file];
+            let a = (start + 4095) & !4095;
+            let b = end & !4095;
+            if b > a {
+                unsafe {
+                    libc::madvise(map.as_ptr().add(a) as *mut _, b - a, libc::MADV_DONTNEED);
+                }
+            }
+        }
+    }
+    let _ = (m, file, start, end);
+}
+
 impl Mapped {
     pub fn open(paths: &[PathBuf]) -> Mapped {
         let mut maps = Vec::new();
@@ -644,20 +665,20 @@ mod tests {
 // SWAR fast paths. Each falls back to the exact scalar parser when unsure.
 // ---------------------------------------------------------------------------
 #[inline(always)]
-fn ld8(p: *const u8) -> u64 {
+pub fn ld8(p: *const u8) -> u64 {
     u64::from_le(unsafe { (p as *const u64).read_unaligned() })
 }
 
 /// Every byte is an ASCII digit (fast_float's check).
 #[inline(always)]
-fn digits8(x: u64) -> bool {
+pub fn digits8(x: u64) -> bool {
     ((x & 0xF0F0_F0F0_F0F0_F0F0) | (((x.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
         == 0x3333_3333_3333_3333
 }
 
 /// The value of 8 ASCII digits, first byte most significant.
 #[inline(always)]
-fn val8(x: u64) -> u64 {
+pub fn val8(x: u64) -> u64 {
     let v = x.wrapping_sub(0x3030_3030_3030_3030);
     let v = (v.wrapping_mul(10)).wrapping_add(v >> 8) & 0x00FF_00FF_00FF_00FF;
     let v = (v.wrapping_mul(100)).wrapping_add(v >> 16) & 0x0000_FFFF_0000_FFFF;
