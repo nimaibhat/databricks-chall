@@ -488,6 +488,7 @@ Where the time is now, from the log (tmpfs, before experiment 9): parse 158 ms, 
   2. In `setup_par`'s worker branch (`setup.rs:828-832`), replace the spin `while !(...) { spin_loop() }` by: take the next 2 MiB block of a pre-reserved range and `madvise(MADV_POPULATE_WRITE)` it, until `keys.done` is set. The arenas are created after the job today (`setup.rs:968-969`); their sizes need only `ev_bytes`, `ck_bytes`, `lk_bytes`, which thread 0 has after the listing (`setup.rs:844`), so creating them there and publishing them through a `Slot` (as `rowcap` and `nbs` already are) is the enabling step. `Arena::alloc` hands out blocks in address order (`sys.rs:175`), so "the first N blocks of the event arena" is well defined and parse will use exactly those first.
 - **Size (my estimate).** About 1.5 ms of window on 7 threads; at 7 GB/s single-thread and a 30 GB/s ceiling that is at most 40 MB, about 20 blocks, 7% of the zeroing. Taken out of a bandwidth-bound parse that is 1 to 2 ms. It cannot lengthen setup: the loop ends on `keys.done`, and a block in progress is 0.3 ms at worst.
 - **What to watch:** `ev_bytes / 28 * 16` (`setup.rs:968`) over-reserves the arena; populate only blocks below the expected use (say the first 32) so no cleared memory is wasted. With `PARTS_READY` the `Part`s are built in setup (`setup.rs:975-983`); they take their first block lazily in `new_chunk`, so nothing else changes.
+- **Which memory to clear first (added in iteration 16):** the click index (`g.csr`, about 82 MB at 20M) is as good a target as the record arenas and simpler, because it is one flat allocation whose size is known in setup (`csr_cap`, `setup.rs:673`). The log's profile has 3.1% of all samples in page zeroing under `links::job`, about 48 thread-ms, which is this table being faulted in by the link jobs that run inside parse (`scatter_chunk`, `links.rs:852-862`). Populating its first 40 MB in setup removes half of that from parse with no change to `Part` or `Arena` at all: one `madvise(MADV_POPULATE_WRITE)` loop over a pointer that already exists.
 - **Risk to output:** none. The same records go to the same addresses.
 
 ### 15.2 Row 4: `ev3b`'s tail
@@ -515,6 +516,12 @@ Where the time is now, from the log (tmpfs, before experiment 9): parse 158 ms, 
 ### 15.5 A caution on row 2 (the licence probe), so it is not oversold
 
 The authors wrote all vector code that runs during parse through 256-bit wrappers with explicit barriers against 512-bit code generation (`sys::z`, `yb`/`kb`, `sys.rs:1139-1158`), including the link jobs that run inside parse, and kept 512-bit code to stage 3. People who do that have usually measured frequency effects on their own machine. That makes it less likely that a second, cheaper licence step was left on the table, though they may not have had a Cascade Lake to test on (the build targets it, `target-cpu=cascadelake`). The probe is still 20 lines and settles it either way.
+
+## Iteration 16 (2026-11-21): the default click-index job read; one refinement, one correction to how the log's figures are read
+
+Read `links.rs:825-931` (`count_chunk`, `scatter_chunk`, `bucket`).
+- Per user bucket the job reads that bucket's click and link records twice (count, then scatter into the index), about 500 KiB per bucket, then sorts within users. The second read comes from cache. I found no pass to remove; mode 2, which drops the count pass, measured equal (experiment 6), which fits.
+- **Reading the log's `st2b_*` figures:** `st2b_pass2` is taken from the job's start, not from the end of pass 1 (`links.rs:919-920`, `dbg2 = tstart.elapsed()`), so it includes `st2b_pass1`. The scatter itself is 113.2 - 18.4 = about 95 thread-ms, of which about 48 is the kernel clearing the index's pages (profile). So the job's own work on 5.1M clicks is about 9 ns per click for the scatter: not a target. The page clearing is, and 15.1 now names the click index as the first thing to pre-clear.
 
 ## Next passes
 
