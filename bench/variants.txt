@@ -1,7 +1,5 @@
 # label|ref|build-args|env
 main|main||
-micah|ext:micah-andelman/shopping-sessions||
-vibhor|ext:Vibhor7-7/shopping-sessions||
-cheryl|ext:cherylaurelia/builders-hackathon||
-skp|ext:explorer-skp/buildathon-shopping-sessions||
-theron|ext:Th3r0n/shopping-sessions||
+s1|origin/gate-s1||
+s2|origin/gate-s2||
+cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
