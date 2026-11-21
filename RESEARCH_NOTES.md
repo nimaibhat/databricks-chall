@@ -253,8 +253,11 @@ A run that trips `sys::fallback` re-executes itself with `--generic` (`sys.rs:12
 | User slots `ucap` | `ecap / 16` (`:964`) | `user_count = events / 30` (`plan.rs:147`, `EVENTS_PER_USER = 30`), at any scale | `ucap` is about 0.09 per event against 0.033 needed: about 2.7x |
 | Output rows per thread `row_cap` | `ev_bytes / 40 / nt * 2 + 65536` (`:845`) | At most 14 days per user (`WINDOW_DAYS`), so at most `events / 30 * 14` rows in total | At 20M: 11M rows of room per thread against 9.3M rows in the whole output: above 8x |
 
+| Ingest time field, 21 bits of seconds from `ws - 1 day` (`ING_MAX`, `main.rs:75`; `ing_base`, `setup.rs:991`; fallback at `parse.rs:450`) | 24.3 days of range | `ingest_ts` is the true event time minus at most 5 s, or plus at most 5 days and 600 s; duplicates add at most 600 s more (`user.rs:551-565`, `:413`). It is always written well-formed (`write_utc`), also on rows whose `ts` is bad | Largest value is about 20.0 days from the base: 4 days of room. Holds for every seed, since none of these bounds is drawn per seed |
+
 - **Odd events** (`links.rs:1954`, fallback above 2% of event rows): the rates that produce non-conforming IDs are fixed constants or narrow ranges in `plan.rs:128-141` (empty user 0.2%, malformed 0.05%, upper-cased 0.0005%); none is drawn from a range that reaches 2%.
 - **Scale.** A comment in `plan.rs:133` speaks of "the full 75M rows". If the hidden set is larger than the reported 20M events, all three capacities scale with input bytes, so the margins above do not shrink. I did not check the other fixed limits (`names over 4 GB`, `edge store over 4G records`, `input too large`) against a 60M-event set; the first two are far away at 20M.
+- **The serial pass over odd events** (`links.rs:1945-1990`, a `HashMap<Vec<u8>, _>` filled on one thread between parse and the sessions stage) only sees events whose ID does not decode, which in the generator is the upper-cased ID case, about 5 per million rows (`plan.rs:133`): about 100 entries at 20M. Not a cost.
 - **What would be worth one run:** generate two more 20M seeds and one 40M set and confirm stderr never shows the fallback message (the fast path's output is compared anyway, but an exact output via the slow path passes the comparison and hides the problem; check the time or `XL_TIMING` line, not only the diff).
 
 ## Iteration 7 (2026-11-21): a no-rebuild knob sweep, because the defaults were tuned on someone else's machine
@@ -270,7 +273,7 @@ The shipped binary reads about 40 `XL_*` variables at start (`main.rs:305-362`, 
 | `XL_PINSTART` | `main.rs:336` | Pin workers when they start, not at the first parse job | off | 1 | Saves one migration per worker at parse start: under 0.2 ms |
 | `XL_PREFAULT` | `main.rs:325` | Each worker faults its first heap chunk at start (`sys.rs` `prefault_chunk`) | off | 1 | `FOR_NIMAI.md` says keep off without an A/B; this is the A/B. Related to row 2 but different memory |
 | `XL_POPW` | `parse.rs:15` | `MADV_POPULATE_WRITE` on each 2 MiB arena block (`parse.rs:185`) | on | 0 | Loses slightly if THP is active (one fault per block either way); if it wins, huge pages are not being granted on this VM and every memory conclusion changes. A check on the bench as much as on the code |
-| `XL_QORD` | `parse.rs:1791` | Order of the parse queue (clicks, links, events by default) | 2 | 0, 1 | Unknown; decides how early the link jobs can start inside parse |
+| `XL_QORD` | `parse.rs:1791`, `:1938-1953` | Order of the parse queue: 2 = clicks, links, events; 1 = events, clicks, links; 0 = directory order | 2 | 1 | Expect 1 to lose: the link jobs that run inside parse (`links::job`) can only start once clicks and links are parsed, so with events first they all land at the end. Worth one run only to confirm the default |
 
 - Run them in one interleaved loop with the baseline, as the log already does. Report each as min / median like experiment 1.
 - `XL_EXITPROF` (`sys.rs:561`, `tl` build) prints an exit profile; please include it with request 3. It is the only thing that can say how much of the 7.4 ms outside the three stages (3.1) is process exit.
