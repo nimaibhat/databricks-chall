@@ -87,7 +87,7 @@ fn map_noreserve() -> i32 {
 static WC_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Write-combining for the partition scatters, from env WC (read once at start).
 pub fn wc_init() {
-    WC_ON.store(std::env::var("WC").map(|v| v == "1").unwrap_or(false), Ordering::Relaxed);
+    WC_ON.store(std::env::var("WC").map(|v| v == "1").unwrap_or(true), Ordering::Relaxed);
 }
 #[inline(always)]
 fn wc_on() -> bool {

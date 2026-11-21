@@ -239,7 +239,7 @@ pub fn ts_bl() -> bool {
 
 pub fn io_mode() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
+    *M.get_or_init(|| std::env::var("IOMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
 }
 
 /// Makes chunk bytes available. Returns (data, start, end) to scan.
