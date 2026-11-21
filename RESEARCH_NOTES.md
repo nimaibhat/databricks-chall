@@ -1589,6 +1589,24 @@ Clones pulled at about 03:55. Read against `OVERNIGHT_LOG.md` with experiments u
 - **Ingest compared in a packed form that is not in calendar order** ([SsjRaz `8c06514`](https://github.com/SsjRaz/databricks-buildathon-shopping-sessions/commit/8c06514)). **Ours**: `DRec.ingest` is seconds from the window start as `i32`, compared as a signed integer (`main.rs:822`); order is preserved. One assumption to keep in mind: `parse_ingest_s` (`parse.rs:1162-1203`) reduces every form to whole seconds, so an `ingest_ts` in epoch milliseconds with a non-zero millisecond part would tie with another copy in the same second and would be judged late against `ts` a fraction of a second off. The generator and all 36 fixtures write `ingest_ts` in F1 only (checked: 105 F1 values in the fixtures, none in F3 or F2; 20M sample all 20 bytes), so this is not a live defect.
 - joch44 notes one dev mismatch that did not reproduce in 33 later runs, attributed to another session touching the shared dataset. Nothing to act on.
 
+## Iteration 40 (2026-11-21, 04:10): the latest heads on x86, and where the pick stands
+
+Run [44887057968](https://github.com/nimaibhat/databricks-chall/actions/runs/44887057968) on `bench-ext`, EPYC 7763, 4 vCPU, median of 7 (20M) and 5 (60M), all outputs equal. Ours is `b2fa94d` code.
+
+| Build | 20M | 60M | Instructions, 1M set |
+|---|---|---|---|
+| cherylaurelia `2e4261f` | 1.276 | 3.498 | 1,175 M |
+| Vibhor7-7 `765c6e2` (board 0.76 s) | 1.320 | 3.768 | 1,249 M |
+| ours `b2fa94d` | 1.442 | 3.992 | 1,422 M |
+| micah-andelman `73dfdd3` (board 1.04 s for v5.12) | 1.675 | 5.061 | |
+| hansliu-dev/676767 `efa72c0` | 1.727 | 5.399 | |
+
+- **Gap to cherylaurelia: 13% at 20M and 14% at 60M** (it was 27% and 32% in iteration 27 on the same CPU model with `0a06317`). To Vibhor7-7: 9% and 6%. The wall ratios again follow the instruction ratios (1.21 and 1.14).
+- Our phases (20M): links 0.081, parse 0.801, dedup 0.077, sessions 0.264, output 0.039; pre 0.122, post 0.057. cherylaurelia's first run: tables and links 0.043, parse 0.712, dedup 0.072, sessions and output 0.253. So against cherylaurelia: parse 0.09 s, links 0.04 s, sessions and output 0.05 s; dedup level.
+- **Links is back to a third of the gap on this runner** (0.081 against 0.043 s; the optimizer's 0.041 was on a faster CPU). Entry 36's rework is worth re-ranking above the scatter sweep.
+- **Sessions plus output is 0.30 s here against cherylaurelia's 0.25 s**; on the 9V74 run of iteration 35 it was level. Zen 3 has the smaller L2 (512 KB), which fits the optimizer's finding that sort time is in groups of 8 to 31 events.
+- `hansliu-dev/676767` at its new head is still 20% slower than our pick; whatever scored for team 67 is not this code. Scaled from Vibhor7-7's 0.76 s, our pick is near 0.83 s.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
