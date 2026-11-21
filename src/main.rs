@@ -984,6 +984,75 @@ fn dedup_partition(lists: &mut [BList<DRec>], sc: &mut DedupScratch, bs: &mut Bl
 }
 
 #[cfg(test)]
+mod session_tests {
+    use super::*;
+    /// Sessions cut from bin-ordered events (any order inside a bin) against
+    /// sessions cut from fully sorted events: same starts, same members.
+    #[test]
+    fn bins_match_sorted_sessions() {
+        let mut x: u64 = 0x0BAD_5EED_1234_5678;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let gap = GAP_MS as u64;
+        for round in 0..60_000 {
+            // a person's timestamps: steps that are tiny, near the 30-minute
+            // rule on both sides, exactly on it, or hours long; with repeats
+            let n = 1 + rnd(if round % 50 == 0 { 400 } else { 30 }) as usize;
+            let mut t = rnd(14 * 86_400_000 - 1);
+            let mut ts = Vec::with_capacity(n);
+            for _ in 0..n {
+                ts.push(t);
+                t += match rnd(12) {
+                    0 => 0,
+                    1 => gap,
+                    2 => gap + 1,
+                    3 => gap - 1,
+                    4 => 2 * gap,
+                    5 => rnd(4 * gap),
+                    6 => 3 * 3_600_000 + rnd(3_600_000),
+                    _ => rnd(240_000),
+                };
+                if t >= 14 * 86_400_000 {
+                    break;
+                }
+            }
+            // reference: sort, split where the gap exceeds 30 minutes
+            let mut sorted = ts.clone();
+            sorted.sort_unstable();
+            let mut want: Vec<(u64, Vec<u64>)> = Vec::new();
+            for &v in &sorted {
+                match want.last_mut() {
+                    Some(s) if v - *s.1.last().unwrap() <= gap => s.1.push(v),
+                    _ => want.push((v, vec![v])),
+                }
+            }
+            // bin order with a shuffle inside each bin; pc carries the index
+            let mut evs: Vec<u64> = ts.iter().map(|&v| (v << 32) | 7).collect();
+            for i in (1..evs.len()).rev() {
+                let j = rnd(i as u64 + 1) as usize;
+                evs.swap(i, j);
+            }
+            evs.sort_by_key(|&w| bin_of(w)); // stable: keeps the shuffle inside a bin
+            let mut got: Vec<(u64, Vec<u64>)> = Vec::new();
+            let mut k = 0;
+            while k < evs.len() {
+                let (end, start) = session_at(&evs, k);
+                assert!(end > k);
+                let mut members: Vec<u64> = evs[k..end].iter().map(|w| w >> 32).collect();
+                members.sort_unstable();
+                got.push((start as u64, members));
+                k = end;
+            }
+            assert_eq!(got, want, "ts {:?}", ts);
+        }
+    }
+}
+
+#[cfg(test)]
 mod dedup_tests {
     use super::*;
     /// `dedup_partition` against the rule stated directly: per id the copy
@@ -1079,6 +1148,49 @@ struct Scratch {
     apos: Vec<u32>,
     since: Vec<u32>,
     active: Vec<u32>,
+    /// events per half-hour bin, then the bin-ordered copy of the partition
+    bcnt: Vec<u32>,
+    tk: Vec<u64>,
+    tg: Vec<u32>,
+}
+
+/// Half-hour bin of an event word (ts << 32 | pc).
+#[inline(always)]
+fn bin_of(w: u64) -> u32 {
+    ((w >> 32) as u32) / GAP_MS as u32
+}
+
+/// The session that starts at `k` in a person's bin-ordered events: (index
+/// one past its last event, its start time).
+#[inline(always)]
+fn session_at(evs: &[u64], k: usize) -> (usize, u32) {
+    let (j, start, mx) = bin_run(evs, k);
+    let mut last = mx;
+    let mut end = j;
+    // the bins that continue this session
+    while end < evs.len() {
+        let (j2, mn2, mx2) = bin_run(evs, end);
+        if mn2 - last > GAP_MS as u32 {
+            break;
+        }
+        last = mx2;
+        end = j2;
+    }
+    (end, start)
+}
+
+/// The run of events of one bin starting at `k`: (end, smallest ts, largest ts).
+#[inline(always)]
+fn bin_run(evs: &[u64], k: usize) -> (usize, u32, u32) {
+    let b = bin_of(evs[k]);
+    let (mut j, mut mn, mut mx) = (k, u32::MAX, 0u32);
+    while j < evs.len() && bin_of(evs[j]) == b {
+        let t = (evs[j] >> 32) as u32;
+        mn = mn.min(t);
+        mx = mx.max(t);
+        j += 1;
+    }
+    (j, mn, mx)
 }
 
 #[inline(never)]
@@ -1103,6 +1215,11 @@ fn process_partition(
     gkeys.clear();
     counts.clear();
     gid.clear();
+    // events per half-hour bin of the window, for the time-ordering pass
+    let nbins = ((ctx.we - ctx.ws) / GAP_MS) as usize + 2;
+    let bcnt = &mut sc.bcnt;
+    bcnt.clear();
+    bcnt.resize(nbins, 0);
     for l in slists {
         l.for_each_slice(|sl| {
             for r in sl {
@@ -1117,6 +1234,7 @@ fn process_partition(
                 let g = *gmap.val_mut(s);
                 counts[g as usize] += 1;
                 gid.push(g);
+                bcnt[(r.ts / GAP_MS as u32) as usize] += 1;
             }
         });
     }
@@ -1131,12 +1249,30 @@ fn process_partition(
     let pos = &mut sc.pos;
     pos.clear();
     pos.extend_from_slice(&off[..ng]);
-    // an event inside its group is one word: ts << 32 | pc, so sorting the
-    // words sorts by time (the order among equal times does not matter)
-    let ev = &mut sc.ev;
-    ev.clear();
-    ev.reserve(n);
-    unsafe { ev.set_len(n) };
+    // No comparison sort. An event inside its group is one word, ts << 32 |
+    // pc. Two counting passes order them: first the whole partition by
+    // half-hour bin, then, keeping that order, by person. A person's events
+    // are then ordered by bin and unordered inside a bin, which is all the
+    // session rule needs (see the sweep below).
+    let nlive = gid.len();
+    {
+        let mut sum = 0u32;
+        for c in bcnt.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+    }
+    let tk = &mut sc.tk;
+    let tg = &mut sc.tg;
+    tk.clear();
+    tk.reserve(nlive);
+    tg.clear();
+    tg.reserve(nlive);
+    unsafe {
+        tk.set_len(nlive);
+        tg.set_len(nlive);
+    }
     {
         let mut i = 0;
         for l in slists {
@@ -1145,13 +1281,26 @@ fn process_partition(
                     if r.pc == DEAD {
                         continue;
                     }
-                    let g = gid[i] as usize;
-                    unsafe { *ev.get_unchecked_mut(pos[g] as usize) = ((r.ts as u64) << 32) | r.pc as u64 };
-                    pos[g] += 1;
+                    let b = (r.ts / GAP_MS as u32) as usize;
+                    let at = bcnt[b] as usize;
+                    bcnt[b] += 1;
+                    unsafe {
+                        *tk.get_unchecked_mut(at) = ((r.ts as u64) << 32) | r.pc as u64;
+                        *tg.get_unchecked_mut(at) = *gid.get_unchecked(i);
+                    }
                     i += 1;
                 }
             });
         }
+    }
+    let ev = &mut sc.ev;
+    ev.clear();
+    ev.reserve(nlive);
+    unsafe { ev.set_len(nlive) };
+    for i in 0..nlive {
+        let g = tg[i] as usize;
+        unsafe { *ev.get_unchecked_mut(pos[g] as usize) = *tk.get_unchecked(i) };
+        pos[g] += 1;
     }
     // group clicks by person (only persons with events)
     let ccounts = &mut sc.ccounts;
@@ -1221,10 +1370,7 @@ fn process_partition(
     const WEEK: u64 = WEEK_MS as u64;
 
     for g in 0..ng {
-        let evs = &mut ev[off[g] as usize..off[g + 1] as usize];
-        if evs.len() > 1 {
-            evs.sort_unstable();
-        }
+        let evs = &ev[off[g] as usize..off[g + 1] as usize];
         let cls = &mut cl[coff[g] as usize..coff[g + 1] as usize];
         if cls.len() > 1 {
             cls.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
@@ -1241,9 +1387,14 @@ fn process_partition(
         let mut k = 0usize;
         let ne = evs.len();
         while k < ne {
-            let start_off = (evs[k] >> 32) as u32;
+            // Sessions from bins. Two events of one half-hour bin are less
+            // than 30 minutes apart, so a bin never splits; the gap between
+            // two occupied bins is the smallest ts of the later minus the
+            // largest of the earlier (more than 30 minutes whenever a bin
+            // lies between them). A session starts at the smallest ts of its
+            // first bin.
+            let (end, start_off) = session_at(evs, k);
             let start = ws + start_off as i64;
-            let mut last = start_off;
             let mut cnt = 0u32;
             let mut rev = 0u64;
             let mut purchase = false;
@@ -1264,9 +1415,8 @@ fn process_partition(
                 d_events = 0;
                 d_rev = 0;
             }
-            while k < ne && ((evs[k] >> 32) as u32) - last <= GAP_MS as u32 {
+            while k < end {
                 let r = evs[k];
-                last = (r >> 32) as u32;
                 cnt += 1;
                 let price = (r as u32) >> 8;
                 if price != 0 {
