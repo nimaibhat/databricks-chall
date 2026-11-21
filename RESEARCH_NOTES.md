@@ -804,6 +804,31 @@ The log's first queued change resolves the person in the parse loop. Entry 14.2 
 - **Expected gain.** Unknown until measured: between nothing (Vibhor7-7's Docker) and several tenths of a second (TejasviniChawla's bind mount, scaled to 96 MB).
 - **Risk.** Step 1 none. Steps 2 to 4 are the reader risk discussed in 5.1 to 5.3: read every output back with polars 2.1.0, pyarrow and duckdb, and keep the dev-answer comparison in the gate, since `compare.py` reads through polars.
 
+### 20.3 Measured sizes of the 20M output under each encoding
+
+Measured offline by re-encoding the optimizer's golden 20M `user_daily` (`~/ss-data/gold20`, 2,242,393 rows in 10 files, rows in the order this build writes them) with pyarrow 26 into the scratchpad. This measures bytes only; it does not time anything, and pyarrow's encoders stand in for a hand-written one. Script: `/private/tmp/claude-501/-Users-nimaibhat-Documents-databricks-chall/273c3dc9-8aa1-4164-a68d-59b78a9a199a/scratchpad/pqsize/size.py`.
+
+| Layout (v1 pages, no statistics) | Size | B/row | `user_id` | `day` | `sessions` | `events` | `revenue` | `top_category` |
+|---|---|---|---|---|---|---|---|---|
+| PLAIN, INT64 counts (as written now) | 96.4 MB | 43.0 | 13.0 | 4.0 | 8.0 | 8.0 | 8.0 | 2.0 |
+| PLAIN, INT32 counts | 78.5 MB | 35.0 | 13.0 | 4.0 | 4.0 | 4.0 | 8.0 | 2.0 |
+| `DELTA_BINARY_PACKED` on the four integer columns | 42.5 MB | 18.9 | 13.0 | 0.7 | 0.4 | 0.7 | 2.2 | 2.0 |
+| plus `DELTA_LENGTH_BYTE_ARRAY` on `user_id` | 33.9 MB | 15.1 | 9.1 | | | | | 2.0 |
+| plus dictionary on `top_category` | 30.0 MB | 13.4 | 9.1 | | | | | 0.3 |
+| `DELTA_BYTE_ARRAY` on `user_id` instead | 21.7 MB | 9.7 | 3.7 | | | | | 2.0 |
+| PLAIN INT32 with Snappy | 22.2 MB | 9.9 | 3.9 | 1.6 | 0.8 | 1.8 | 1.0 | 0.7 |
+| Delta, delta-length, dictionary, with Snappy | 14.9 MB | 6.6 | 3.5 | 0.6 | 0.3 | 0.7 | 1.2 | 0.3 |
+| PLAIN INT32 with Zstandard | 10.9 MB | 4.9 | 1.9 | 0.7 | 0.3 | 0.9 | 0.6 | 0.4 |
+
+Facts from the same read: 667,450 distinct `user_id`s (3.36 rows per person), 82.4% null `top_category`, largest `revenue_cents` 34,488,578, largest `events` 29,232, largest `sessions` 19.
+
+What this says:
+
+- **One encoder buys most of it.** `DELTA_BINARY_PACKED` on `day`, `sessions`, `events` and `revenue_cents` alone takes the file from 96.4 to 42.5 MB (-56%). It is the simplest of the encodings in entry 5.3 and has no compression dependency.
+- **`user_id` is then 70% of what is left.** A dictionary over distinct values does not help (pyarrow's came out at 10.7 B/row). `DELTA_BYTE_ARRAY` does (3.7 B/row), because a person's rows are adjacent and each repeat costs a prefix length and an empty suffix. It is built from the same delta encoder (prefix lengths, then suffixes as delta-length byte arrays). Polars lists it as supported (entry 5.1); it is the least commonly written of these encodings, so it needs the read-back check more than the others.
+- **Delta integers plus `DELTA_BYTE_ARRAY` plus a `top_category` dictionary would be about 8 B/row, roughly 18 MB**: a fifth of today's bytes with no compressor. Snappy on plain INT32 pages lands at the same size with one mechanism but needs an encoder.
+- `revenue_cents` fits in 32 bits for this dataset by a factor of 60, but a whale's day can exceed any assumed bound at 60M, so it stays INT64 (delta packing makes the width irrelevant anyway).
+
 ### 20.2 Other new commits
 
 - [Vibhor7-7 `80df6c5`](https://github.com/Vibhor7-7/shopping-sessions/commit/80df6c5) (experiment 23, no number yet): `ingest_ts` validity checked with ordinary compare-and-branch instead of a folded flag, because unlike `ts` its form is always F1 and the branches predict; its whole seconds come straight from the parse "instead of from multiplying by 1000 and dividing again". This repo already keeps ingest in seconds (`parse_ingest_s`).
