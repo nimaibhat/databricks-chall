@@ -10,11 +10,13 @@ Re-ranked in iteration 14 after log experiments 5 to 10. Source is now `801982c`
 
 | # | Idea | Where | Expected gain | Rests on | Risk to exact output | Entry |
 |---|---|---|---|---|---|---|
-| 1 | **Insurance, no gain at 20M:** pick the bucket size by input size. Ship two builds (`XL_BB=14`, `XL_BB=15`); the default one `execv`s the other when `events.csv` is above about 25M events' worth of bytes | `setup.rs:844` (sizes known after the listing), `Dockerfile` | 0 at 20M; 5 ms at 30M, 15 ms at 40M (**measured**, experiment 14); costs about 1.5 ms (**my estimate**) on the large path only | Experiment 14: bucket 2^14 alone is +15 ms at 40M, crossover near 25M | None if both builds pass the gate; both must be gated | 17.1 |
-| 2 | `perf annotate` of `run_events`, `ev_batch`, `links::job` (no code) | n/a | Directs everything else | Experiment 13's thread table shows parse is bound by computation on the cores, so the next gain is in instructions, and I cannot rank instructions without samples | None | 15.4, 17.3 |
-| 3 | Prefetch the 64 staging lines of a batch as `ev_vec` computes their addresses | `parse.rs:714` (after `st4::<LP>`), same in `ck_vec` | **My estimate** 0 to 1 ms at 20M; possibly several ms of the 30M/40M penalty | Mechanism only. Experiment 14: doubling the buckets cost nothing at 20M, so the lines are not latency-bound there | None | 17.2 |
-| 4 | Frequency-licence probe at three points | `parse.rs:2181`, `events.rs:2096` | Diagnostic | Not yet run; see the caution in 15.5 | None | 14.2 |
-| 5 | (empty: nothing else I can support with evidence) | | | | | |
+| 1 | Fresh numbers for the new pipeline (no code): lap line, `prof` thread-ms, fault count, user/system time, peak RSS, `perf report` top 15 symbols, and `perf annotate` of the new `ev_loop` | n/a | Directs everything else | Every figure these notes rank by was measured on `941879e`/`801982c`; the parser, record size, click index and writer have all changed since (experiments 15, 16) | None | 18.1 |
+| 2 | Staging footprint of the 12-byte event path: test `XL_BB=16` once, and the staging-block prefetch | `parse.rs:318` (`EV_STAGE = 192`), `parse.rs:428` (`EvPart::push_many`) | Unknown; experiment 15 shows the sign: more buckets now costs parse 8 ms at 20M | Staging is now 256 B per bucket per thread (was 64 B): 197 KB at 20M, 295 KB at 30M, two hyperthreads per 1 MiB L2 | None for the prefetch; `BB=16` takes the old stage 3 path (`events.rs`, `BB > 15`), gate it | 18.2 |
+| 3 | Frequency-licence probe at three points | end of `stage1`, end of `stage3a` | Diagnostic | Still not run; the new push path uses a masked 128-bit store only, so the picture has not got worse | None | 14.2 |
+| 4 | (empty until 18.1's numbers exist) | | | | | |
+| 5 | (empty) | | | | | |
+
+**All file and line references below iteration 18 are to the old source and are stale.**
 
 **Closed by measurement since iteration 9 (do not re-propose):**
 - Row 1 of iteration 9 (release input once at the end): experiment 5. Parse does drop to 151.0, but the parallel release then takes 8.6 ms, so the wall is the same. The log's conclusion is the durable fact: **unmapping 1.8 GB of 4 KiB input pages costs about 8 ms of wall on 8 threads wherever it is done.** My estimate of 3 to 6 ms for the parallel release was too low.
@@ -549,6 +551,23 @@ Read `links.rs:825-931` (`count_chunk`, `scatter_chunk`, `bucket`).
 ### 17.3 Where I stand
 
 Four ideas from iterations 15 and 16 were measured and none paid. The mechanisms I can argue from the source and the log's totals are used up; the remaining time is inside three functions and I need per-instruction samples (15.4 item 1) to say anything better than a guess. That profile is the most valuable thing the coding agent can run next.
+
+## Iteration 18 (2026-11-21): experiments 15 to 17 read; the source is a different pipeline now
+
+- Experiments 15 and 16 took three newer upstream pipeline commits and upstream's assembly event loop: 20M went from about 209 to about 196 (parse 162 to 149, write 9.9 to 7.3). That gain did not come from these notes.
+- What changed, from my first read of the diff: event records are 12 bytes (`R12`, `parse.rs:321`), staged 16 at a time in 192-byte blocks per bucket (`EV_STAGE`, `parse.rs:318`); click index entries are 8 bytes (`main.rs`, `csr_range` now `&[u64]`); bucket size is back to 2^15; the event loop is hand-written assembly (`k_free.rs`, `ev_loop` / `ev_redo`); the writer and `pqw.rs` grew by about 1,300 lines; a fault handler falls back (`sys::fault_fallback_init`).
+- **Withdrawn:** 17.1 (two builds by input size): the smaller bucket now loses at 20M too, main is on 2^15, nothing to switch between. 17.2 as written (line numbers and sizes were for the old 64-byte staging); its successor is 18.2.
+- Experiment 17: upstream's other variants and all runtime knobs are no better than the shipped build. Closed.
+
+### 18.1 Row 1: measurements needed before I can rank anything
+
+On `9363748`, seed 20, tmpfs, the same commands as the "Facts for the research session" block of the log: (a) the `XL_TIMING` lap line and the `prof` thread-ms line; (b) page faults, user and system time for parse; (c) peak RSS; (d) `perf report` top 15 symbols; (e) `perf annotate` of the event loop, ten hottest instructions. With 12-byte records the arena traffic fell by a quarter and the kernel share should have fallen with it; whether the remaining time is the scanner, the staging stores or stage 3 decides where I read next.
+
+### 18.2 Row 2: staging footprint
+
+- Each thread now keeps 256 B of staging per bucket (192 B block plus per-bucket state), four times the old 64 B line. At 769 buckets that is 197 KB per thread, about 400 KB for the two hyperthreads sharing a 1 MiB L2, before the scanner's tables and the input. Experiment 15's `upb` column fits: doubling the buckets cost parse 8 ms at 20M where on the old layout it was free.
+- So the stage is now on the edge at 20M, and two cheap tests follow. (1) `XL_BB=16`: halves the staging (98 KB) at the price of a 1 MiB dedup table in stage 3 and the older stage 3 path (`BB > 15` selects it). Parse should gain, ev3a should lose; one build says which wins. (2) In `EvPart::push_many`, prefetch the target of each row (`l + f`, known from `lp` and `fill`) a batch ahead, as in old 17.2. **Both are my estimates of sign only; no size claimed.**
+- Risk to output: none for (2). (1) changes which stage 3 code runs, so full gate.
 
 ## Next passes
 
