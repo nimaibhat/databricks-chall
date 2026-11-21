@@ -948,6 +948,22 @@ Read from `git show` copies of `src/` at that commit; nothing was built. The bra
 - **Unchanged and still open:** the per-person sort of 16-byte records (entry 7.1), the comparator click sort (13.2), `civil_swar` and `parse_ingest_s` (15.1 to 15.3), the serial catalog load before `build_links` (8.1), the serial union-find and naming loop (7.3), and `background_readahead`, which is still started (`main.rs:366`) although the input is reported to be on tmpfs (entry 11.2).
 - **`build_links` now does more work than it needs.** It still interns every ID into 512 `KMap` shards, runs the union-find, and then inserts the non-root IDs into the `LinkTab` (`main.rs:165-258`). The two fastest builds do the union-find inside the final table (entry 18.1), which removes the shard maps and the index translation. Links were 0.112 s of about 2.1 s at 20M in the log's profile, so this is worth at most a few percent and only after the parse work settles.
 
+### 23.3 The rewritten scanner on that branch: logic matches the model; two places to trim
+
+Read from `parse.rs:477-587` at `40e0519` (commit `6c99487`).
+
+- **Logic.** It is the algorithm of entry 14.1 with 128-bit integers: masks for 67 blocks at a time, a window of each mask stream at the line start, `trailing_zeros` of the newline window for the line length, the borrow test `(q & !(st | en)) | (x & en) | (y.wrapping_sub(x) & d)` on `u128`, and the long-line and tail cases handed to `split`. Checked by reading against the Python model of 14.1 (`scratchpad/chk2/split.py`), case by case:
+  - window shift at offset 0 (`(b << 1) << (63 - sh)` is zero-safe);
+  - the virtual terminator at `end`, including when `end` is a multiple of 64 (it lands in block `nblocks`, which the refill loop covers because it always fills three blocks past the line's own);
+  - bytes at and after `end` masked out of the last real block, so a chunk never sees its neighbour's separators;
+  - an empty line (zero commas, dropped by the field-count test);
+  - a quoted field's length cannot underflow, because a one-byte `"` field is rejected by `x & en` before the fields are cut;
+  - a line of 128 bytes or more, and a last line with no newline, both go through `memchr` and `split`.
+  No discrepancy found. The branch also strengthened `fuzz_scan`.
+- **Trim 1: 128-bit shifts and bit scans in the field loop** (`:571-584`). `m.trailing_zeros()` and `m &= m - 1` on a `u128`, and `(q >> fs) as u32` with a variable shift of a `u128`, each compile to several instructions with a branch or conditional move, six or seven times per line. cherylaurelia's version works on the two 64-bit halves separately (comma offsets from each word, merged by a shift of `8 * popcount(c0)`; quoted flags through `pext`/`pdep`), which keeps every operation a single 64-bit instruction (entry 2.1, lines 1352 to 1380 of their `src/main.rs`). TejasviniChawla measured its own `u64`-halves splitter at only 1 ns per line better (entry 22.1), so this is small.
+- **Trim 2: three blocks recomputed per refill.** Each refill restarts at the current block and recomputes the masks of blocks that the previous segment already covered as its three look-ahead blocks: about 5% more `masks64` calls than needed. Carrying the last three words forward removes it.
+- **Expected gain.** A few percent of the scanner at most; listed for completeness now that the scanner is the newest code.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
