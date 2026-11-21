@@ -126,24 +126,30 @@ pub struct Ctx {
 // ---------------------------------------------------------------------------
 // Phase 1: links
 // ---------------------------------------------------------------------------
+const LINK_SHARD_BITS: u32 = 7;
+
 fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> LinkTab {
     let t0 = Instant::now();
     let paths = list_csv(&data.join("links"));
     let m = Mapped::open(&paths);
     let mut chunks = Vec::new();
     chunks_of(0, &m, 1 << 20, &mut chunks);
-    let shard_bits: u32 = p2_bits();
+    // 128 interning shards: enough for parallelism, few enough that their
+    // partly filled blocks stay small
+    let shard_bits: u32 = LINK_SHARD_BITS;
     let shards: usize = 1 << shard_bits;
     let shift = 64 - shard_bits;
-    // sized up front (a link line is about 20 bytes) so the lists do not regrow
-    let lines = m.maps.iter().map(|x| x.len()).sum::<usize>() / 18;
-    let pairs = PerThread::new(threads, || Vec::<(Key, Key)>::with_capacity(lines / threads * 3 / 2 + 1024));
-    let skeys = PerThread::new(threads, || (0..shards).map(|_| Vec::<Key>::with_capacity(2 * lines / shards / threads * 3 / 2 + 64)).collect::<Vec<_>>());
+    // the pair list and the per-shard key lists live in arena blocks (huge
+    // pages, write-combined) like the event streams
+    let lblocks = PerThread::new(threads, || Blocks::new(arena));
+    let pairs = PerThread::new(threads, || Scatter::<(Key, Key)>::new(1));
+    let skeys = PerThread::new(threads, || Scatter::<Key>::new(shards));
     par_for(chunks.len(), threads, |t, i| {
         let c = chunks[i];
         let d: &[u8] = &m.maps[c.file as usize];
         let p = unsafe { pairs.get(t) };
         let sk = unsafe { skeys.get(t) };
+        let lb = unsafe { lblocks.get(t) };
         let mut sink = FnSink::<2, _>(|f: &[&[u8]; 2]| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
@@ -153,16 +159,18 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
             if a == b {
                 return; // self-link: no effect
             }
-            p.push((a, b));
-            sk[(hk(a) >> shift) as usize].push(a);
-            sk[(hk(b) >> shift) as usize].push(b);
+            p.push(0, (a, b), lb);
+            sk.push((hk(a) >> shift) as usize, a, lb);
+            sk.push((hk(b) >> shift) as usize, b, lb);
         });
         scan_lines::<2, _>(d, c.start, c.end, &mut sink);
+        Scatter::<Key>::fence();
     });
     let t_parse = t0.elapsed();
-    let pairs = pairs.into_inner();
-    let skeys = skeys.into_inner();
-    let npairs: usize = pairs.iter().map(|p| p.len()).sum();
+    // [thread] -> the pair list; [thread][shard] -> a key list
+    let pairs: Vec<BList<(Key, Key)>> = pairs.into_inner().into_iter().map(|s| s.finish().pop().unwrap()).collect();
+    let skeys: Vec<Vec<BList<Key>>> = skeys.into_inner().into_iter().map(|s| s.finish()).collect();
+    let npairs: usize = pairs.iter().map(|p| p.len).sum();
     if npairs == 0 {
         return LinkTab::new(0);
     }
@@ -170,16 +178,18 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     let maps = PerThread::new(shards, || KMap::<Key>::with_capacity(16));
     let shard_keys = PerThread::new(shards, Vec::<Key>::new);
     par_for(shards, threads, |_t, s| {
-        let n: usize = skeys.iter().map(|v| v[s].len()).sum();
+        let n: usize = skeys.iter().map(|v| v[s].len).sum();
         let mut mp = KMap::<Key>::with_capacity(n * 3 / 4 + 16);
         let ks = unsafe { shard_keys.get(s) };
         for v in &skeys {
-            for &k in &v[s] {
-                let (_, ins) = mp.entry(k, ks.len() as Key);
-                if ins {
-                    ks.push(k);
+            v[s].for_each_slice(|sl| {
+                for &k in sl {
+                    let (_, ins) = mp.entry(k, ks.len() as Key);
+                    if ins {
+                        ks.push(k);
+                    }
                 }
-            }
+            });
         }
         unsafe { *maps.get(s) = mp };
     });
@@ -200,19 +210,20 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     let ipairs = PerThread::new(threads, Vec::<(u32, u32)>::new);
     par_for(pairs.len(), threads, |t, i| {
         let out = unsafe { ipairs.get(t) };
-        out.reserve(pairs[i].len());
+        out.reserve(pairs[i].len);
         // the shard maps are far larger than the cache: fetch the lines of
         // the pair a few steps ahead while translating this one
         const AHEAD: usize = 8;
-        let ps = &pairs[i];
-        for (j, &(a, b)) in ps.iter().enumerate() {
-            if let Some(&(pa, pb)) = ps.get(j + AHEAD) {
-                let (ha, hb) = (hk(pa), hk(pb));
-                prefetch(maps[(ha >> shift) as usize].slot_ptr(ha));
-                prefetch(maps[(hb >> shift) as usize].slot_ptr(hb));
+        pairs[i].for_each_slice(|ps| {
+            for (j, &(a, b)) in ps.iter().enumerate() {
+                if let Some(&(pa, pb)) = ps.get(j + AHEAD) {
+                    let (ha, hb) = (hk(pa), hk(pb));
+                    prefetch(maps[(ha >> shift) as usize].slot_ptr(ha));
+                    prefetch(maps[(hb >> shift) as usize].slot_ptr(hb));
+                }
+                out.push((gidx(a), gidx(b)));
             }
-            out.push((gidx(a), gidx(b)));
-        }
+        });
     });
     let ipairs = ipairs.into_inner();
     let t_xlate = t0.elapsed();
@@ -239,7 +250,9 @@ fn build_links(data: &Path, threads: usize, arena: &Arena, prefault: usize) -> L
     // start of the record arena, which the parse threads would otherwise
     // have to wait for page by page.
     let stop = std::sync::atomic::AtomicBool::new(false);
-    let pf_next = AtomicUsize::new(0);
+    // the link lists already took (and touched) the first blocks
+    let pf_next = AtomicUsize::new(arena.used() & !((2 << 20) - 1));
+    let prefault = if prefault > 0 { prefault + arena.used() } else { 0 };
     let mut nmoved = 0usize; // IDs that are not a root = unions made
     std::thread::scope(|sc| {
     if prefault > 0 {
@@ -466,7 +479,11 @@ fn main() {
     // Plus one partial block per list. The reservation is address space only.
     let partial = ((1usize << p1_bits()) + 2 * (1usize << p2_bits())) * threads * BLK;
     let est = ev_bytes / 78 * 32 + cl_bytes / 40 * 32 + partial * 2 + (256 << 20);
-    let arena = Arena::new(2 * ev_bytes + 4 * cl_bytes + partial + (64 << 20), est * 3 / 2);
+    // the link build keeps its pair and key lists in the arena too: 32 bytes
+    // per link line of at least 4 bytes, plus its partial blocks
+    let lk_bytes: usize = list_csv(&data.join("links")).iter().map(|p| std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0)).sum();
+    let lk_room = 8 * lk_bytes + ((1usize << LINK_SHARD_BITS) + 1) * threads * BLK;
+    let arena = Arena::new(2 * ev_bytes + 4 * cl_bytes + partial + lk_room + (64 << 20), est * 3 / 2 + lk_room);
     assert!(arena.cap() / 16 < u32::MAX as usize - 1, "input too large for 32-bit record indices");
     let abase = arena.base();
     eprintln!("mapped + arena at {:?}", t_start.elapsed());
