@@ -757,9 +757,9 @@ struct Scratch {
     cl: Vec<CRec>,
     cat_rev: Vec<u64>,
     touched: Vec<u16>,
-    starts: Vec<i64>,
-    runs: Vec<(i32, u32, u32)>,
-    ac: Vec<(u32, i64)>,
+    acnt: Vec<u32>,
+    apos: Vec<u32>,
+    active: Vec<u32>,
 }
 
 #[inline(never)]
@@ -877,9 +877,13 @@ fn process_partition(
     cat_rev.clear();
     cat_rev.resize(ncat, 0);
     let touched = &mut sc.touched;
-    let starts = &mut sc.starts;
-    let runs = &mut sc.runs;
-    let ac = &mut sc.ac;
+    if sc.acnt.len() < ctx.camp_names.len() + 1 {
+        sc.acnt = vec![0; ctx.camp_names.len() + 1];
+        sc.apos = vec![0; ctx.camp_names.len() + 1];
+    }
+    let acnt = &mut sc.acnt;
+    let apos = &mut sc.apos;
+    let active = &mut sc.active;
     let organic = ctx.camp_names.len() as u32;
     let ws = ctx.ws;
 
@@ -893,13 +897,12 @@ fn process_partition(
             cls.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
         }
         let person = gkeys[g];
-        starts.clear();
-        runs.clear();
         let mut cur_day: i32 = i32::MIN;
         let mut d_sess = 0u32;
         let mut d_events = 0u32;
         let mut d_rev = 0u64;
         let mut cj = 0usize;
+        let mut wlo = 0usize;
 
         let mut k = 0usize;
         let ne = evs.len();
@@ -939,9 +942,29 @@ fn process_partition(
             d_sess += 1;
             d_events += cnt;
             d_rev += rev;
-            // credit: latest click at or before the start, within 7 days; ties -> smallest click_id
+            // clicks in [start - 7d, start] form the window: credit picks the
+            // latest, every distinct campaign in it assists
             while cj < cls.len() && cls[cj].ts <= start {
+                let c = cls[cj].camp as usize;
+                if acnt[c] == 0 {
+                    apos[c] = active.len() as u32;
+                    active.push(c as u32);
+                }
+                acnt[c] += 1;
                 cj += 1;
+            }
+            while wlo < cj && cls[wlo].ts < start - WEEK_MS {
+                let c = cls[wlo].camp as usize;
+                acnt[c] -= 1;
+                if acnt[c] == 0 {
+                    let i = apos[c] as usize;
+                    let last = active.pop().unwrap();
+                    if last as usize != c {
+                        active[i] = last;
+                        apos[last as usize] = i as u32;
+                    }
+                }
+                wlo += 1;
             }
             let mut camp = organic;
             if cj > 0 {
@@ -959,57 +982,16 @@ fn process_partition(
             cell[0] += 1;
             cell[1] += purchase as u64;
             cell[2] += rev;
-            let si = starts.len() as u32;
-            match runs.last_mut() {
-                Some(r) if r.0 == day => r.2 = si + 1,
-                _ => runs.push((day, si, si + 1)),
+            for &c in active.iter() {
+                a.camp_cell(c as usize, di)[3] += 1;
             }
-            starts.push(start);
         }
         flush_user(a, person, cur_day, d_sess, d_events, d_rev, cat_rev, touched);
 
-        // assists: per campaign, union of [click, click + 7d], sessions counted per day
-        if !cls.is_empty() {
-            ac.clear();
-            ac.extend(cls.iter().map(|c| (c.camp, c.ts)));
-            ac.sort_unstable();
-            let mut q = 0;
-            while q < ac.len() {
-                let camp = ac[q].0;
-                let mut a_lo = ac[q].1;
-                let mut a_hi = a_lo + WEEK_MS;
-                q += 1;
-                loop {
-                    let more = q < ac.len() && ac[q].0 == camp;
-                    if more && ac[q].1 <= a_hi {
-                        a_hi = ac[q].1 + WEEK_MS;
-                        q += 1;
-                        continue;
-                    }
-                    let lo = starts.partition_point(|&s| s < a_lo) as u32;
-                    let hi = starts.partition_point(|&s| s <= a_hi) as u32;
-                    if lo < hi {
-                        for r in runs.iter() {
-                            if r.2 <= lo {
-                                continue;
-                            }
-                            if r.1 >= hi {
-                                break;
-                            }
-                            let c = hi.min(r.2) - lo.max(r.1);
-                            let di = (r.0 as i64 - ctx.day0) as usize;
-                            a.camp_cell(camp as usize, di)[3] += c as u64;
-                        }
-                    }
-                    if !more {
-                        break;
-                    }
-                    a_lo = ac[q].1;
-                    a_hi = a_lo + WEEK_MS;
-                    q += 1;
-                }
-            }
+        for &c in active.iter() {
+            acnt[c as usize] = 0;
         }
+        active.clear();
     }
 }
 
