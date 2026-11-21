@@ -222,6 +222,25 @@ Read: `OVERNIGHT_LOG.md` (experiment 1), `events.rs:234-262` (`scatter_chunk`), 
 - Read: 1.8 GB of input. Written: about 400 MB of records with non-temporal stores (`parse.rs:94-159`). Zeroed by the kernel first: the same 400 MB, when each 2 MiB block is populated (`parse.rs:180`). Total about 2.6 GB in 146 ms, 18 GB/s across 4 cores.
 - That is within what this class of machine streams, but it is not small, and the scorer's host is shared by 32 vCPUs. The 400 MB that is written twice (once as zeros, once as records) is the only part that could be removed, and only by writing fewer or smaller records; fresh anonymous memory cannot be had without the clear. Records are 16 bytes (`Rec`, `main.rs`), holding the slot, ingest time, timestamp, user and kind; I see no field that can be dropped without re-reading input later. **Closed** unless a later pass over `events.rs` shows a field the fast path never reads.
 
+## Iteration 5 (2026-11-21): record layout, the write stage, and what the board number is made of
+
+Read: `parse.rs:440-500` (record packing), `pqw.rs:76-124`, `:1056-1100` (`Out`, `UserFile`), `out.rs:500-560` (the write-stage scheduler).
+
+### 5.1 Closed: a smaller event record
+
+`Rec` is two words and every bit is used (`parse.rs:488-493`): `w0` = timestamp (31 bits) | price (24) | category (5) | alias (4); `w1` = slot in bucket (16) | ingest seconds (21) | user (27). The slot and ingest time are what `scatter_chunk` dedups on (`events.rs:238-241`), the rest is read by `stage3a`. Nothing can be dropped without a second look at the input. This closes 4.4's open question.
+
+### 5.2 The write stage: nothing found, one number wanted
+
+- `user_daily` pieces are streamed through a buffer flushed at 1 MiB (`Method::Stream(1 << 20)`, `out.rs:206`; `Out::flush`, `pqw.rs:88`), campaign files are written whole. Each flush is one `write_all`. The encoders are already specialised per column (`emit_user_ids`, `emit_zero_head`, `emit_null_head`).
+- The input region's `munmap` (`out.rs:541-546`) is taken by the first thread that has no shard to work on, before it takes a write piece. With the per-chunk release on, the pages are already gone and only page tables are freed (about 1,150 of them for 2.3 GB; **my estimate** 0.2 to 0.4 ms). Left alone.
+- The `tl` build already separates time inside `write` calls (`WR_IO`, `pqw.rs:91-95`). If that is more than half of the 9.4 ms, the stage is the kernel copying into the page cache and row 4 (early writeback) is the only lever; if it is small, the stage is encoding and I will read the encoders next. Please include that line with request 3.
+
+### 5.3 For the user: what the 0.35 s on the board is made of (my arithmetic on quoted numbers)
+
+- The test VM runs the process in 198.6 ms on a CPU whose cores run well above 4 GHz. The scorer is reported at 2.8 GHz. Scaling by clock alone gives roughly 280 to 310 ms in-process there, which with the reported 0.1 s outside the process would be 0.38 to 0.41 s, above the 0.35 s on the board. So either the scorer's cores run faster than 2.8 GHz under turbo, or the outside part is nearer 0.05 s. Both readings say the same thing: **in-process time is about 0.25 to 0.30 s of the score, and a 1% code gain is about 3 ms on a clock whose single draws differ by tens of ms.**
+- Consequence for picking the final commit: decide on the VM's interleaved A/B (±1 ms), never on one board draw. A change that is exact and not slower on the VM is safe to submit; whether it "helped on the board" is not knowable from one or two draws.
+
 ## Next passes (in this order)
 
 1. `events.rs` `stage3a` and `core.rs`: the 35 ms stage, pass by pass.
