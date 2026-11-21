@@ -1,6 +1,4 @@
 # label|ref|build-args|env
-k0|origin/gate-k0-e50641f||
-s1|origin/gate-s1-e50641f||DSTAGE=1
-s2|origin/gate-s2-e50641f||DSTAGE=2
-s3|origin/gate-s3-e50641f||DSTAGE=3
-s4|origin/gate-s4-e50641f||DSTAGE=4
+main|origin/gate-main-0e964c1||
+xk|origin/gate-xk-6720ae0||
+xk_off|origin/gate-xk_off-6720ae0||SS512=0
