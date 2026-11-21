@@ -1679,6 +1679,25 @@ Run [44891360079](https://github.com/nimaibhat/databricks-chall/actions/runs/448
 - **A measurement artifact to know about**: the build listed first in `variants.txt` runs first after the `cat` that warms the page cache and is 20% slower in-process on that run (ours: 0.98 s with 1.04 s of system time, against 0.78 s and 0.25 s warm). It is excluded from the medians, but the `ERR` phase lines of iterations 35 and 40 come from that run, so our phases there are overstated relative to the other builds'.
 - **What is left**: 0.2 CPU-seconds of user time against Vibhor7-7, which is the remaining parse diet of 38 (time-of-day check, room checks, type dispatch, repeated hash) and the mask early-exit of 39. Nothing structural.
 
+## Iteration 44 (2026-11-21, 05:20): one new measured idea from this cycle's competitor commits
+
+Pulled: Vibhor7-7 `765c6e2..b4025c3` (experiments 30 to 32), Th3r0n `4451e22..e196257`, joch44 `e0545a7..466a01a` (bug fixes for long IDs only). `OVERNIGHT_LOG.md` is at experiment 49, pick `dc58e98`; its queue is a wider arena pre-fault, the link build (36) and the remaining parse items (38, 39).
+
+### 44.1 Scatter stages and partition cursors on one huge page per thread
+
+- **Idea.** Vibhor7-7 experiment 32 ([`00ed09f`](https://github.com/Vibhor7-7/shopping-sessions/commit/00ed09f), [BENCH.md](https://github.com/Vibhor7-7/shopping-sessions/blob/b4025c3/BENCH.md) row 32): the write-combining buffers and per-partition states of all three streams were separate allocations on 4 KB pages, "about 125 pages a thread, one of them touched at random by every push and by the prefetch that announces it". Putting them in one 2 MB mapping per thread that asks for a huge page gave **-1.0 to -1.4% wall at 20M on Zen 4, -0.9 to -1.2% on Zen 3, -0.8 to -1.3% on Zen 5, -0.7 to -1.3% at 60M**, parse -1.0 to -1.9%. One thread: no change (the gain appears with two threads per core, which is the scorer's shape).
+- **Here.** `Scatter::new` (`mem.rs:201-205`) takes each stage area from the global allocator (`alloc_zeroed(parts * STG, 64)`: 64 KB at 512 partitions, 128 KB at 1024) and `cur` and `blocks` from `Vec`s. Three scatters per thread (`main.rs:527-529`) make about 200 to 400 KB per thread on 4 KB pages, 50 to 100 pages hit at random by every push; mimalloc does not ask for huge pages for allocations of that size (experiment 17 showed its large-page switch does nothing). The arena is already mapped with `MADV_HUGEPAGE` and 2 MB aligned (`Arena::new`), so the change is to carve one 2 MB-aligned region per thread out of the arena (or one extra mapping) and place the three stage areas and the three `cur` arrays in it; `blocks` (touched once per 32 KB block) can stay where it is.
+- **Expected gain.** About -1% wall, by the four runner measurements above; possibly more at 60M now that the partition count is 1024 there (experiment 47). It also removes about 100 of the 4 KB first-touch faults per thread.
+- **Risk to exactness.** None: same buffers, records and order. The arena reservation grows by 2 MB per thread. On a host that grants no huge pages it is neutral.
+- **Rank.** Above the mask early-exit (39): same size of gain, smaller change, measured on four CPUs.
+
+### 44.2 Smaller notes
+
+- Vibhor7-7 experiment 30 (suspect copies settled in a small table instead of a sort): dedup phase -15 to -17%, wall -0.3 to -1.3%. Ours already settles suspects in the exact table behind the bitmap prefilter (experiment 13); nothing to take.
+- Vibhor7-7 experiment 31 (`user_daily` written from its columns with `writev`, never assembled): -1.4 to -2.3% at 20M on Sapphire Rapids, -0.3 to -0.5% at 60M on Zen 3. Ours streams row groups from the workers since experiment 39, which is the same saving.
+- Vibhor7-7's log on kernel time: "the kernel's share is twice as large on Intel" (14.5% of CPU on Granite Rapids against 6.8% on Zen 3), the same asymmetry that made the optimizer's arena pre-fault pay only on Intel (experiment 48). It supports queue item 1 (pre-fault the rest of the arena in parallel before the parse).
+- Th3r0n: deferred name lookups resolved one table region at a time, day-major campaign counters, digit pairs with one multiply per word; no numbers logged, nothing ranked.
+
 ## Next iteration
 
 Each cycle: re-read `OVERNIGHT_LOG.md` and `git log` for new experiments, pull the 18 competitor clones for new commits, then one deep read from this queue:
