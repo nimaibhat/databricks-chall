@@ -86,6 +86,21 @@ Fresh numbers for 9363748 (`v21p`), research 18.1. One run each, VM tmpfs, 8 CPU
 
 Upstream note: `jason-scheffel/express-lane` added, at 612962f (16:23), a notice in every file opting the repository out of use by other teams and their tools during the event. Nothing has been taken from it at or after that commit, and nothing more will be.
 
+Experiment 18, on 9363748 (`v21p`). All rejected; main unchanged.
+
+- Staging prefetch pre-pass (research 19, change A) in `EvPart::push_many`'s full-batch path, read intent (`pf1`) and write intent (`pf2`), 11 rounds: 30M 300.5 and 299.5 against 298.3; 20M 196.1 and 196.6 against 195.3. Parse +1 to +3. Rejected.
+- Compiler flags, 9 rounds at 20M, control 196.5 / 199.9: no branch-boundary padding 196.6 / 200.3; `-align-loops=32` 196.6 / 199.3; `-align-loops=64` 195.7 / 198.2; padding without the prefix limit 197.2 / 199.6; `-prefer-256-bit` off 215.0 / 218.2 (parse +18). Rejected.
+- Build-time constants sweep (25 variants) was started and abandoned unmeasured when upstream moved.
+- Upstream c7d4aa4 ("write rows during stage 3, lighter sinks and driver", on top of 2398c62 "cut work per event line and per record"), taken at the user's explicit request after the opt-out notice. `j3` as is, `j3s` with 64 MiB chunk and prefetch 512. Gate clean for both (36/36, dev, seed 20; `j3s` equal to 941879e at NCPU 8, 2, 1 on seeds 7 and 3). 11 rounds, wall min / med:
+
+| Set | v21p | j3 | j3s |
+|---|---|---|---|
+| 20M seed 20 | 197.3 / 199.4 | 198.5 / 199.7 | 198.3 / 199.8 |
+| 20M seed 7 | 200.4 / 203.4 | 199.9 / 204.0 | 198.4 / 202.2 |
+| 30M seed 6 | 299.1 / 303.0 | 299.4 / 300.3 | 296.2 / 299.9 |
+
+Stages at 20M seed 20: write 7.2 to 5.3, ev3a 34.0 to 36.0, parse level. On this VM the two cancel: -2 to +1 ms, inside the noise. Not kept on main. `j3s` is on branch `upstream-c7d4aa4` (d3e8178) so it can be tried on the scorer, where the output directory may cost differently from this VM's disk.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
