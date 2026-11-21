@@ -38,6 +38,7 @@ runone() { # ds label envs keep
   es=$(grep -oE '^epoch_start [0-9.]+' $out.err | awk '{print $2}'); ed=$(grep -oE '^epoch_done [0-9.]+' $out.err | awk '{print $2}')
   pre=""; post=""; [ -n "$es" ] && pre=$(echo "$es - $t0" | bc); [ -n "$ed" ] && post=$(echo "$t1 - $ed" | bc)
   echo "$ds $label rc=$rc wall=$w pre=$pre post=$post | $ph" >> /tmp/results.txt
+  [ -n "$keep" ] && head -c 6000 $out.err | sed "s/^/ERR $ds $label: /"
   if [ -n "$keep" ]; then sudo chmod -R a+rwX $out; rm -rf /tmp/out_${ds}_$label; mv $out /tmp/out_${ds}_$label; else sudo rm -rf $out; fi
   sudo rm -rf $scr $out.err
 }

@@ -1,5 +1,6 @@
 # label|ref|build-args|env
 ours|origin/main||
-team67|ext:hansliu-dev/676767@68ea737||
 cheryl|ext:cherylaurelia/builders-hackathon@2e4261f||
 vibhor|ext:Vibhor7-7/shopping-sessions@bee0cbf||
+micah|ext:micah-andelman/shopping-sessions@2b46b02||
+joch|ext:joch44/shopping-sessions@3261746||
