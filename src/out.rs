@@ -135,24 +135,43 @@ pub fn write_all(outdir: &Path, ctx: &Ctx, mut accs: Vec<Acc>) {
         let cd = &cd;
         s.spawn(move || {
             let ncamp = ctx.camp_names.len();
-            let (mut ib, mut ie, mut chb, mut che) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            // rows come campaign by campaign: campaign_id and channel are
+            // dictionary runs, day a small dictionary; counts are INT32 when
+            // they fit (any integer width is accepted)
+            let (mut ib, mut ie, mut iruns) = (Vec::new(), Vec::new(), Vec::<(u32, u32)>::new());
+            let (mut chb, mut che, mut chruns) = (Vec::new(), Vec::new(), Vec::<(u32, u32)>::new());
+            let mut chan_ix: Vec<(Vec<u8>, u32)> = Vec::new();
             let (mut days, mut c0, mut c1, mut c2, mut c3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for c in 0..=ncamp {
+                let mut first = true;
                 for d in 0..ndays {
                     let v = camp[c * ndays + d];
                     if v[0] == 0 && v[3] == 0 {
                         continue;
                     }
-                    if c == ncamp {
-                        ib.extend_from_slice(b"organic");
-                        chb.extend_from_slice(b"organic");
-                    } else {
-                        ib.extend_from_slice(&ctx.camp_names[c]);
-                        chb.extend_from_slice(&ctx.camp_channels[c]);
+                    let (name, chan): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { (&ctx.camp_names[c], &ctx.camp_channels[c]) };
+                    if first {
+                        first = false;
+                        ib.extend_from_slice(name);
+                        ie.push(ib.len() as u32);
+                        iruns.push((ie.len() as u32 - 1, 0));
+                        let ci = match chan_ix.iter().find(|x| x.0 == chan) {
+                            Some(x) => x.1,
+                            None => {
+                                chb.extend_from_slice(chan);
+                                che.push(chb.len() as u32);
+                                chan_ix.push((chan.to_vec(), che.len() as u32 - 1));
+                                che.len() as u32 - 1
+                            }
+                        };
+                        match chruns.last_mut() {
+                            Some(r) if r.0 == ci => {}
+                            _ => chruns.push((ci, 0)),
+                        }
                     }
-                    ie.push(ib.len() as u32);
-                    che.push(chb.len() as u32);
-                    days.push((ctx.day0 + d as i64) as i32);
+                    iruns.last_mut().unwrap().1 += 1;
+                    chruns.last_mut().unwrap().1 += 1;
+                    days.push(d as u32);
                     c0.push(v[0] as i64);
                     c1.push(v[1] as i64);
                     c2.push(v[2] as i64);
@@ -160,15 +179,22 @@ pub fn write_all(outdir: &Path, ctx: &Ctx, mut accs: Vec<Acc>) {
                 }
             }
             let n = days.len();
-            let plain = |name: &'static str, logical: Logical, v: Values| Column { name, logical, def: None, enc: Enc::Plain(v) };
+            let ints = |name: &'static str, v: Vec<i64>| -> Column {
+                let enc = if v.iter().all(|&x| (0..=i32::MAX as i64).contains(&x)) {
+                    Enc::Plain(Values::I32(v.into_iter().map(|x| x as i32).collect()))
+                } else {
+                    Enc::Plain(Values::I64(v))
+                };
+                Column { name, logical: Logical::None, def: None, enc }
+            };
             let cols = [
-                plain("campaign_id", Logical::Utf8, Values::Str { bytes: ib, ends: ie }),
-                plain("channel", Logical::Utf8, Values::Str { bytes: chb, ends: che }),
-                plain("day", Logical::Date, Values::I32(days)),
-                plain("sessions", Logical::None, Values::I64(c0)),
-                plain("purchasing_sessions", Logical::None, Values::I64(c1)),
-                plain("revenue_cents", Logical::None, Values::I64(c2)),
-                plain("assisted_sessions", Logical::None, Values::I64(c3)),
+                Column { name: "campaign_id", logical: Logical::Utf8, def: None, enc: Enc::Dict { dict: Values::Str { bytes: ib, ends: ie }, idx: Idx::Runs(iruns) } },
+                Column { name: "channel", logical: Logical::Utf8, def: None, enc: Enc::Dict { dict: Values::Str { bytes: chb, ends: che }, idx: Idx::Runs(chruns) } },
+                Column { name: "day", logical: Logical::Date, def: None, enc: Enc::Dict { dict: Values::I32((0..ndays as i32).map(|d| ctx.day0 as i32 + d).collect()), idx: Idx::Each(days) } },
+                ints("sessions", c0),
+                ints("purchasing_sessions", c1),
+                ints("revenue_cents", c2),
+                ints("assisted_sessions", c3),
             ];
             pq::write(&cd.join("part-0.parquet"), &cols, n).expect("write campaign_daily");
         });
