@@ -262,6 +262,8 @@ Experiment 52 (boundary-value check on `k7`, 862289c; nothing changed): after th
 
 Experiment 53 (other sizes on `k7`, 862289c; nothing changed): in case the final is not exactly 60M. Data on disk, compared with the independent pre-overhaul implementation, no fallback in any run: seed 4, 33M events: 1,024 / 1,024 partitions (first / second stage), 0.64 s, 1.49 GB, MATCH. Seed 5, 48M: 2,048 / 2,048, 0.95 s, 2.08 GB, MATCH. Seed 9, 75M: 4,096 / 2,048, 3.06 GB, MATCH (16.4 s wall, but that run read 7 GB from a cold disk; not a timing). So both partition-count steps between 20M and 75M are covered.
 
+Experiment 54 (build check, nothing changed): the committed tree of 862289c (`git archive`, so only tracked files) built from scratch on the VM with `docker build --no-cache` gives an 8.29 MB image whose `/pipeline` is byte-identical to the tested binary `k7`. So what the scorer builds from the hash is what was gated and timed.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
