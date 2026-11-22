@@ -329,6 +329,9 @@ fn main() {
     if std::env::var("XL_ALLOC").map_or(true, |v| v == "1") {
         sys::alloc_enable();
     }
+    if std::env::var("XL_PMB").is_ok_and(|v| v == "0") {
+        sys::BIG_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(v) = std::env::var("XL_DONATE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
         sys::DONATE_DIV.store(v, std::sync::atomic::Ordering::Relaxed);
     }
@@ -416,6 +419,11 @@ fn main() {
                 s.push_str(&format!("{n}={ms:.1} "));
             }
             eprintln!("[v3b] setup ms: {s}; exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        match std::env::var("XL_PMX").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2) {
+            1 => sys::exit_release(g.nt, unsafe { &parse::FDS }),
+            2 => sys::exit_release_pieces(g.nt, unsafe { &parse::FDS }),
+            _ => {}
         }
         unsafe { sys::_exit(0) }
     }
