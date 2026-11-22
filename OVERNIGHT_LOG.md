@@ -228,6 +228,10 @@ Experiment 42 (readings on `k5p`, nothing changed):
 
 Experiment 43 (reading on `k5p`, nothing changed; closes research idea 1 of 23:45): 30 runs at 60M with default settings, the `links` lap never exceeded 2 ms (0 of 30). The two waits seen in experiment 40 (23 and 49 ms) were both under non-default knobs (`XL_V3T2=3072`, `XL_V3M1=11`), which we do not ship. So the links thread is not on the critical path at 60M with the shipped defaults, and moving the per-partition link list into `p1_thread` (which would need a concurrent `find`) has nothing to recover. Not attempted.
 
+Experiment 44 (not kept; correction to experiment 43):
+- **Packed stage arrays again, more rounds.** `pk1` against `k5p`, 31 rounds at 20M, wall min / med: `k5p` 466.4 / 470.0, `pk1` 465.2 / 468.2. 11 rounds at 60M: `k5p` 1451.6 / 1487.9, `pk1` 1450.0 / 1485.6 (peak 3.39 against 3.35 GB). The gain is 1 to 2 ms at both sizes. Closed; not worth a second patch on upstream's file.
+- **Correction on the links wait.** One of the 11 `k5p` runs at 60M in this comparison, with default settings, showed `links=60.4` (that run's wall was the maximum, 1543 ms). So the wait does happen with the shipped defaults, roughly once in 40 runs (1 of 41 across experiments 43 and 44), costing about 50 ms when it does, about 1 ms on average. Experiment 43's statement that it only happens under non-default knobs is wrong. It is still too rare to justify a concurrent `find` in `p1_thread`; a cheaper fix would be worth having if the research session sees one (for example why the links thread is late in those runs: it is a ninth thread on 8 CPUs).
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
