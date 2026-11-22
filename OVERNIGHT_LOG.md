@@ -219,6 +219,8 @@ Experiment 40 (checks on `k5p`, 60f2fae; nothing changed):
 - **Research idea 3, links wait at 60M.** The `links` lap is 0.2 to 0.3 ms in most 60M runs but 23 and 49 ms in two of forty, so the link thread is occasionally the critical path at 60M.
 - **Knobs at 60M**, 5 rounds, wall min / med, base 1475 / 1492: `T2` 1536: 1469 / 1506; 3072: 1459 / 1500; `M2` 12: 1472 / 1508; `M1` 13: 1509 / 1512; 11: 1492 / 1517; `T1` 20: 1484 / 1523; 80: 1493 / 1496. Nothing beats the defaults at the final's size; run-to-run spread at 60M is about 20 ms.
 
+Experiment 41 (not kept, research idea 1 of 23:25): the `WBins` and `VB` stage arrays (np x 256 B each, about 256 KiB, each rounded up to its own 2 MiB block by `anon`) carved out of shared 2 MiB blocks instead (`pk1`). Huge-page faults per 20M run 673 to 620 (106 MB less zeroed), peak RSS 1389 to 1305 MB. 13 rounds, wall min / med: `k5p` 469.6 / 479.5, `pk1` 465.0 / 477.1. That is 2 to 4 ms, inside noise, and it is one more patch to carry across upstream's fast-moving `v3b.rs`; not kept. If upstream slows down it is a safe small gain to put back. The census line of `k5p` shows where the rest of the fresh memory goes at 20M: event lanes 66,780 + 42,368 + 8,194 chunks of 4 KiB (459 MB), click lanes 33,199 chunks (130 MB), pass-one blocks 37,090 chunks (145 MB) while 47,337 released chunks (185 MB) are still on the free list at that point.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
