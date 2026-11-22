@@ -238,6 +238,11 @@ Experiment 45 (kept): upstream 1cda738 (five commits since c4a033b: dedup kernel
 - Our 768 is still worth 9 ms at 20M and neutral at 60M. Re-sweep on `k6p` at 20M (5 rounds, min / med, base 401.6 / 406.9): `T2` 512: 401.3 / 403.7; 1024: 401.5 / 403.3; 1536: 402.2 / 403.9; `M2` 12: 401.5 / 403.8; 10: 403.5 / 405.3. Flat around 768; left as is.
 - Line numbers in the research table refer to c4a033b and have moved.
 
+Experiment 46 (checks on `k6p`, 5f2fda8; nothing changed):
+- **More seeds, exactness.** Seeds 2, 3, 5, 11, 42, 99 at 3M events and 1,000 / 5,000 / 200,000 events (seed 8): `k6p` equals the independent pre-overhaul implementation on all nine, no fallback taken. `k6p --generic` at 60M: 10.2 s, 11.8 GB, equal to the reference.
+- **Research idea 1 of 00:45 (link table built twice?).** 40 runs at 60M with `XL_TIMING`: the `[v3b] links:` line was printed exactly once in every run (slots=2568 each time), so no retry happened, and the `links` lap was 4 to 5 ms in all 40 (clicks now run after dedup, so the lap is no longer near zero, but there was no long wait). Link thread times vary a lot between runs (uf 281 to 380 ms, out 155 to 253 ms), which fits a ninth thread being descheduled rather than a rebuild. Not confirmed; nothing to change.
+- **Profile at 20M:** `ev_loop` 20.0%, `kernel_init_pages` 8.6%, `run::{closure#15}` 6.2%, `ev_batch` 5.9%, `run::{closure#16}` 3.8%, `finish_person` 3.3%, `cl_loop` 3.3%, `build_links` 3.2%, `ua_events` 2.8%. Faults 31,750 (27,410 of them by the end of parse); RSS after parse 569 MB, at end 976 MB, all on huge pages. Thread-ms: dd.table 375, dd.gather 102, dd.emit 66, p1.short 254, p1.gather 201, p1.group 109, p2.walk 271, lk.uf 136, wr.users 111, wr.camp 64. The scanner is now the largest single item (parse 170 of 402 ms).
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
