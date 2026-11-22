@@ -2,27 +2,62 @@
 
 Written for the coding agent. These notes cover the rules as changed on 2026-11-21 (opaque variable-width IDs, final on about 60M events). Everything written for the old ID format was removed from this file; it is in git history up to `0f4ee43` and none of it is evidence for the new path.
 
-Read against `fcd9075` (upstream `ff78d19` plus the two constants) and `OVERNIGHT_LOG.md` up to experiment 28. Line numbers are for `src/v3b.rs` at that commit unless a file is named.
+Read against `7de923f` (upstream `7c69e3e` plus the input release and the two constants) and `OVERNIGHT_LOG.md` up to experiment 31. `sess_thread` and `person` are unchanged since `fcd9075`; line numbers below for those two are for `7de923f` (`person` starts at line 1732, `sess_thread` at 1550). Older sections further down still carry `fcd9075` line numbers and are marked closed where the log closed them.
 
 **Numbers:** "log" means measured by the coding agent and quoted from `OVERNIGHT_LOG.md`. "estimate" means my arithmetic, not a measurement. I cannot run the binary.
 
 **Which size to tune for:** the practice board runs 20M, the final runs about 60M. Where a setting helps one size and hurts the other, the 60M result is the one that decides the final score.
 
-## Top five untried
+## Top five untried (after experiment 31)
+
+Experiment 31 closed my whole first table (see the log at the bottom). What it left is one hard number: at 20M the sessions stage is 1,632 thread-ms, of which `person` is 852 and the grouping loop 578 (log). Counting the operations in `person` by hand I can account for about 300 of the 852. So the first item is a measurement, and the next three are the candidates it would choose between.
 
 | # | Idea | Where | Expected at 20M | Row risk |
 |---|---|---|---|---|
-| 1 | Recycle finished event-lane chunks as storage for the user lane during dedup | `dedup_thread` end of each partition; `WBins::chunk` | −14 ms (estimate), about −40 ms at 60M, and −0.4 GB peak | Low |
-| 2 | Take the largest partitions first in join and sessions | `run` before each `run_par`; `join_thread`, `sess_thread` claim loop | −5 ms on average (estimate), mostly removes a bad-luck tail; about −15 ms at 60M | None |
-| 3 | Read out `[v3b] st` and sweep `XL_PB0` (the brute-force assist limit) | `person`, line 1734 | Unknown until `st[5]` is read; possibly −10 ms or more | None (both paths exist and pass the gate) |
-| 4 | Account for the anonymous memory: 2.0 GB peak against about 1.3 GB that `v3b` needs by my count | `--features tl` allocation table; `src/setup.rs:1138–1196` | Up to −20 ms if old-path tables are still being touched (estimate, unconfirmed) | None |
-| 5 | Smaller write-combining stage in `WBins` (`SW` 24 to 8 or 12) | constants at lines 48–49 | Unknown sign; a two-constant test | None |
+| 1 | Turn the cycle counters in `person` back on for one diagnostic run and paste `[v3b] st` | `person`: `c0`…`c4` are all the constant `0u64` now, so "person Mcycles" prints zeros | No gain itself; splits 852 thread-ms into buckets / rows and purchases / click sort / click walk | None (diagnostic build only) |
+| 2 | Bitmask assists for people with at most 64 sessions | `person`, the `brute` branch and the loop over `t.sess` | Up to −20 ms if the click walk is most of the unexplained 550 thread-ms (estimate, depends on 1) | Moderate: new logic on `assisted_sessions` |
+| 3 | Category totals without the 32-wide table per row | `person`, the `if !t.sb.pp.is_empty()` block | −3 to −5 ms (estimate) | Low |
+| 4 | One 32-byte entry per ID in `KTab` instead of separate `keys` and `vals` arrays | `KTab` (struct, `get`, `insert`, `grow`) | −3 to −8 ms off the 578 thread-ms grouping loop (estimate) | None |
+| 5 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | Safety, not speed | — |
 
-Releasing input chunks after parsing (my former number 1) was done independently as experiment 29 and kept: −14 ms at 20M and −37 ms at 60M measured, against my estimates of −15 and −45. See the log at the bottom.
+### 1. The measurement
 
-Details for each are below, followed by lower-ranked ideas, the measurements I need, two safety checks, and what the generator does and does not guarantee.
+`person` has timing points `c0`, `c1`, `c2`, `c3`, `c4` that feed `prof[13..15]` and `st[8..10]`, but each is `let cN = 0u64;`. Put `unsafe { core::arch::x86_64::_rdtsc() }` back for one build and paste the `[v3b] prof` and `[v3b] st` lines at 20M. The useful fields:
 
-## What the log already says about where time goes
+- `prof[13]` bucket pass, `prof[14]` rows and purchases, `prof[15]` everything to do with clicks.
+- `st[9]` click sort, `st[10]` click walk including brute-force assists.
+- `st[5]` brute-force inner iterations, `st[6]` assists actually added, `st[7]` people on the non-brute path, `st[11]` timestamp ties.
+
+My hand count for the 852 thread-ms, all estimates: bucket pass 80, bucket scan and session rows 85, name text 27, purchases 40, click sort about 60, leaving roughly 550 that I can only place in the click walk and the accumulator updates. Experiment 31 supports that reading indirectly: turning brute force off entirely (`XL_PB0=0`) cost 15 ms of wall, so the other assist method is dearer still, and assists are expensive by either method.
+
+### 2. Bitmask assists (do after 1, only if `st[10]` is large)
+
+For a person with at most 64 sessions (nearly everyone; whales keep the existing non-brute path):
+
+1. Sessions are already in start order. Build one 64-bit mask per day the person has sessions on (`day_mask[d]`, at most 15).
+2. Walk the clicks in time order (`k64` is already sorted). For each click, the sessions it can assist are the contiguous index range from the first session starting at or after the click to the last session starting within 7 days of it. Both ends only move forward as clicks advance, so two indices suffice.
+3. OR that range into `mask[campaign]`. Use the existing `stamp`/`serial` trick to reset a campaign's mask the first time this person touches it, and keep a short list of the campaigns touched.
+4. For each touched campaign and each day: `acc.assist(slot(c, day), popcount(mask[c] & day_mask[day]))` when non-zero.
+
+Cost is about `clicks + touched campaigns × days`, against `sum over sessions of clicks in the window` now. The credited campaign (latest click, smallest `click_id` on a tie) is untouched: keep that code as it is.
+
+Exactness: a session is assisted by campaign `c` exactly when some click of `c` has `start − 7d <= click.ts <= start`, which is the same as the session index lying in that click's range; the OR over clicks is "at least one"; the popcount per day is the number of such sessions that day. Boundary cases to test are the ones the generator plants: a click exactly 7 days before, 7 days + 1 ms before, exactly at, and 1 ms after a session start.
+
+### 3. Category totals
+
+Today, for every person with a purchase, `sb.cs` is resized to `rows × 32` zeroed words and then every row with revenue scans all 32. Most people have one or two purchases. Cheaper: sort `sb.pp` entries by `(row, category)` after mapping each to its row (it is a handful of items), then one pass sums runs and keeps the best per row; ties already resolve to the lowest category index because the scan order is ascending. For people with many purchases keep the table. Row risk is low but not none: `top_category` ties must still go to the lowest index.
+
+### 4. `KTab` layout
+
+Each event does `slots[s]` then `keys[i]` then `vals[i]`: three dependent loads from three arrays. Storing `(Key, u32)` together in one 32-byte, 32-aligned entry makes it two loads and one cache line. The table holds about 700 IDs per partition, so everything is in L1 or L2 already and the gain is only the shorter dependency chain; hence the small estimate.
+
+### What I do not have an idea for
+
+The grouping loop (578 thread-ms, 29 ns per event per logical CPU) is three passes: look up the person, count, scatter. I looked for a way to fold the scatter and the bucket pass into one probe per event; the per-partition table it needs costs a sort that cancels the saving. I have no proposal there beyond item 4.
+
+## Earlier analysis (experiments 27 to 29), kept for reference
+
+### What the log said about where time goes
 
 From experiments 27 and 28 (log), 20M, `k1s`:
 
@@ -56,7 +91,7 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **Result (log, experiment 29).** Kept as `m1`. 20M: 682.6 to 668.2 median (−14). 60M: 2084 to 2047 (−37). Peak RSS 3.9 to 2.0 GB at 20M and 11.0 to 5.0 GB at 60M. The exit gap is gone; parse grew by 10 ms in-process because the unmapping now happens there, in parallel.
 
-## 1. Recycle finished event-lane chunks for the user lane
+## Closed: recycle finished event-lane chunks for the user lane (done upstream in `7c69e3e`, experiment 30)
 
 **What.** During dedup, once a thread has finished partition `p` (after the final `emit_rec` loop, line 1251), every full 4 KiB chunk listed in `me.ssl` and `me.wsl` for that partition is dead: nothing reads it again. Push those chunk addresses (only entries with length 512 words, which are whole chunks; not the partial last chunk and not the staging area) onto a per-thread free list. In `WBins::chunk` (line 77), pop from that free list before carving a new chunk from `anon(BLOCK)`. Only `t.u2` needs the free list; the simplest form is a raw pointer field on `WBins` that is set for `u2` and null for the others.
 
@@ -68,7 +103,7 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **Test.** Gate as usual, plus NCPU 1 and 2 (with one thread the recycling lag is the most extreme). Watch `minflt` in the `[v3b] pa` line: it should drop.
 
-## 2. Largest partitions first in join and sessions
+## Closed: largest partitions first (experiment 31: sessions stage has no idle tail at 20M)
 
 **What.** Before the join `run_par`, compute each second-stage partition's size (sum over threads of `u2.b` `nstages` for that partition, plus the click lane's), sort partition indices by size descending into a `Vec<u32>`, and have `join_thread` and `sess_thread` claim `order[cx.next.fetch_add(1)]` instead of the raw index. Dedup partitions are split by event ID and are even, so they need nothing.
 
@@ -78,7 +113,7 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **Risk.** None. Partition order affects only which thread's row buffer a row lands in, and row order does not matter.
 
-## 3. Read `[v3b] st`, then sweep `XL_PB0`
+## Closed: `XL_PB0` sweep (experiment 31: flat from 256 to 4096, worse outside)
 
 **What.** `person` (line 1596) has two exact ways to count assists. The brute-force one (lines 1764–1777) runs when `clicks × sessions <= KN[0]` (default 4096, set by `XL_PB0`): for every session it walks every click in the 7-day window. The other (lines 1783–1823) sorts by campaign and uses binary search.
 
@@ -90,7 +125,7 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **If `st[5]` is large,** there is a cheaper exact method for people with at most 64 sessions, described in idea 6.
 
-## 4. Account for the anonymous memory
+## Moot: account for the anonymous memory (peak is 4.0 GB at 60M after chunk reuse)
 
 **What.** After experiment 29 the input no longer counts toward peak RSS, so the 2.0 GB peak at 20M (log) is all anonymous memory. My count of what `v3b` writes is about 1.3 GB: compact event lane 0.26, wide event lane 0.16, click lane 0.14, user lane 0.36, moved lanes 0.15, rows 0.1, partial chunks about 0.15. That leaves roughly 0.5 to 0.7 GB unexplained. `kernel_init_pages` at 9.4% of samples points the same way: about 0.5 CPU-s of zeroing is more than 1.3 GB should cost at the VM's write bandwidth.
 
@@ -102,7 +137,7 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **Risk.** None: this removes work whose results the new path never reads.
 
-## 5. Smaller staging block in `WBins`
+## Closed: smaller staging block in `WBins` (experiment 31: 8 and 56 both slower than 24)
 
 **What.** `SW` (line 48) is 24 words, so each partition's staging block is 256 bytes with its header. With 2,048 second-stage partitions that is 512 KB per thread per lane, and two hyperthreads share a 1 MB L2. Try `SW = 8` (128 bytes per partition, one cache line per flush) and `SW = 12`. `CW % SW == 0` must hold: 504 divides by 8 and 12, not by 16.
 
@@ -176,3 +211,7 @@ I read the new generator source (`generator.zip` in the repo root).
 | Idea | Experiment | Result | My estimate |
 |---|---|---|---|
 | Release each input chunk after parsing | 29 (found independently by the coding agent) | Kept: −14 ms at 20M, −37 ms at 60M | −15 ms, −45 ms |
+| Recycle event-lane chunks | 30 (done upstream, `7c69e3e`) | Part of a −40 ms step with long IDs in the event loop; not separable | −14 ms |
+| Largest partitions first | 31 | Not built: thread-ms ÷ 8 equals the stage wall, so no idle tail at 20M | −5 ms average. Wrong at 20M; untested at 60M |
+| `XL_PB0` sweep | 31 | Flat 256 to 4096; 0 and 262144 are 15 ms worse | unknown |
+| `SW` 8 | 31 | Slower (632 to 638 median); 12 does not build | unknown sign |
