@@ -8,52 +8,45 @@ Read against `7de923f` (upstream `7c69e3e` plus the input release and the two co
 
 **Which size to tune for:** the practice board runs 20M, the final runs about 60M. Where a setting helps one size and hurts the other, the 60M result is the one that decides the final score.
 
-## Top five untried (after experiment 31)
+## Top five untried (after experiment 32)
 
-Experiment 31 closed my whole first table (see the log at the bottom). What it left is one hard number: at 20M the sessions stage is 1,632 thread-ms, of which `person` is 852 and the grouping loop 578 (log). Counting the operations in `person` by hand I can account for about 300 of the 852. So the first item is a measurement, and the next three are the candidates it would choose between.
+Experiment 32 switched the counters in `person` on and gave the split I asked for (log, 20M, thread-ms, 667,450 people): bins fill 121; sessions, rows and purchases 317; clicks 431 (no-click people 17, key build and sort 93, session walk 237, non-brute assists 84). It kept a branch-free assist loop and a one-purchase shortcut (−3 ms), rejected chunk prefetch, and declined the bitmask assists with a reason I accept: 15.2M click visits would become about 5M click steps plus about 8M per-day adds, which is not enough of a cut to justify new logic on an output column.
+
+The useful reading of those numbers is per person, not per event: the bins pass and the bucket scan together cost about 438 thread-ms, which is about 2,500 TSC cycles per person on a shared core, for a person who has about 30 events and 5 sessions.
 
 | # | Idea | Where | Expected at 20M | Row risk |
 |---|---|---|---|---|
-| 1 | Turn the cycle counters in `person` back on for one diagnostic run and paste `[v3b] st` | `person`: `c0`…`c4` are all the constant `0u64` now, so "person Mcycles" prints zeros | No gain itself; splits 852 thread-ms into buckets / rows and purchases / click sort / click walk | None (diagnostic build only) |
-| 2 | Bitmask assists for people with at most 64 sessions | `person`, the `brute` branch and the loop over `t.sess` | Up to −20 ms if the click walk is most of the unexplained 550 thread-ms (estimate, depends on 1) | Moderate: new logic on `assisted_sessions` |
-| 3 | Category totals without the 32-wide table per row | `person`, the `if !t.sb.pp.is_empty()` block | −3 to −5 ms (estimate) | Low |
-| 4 | One 32-byte entry per ID in `KTab` instead of separate `keys` and `vals` arrays | `KTab` (struct, `get`, `insert`, `grow`) | −3 to −8 ms off the 578 thread-ms grouping loop (estimate) | None |
+| 1 | Hybrid sessionizing: sort-and-walk for people with few events, bins only above a threshold | `person`, first half; the sort-and-walk code is in `738cc7d` (`person`, `t.pe[a..b].sort_unstable()` and the loop after it, with `flush_row` taking `touched`) | −10 ms, possibly more (estimate; see below) | Low: both methods have passed the full gate |
+| 2 | Iterate only the occupancy words a person touched | `person`: set a bit per `bi >> 6` during the fill, loop over that mask instead of `0..occ.len()` | −2 ms (estimate) | None |
+| 3 | One 32-byte entry per ID in `KTab` | `KTab` struct, `get`, `insert`, `grow` | −3 to −8 ms off the 578 thread-ms grouping loop (estimate) | None |
+| 4 | Is the sessions stage balanced at 60M? | compare its thread-ms ÷ 8 with its wall time in an existing 60M timing line | If there is a gap, largest-partitions-first is worth that gap; a whale partition is three times larger at 60M | None |
 | 5 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | Safety, not speed | — |
 
-### 1. The measurement
+### 1. Hybrid sessionizing
 
-`person` has timing points `c0`, `c1`, `c2`, `c3`, `c4` that feed `prof[13..15]` and `st[8..10]`, but each is `let cN = 0u64;`. Put `unsafe { core::arch::x86_64::_rdtsc() }` back for one build and paste the `[v3b] prof` and `[v3b] st` lines at 20M. The useful fields:
+**Evidence that bins cost the average person time.** When upstream replaced sort-and-walk with session bins (experiment 27), every stage got faster except sessions, which went from 189 to 205 ms (log). Other things changed in the same step, so this is suggestive, not proof.
 
-- `prof[13]` bucket pass, `prof[14]` rows and purchases, `prof[15]` everything to do with clicks.
-- `st[9]` click sort, `st[10]` click walk including brute-force assists.
-- `st[5]` brute-force inner iterations, `st[6]` assists actually added, `st[7]` people on the non-brute path, `st[11]` timestamp ties.
+**Why it is plausible.** With bins, every person pays a fixed price whatever their size: the scan over all 11 occupancy words, then for each occupied bucket three loads, three resets and an unpredictable "new session?" branch. Sorting 30 `u64` values is a few hundred cycles with the standard library's small-sort networks, and the walk after it is a simple loop. My count is about 640 real cycles per person for sort-and-walk against about 1,260 for bins (both estimates). Bins win for whales and shared-device people, where sorting hundreds of thousands of events is the dearer part.
 
-My hand count for the 852 thread-ms, all estimates: bucket pass 80, bucket scan and session rows 85, name text 27, purchases 40, click sort about 60, leaving roughly 550 that I can only place in the click walk and the accumulator updates. Experiment 31 supports that reading indirectly: turning brute force off entirely (`XL_PB0=0`) cost 15 ms of wall, so the other assist method is dearer still, and assists are expensive by either method.
+**What to build.** In `person`, if `b - a <= T`, run the old path: sort `t.pe[a..b]`, walk it cutting sessions on `ts - prev > GAP_MS`, accumulate per-day rows and category sums as `738cc7d` did. Otherwise run the bins path as now. Both must leave `t.sess` and the rows in the same form for the click half, which is unchanged. Make `T` a knob and try 32, 64, 128, 512 and "always sort" at both sizes.
 
-### 2. Bitmask assists (do after 1, only if `st[10]` is large)
+**Estimate.** If sort-and-walk halves the 438 thread-ms for the people under the threshold, that is about 200 thread-ms, 25 ms of wall. I am quoting −10 ms in the table because my cycle counts in this function have been too optimistic before.
 
-For a person with at most 64 sessions (nearly everyone; whales keep the existing non-brute path):
+**Risk.** Low. The sort key is the whole `w0` word; events with equal timestamps can come out in any order and the sums do not depend on it. The gate at `738cc7d` and at the current head covers each method on its own; the hybrid needs the gate again plus the 20M and 60M comparisons.
 
-1. Sessions are already in start order. Build one 64-bit mask per day the person has sessions on (`day_mask[d]`, at most 15).
-2. Walk the clicks in time order (`k64` is already sorted). For each click, the sessions it can assist are the contiguous index range from the first session starting at or after the click to the last session starting within 7 days of it. Both ends only move forward as clicks advance, so two indices suffice.
-3. OR that range into `mask[campaign]`. Use the existing `stamp`/`serial` trick to reset a campaign's mask the first time this person touches it, and keep a short list of the campaigns touched.
-4. For each touched campaign and each day: `acc.assist(slot(c, day), popcount(mask[c] & day_mask[day]))` when non-zero.
+### 2. Occupancy mask
 
-Cost is about `clicks + touched campaigns × days`, against `sum over sessions of clicks in the window` now. The credited campaign (latest click, smallest `click_id` on a tie) is untouched: keep that code as it is.
+Eleven `if m == 0 { continue }` tests per person, on words that are empty or not depending on which days the person was active, are hard to predict. A 16-bit mask of touched words, built during the fill at no extra load, turns them into one short loop. Saves an estimated 3 mispredictions per person. Only relevant for people still on the bins path after idea 1.
 
-Exactness: a session is assisted by campaign `c` exactly when some click of `c` has `start − 7d <= click.ts <= start`, which is the same as the session index lying in that click's range; the OR over clicks is "at least one"; the popcount per day is the number of such sessions that day. Boundary cases to test are the ones the generator plants: a click exactly 7 days before, 7 days + 1 ms before, exactly at, and 1 ms after a session start.
+### 3. `KTab` layout
 
-### 3. Category totals
+Each event does `slots[s]`, then `keys[i]`, then `vals[i]`: three dependent loads from three arrays. Storing `(Key, u32)` in one 32-byte entry makes it two loads and one cache line. The table holds about 700 IDs per partition, so everything is already in L1 or L2 and the gain is only the shorter chain.
 
-Today, for every person with a purchase, `sb.cs` is resized to `rows × 32` zeroed words and then every row with revenue scans all 32. Most people have one or two purchases. Cheaper: sort `sb.pp` entries by `(row, category)` after mapping each to its row (it is a handful of items), then one pass sums runs and keeps the best per row; ties already resolve to the lowest category index because the scan order is ascending. For people with many purchases keep the table. Row risk is low but not none: `top_category` ties must still go to the lowest index.
+### What I looked at and dropped
 
-### 4. `KTab` layout
-
-Each event does `slots[s]` then `keys[i]` then `vals[i]`: three dependent loads from three arrays. Storing `(Key, u32)` together in one 32-byte, 32-aligned entry makes it two loads and one cache line. The table holds about 700 IDs per partition, so everything is in L1 or L2 already and the gain is only the shorter dependency chain; hence the small estimate.
-
-### What I do not have an idea for
-
-The grouping loop (578 thread-ms, 29 ns per event per logical CPU) is three passes: look up the person, count, scatter. I looked for a way to fold the scatter and the bucket pass into one probe per event; the per-partition table it needs costs a sort that cancels the saving. I have no proposal there beyond item 4.
+- **Click sort (93 thread-ms):** about 12 clicks per person, already on the standard library's branch-free small sort. At most 4 ms to find; no proposal.
+- **Session walk (237 thread-ms):** about 410 TSC cycles per session, mostly short loops with unpredictable trip counts and second-level-cache accumulator updates. I have no restructuring that removes those without new logic on output columns.
+- **Bitmask assists:** declined by the coding agent in experiment 32 for the reason above. Closed.
 
 ## Earlier analysis (experiments 27 to 29), kept for reference
 
@@ -215,3 +208,6 @@ I read the new generator source (`generator.zip` in the repo root).
 | Largest partitions first | 31 | Not built: thread-ms ÷ 8 equals the stage wall, so no idle tail at 20M | −5 ms average. Wrong at 20M; untested at 60M |
 | `XL_PB0` sweep | 31 | Flat 256 to 4096; 0 and 262144 are 15 ms worse | unknown |
 | `SW` 8 | 31 | Slower (632 to 638 median); 12 does not build | unknown sign |
+| Counters in `person` | 32 | Done; gave the split used above | — |
+| One-purchase shortcut for category totals | 32 | Kept with a branch-free assist loop: sessions 202.3 to 198.6 at 20M, 616.5 to 600.2 at 60M | −3 to −5 ms |
+| Bitmask assists | 32 | Not built: visits would fall only from 15.2M to about 13M steps | up to −20 ms; too high |
