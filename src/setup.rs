@@ -405,9 +405,18 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
     let (ukey, ekey) = match (envkey("XL_UKEY"), envkey("XL_EKEY")) {
         (Some(u), Some(e)) => (u, e),
         _ => {
-            let Some(ukey) = keyrec::recover_user_key(&sample, &mut st) else { fallback("no user key") };
-            let Some(ekey) = keyrec::recover_event_key(&sample, ukey, Some(ws), &mut st) else { fallback("no event key") };
-            (ukey, ekey)
+            if crate::v3b::forced() {
+                crate::v3b::ON.store(true, Ordering::SeqCst);
+                (0, 0)
+            } else {
+                match keyrec::recover_user_key(&sample, &mut st).and_then(|u| keyrec::recover_event_key(&sample, u, Some(ws), &mut st).map(|e| (u, e))) {
+                    Some(k) => k,
+                    None => {
+                        crate::v3b::ON.store(true, Ordering::SeqCst);
+                        (0, 0)
+                    }
+                }
+            }
         }
     };
     if check {
@@ -937,9 +946,18 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         let k = match (envkey("XL_UKEY"), envkey("XL_EKEY")) {
             (Some(u), Some(e)) => (u, e),
             _ => {
-                let Some(ukey) = keyrec::recover_user_key(&sample, &mut st) else { fallback("no user key") };
-                let Some(ekey) = keyrec::recover_event_key(&sample, ukey, Some(ws), &mut st) else { fallback("no event key") };
-                (ukey, ekey)
+                if crate::v3b::forced() {
+                    crate::v3b::ON.store(true, Ordering::SeqCst);
+                    (0, 0)
+                } else {
+                    match keyrec::recover_user_key(&sample, &mut st).and_then(|u| keyrec::recover_event_key(&sample, u, Some(ws), &mut st).map(|e| (u, e))) {
+                        Some(k) => k,
+                        None => {
+                            crate::v3b::ON.store(true, Ordering::SeqCst);
+                            (0, 0)
+                        }
+                    }
+                }
             }
         };
         crate::sys::xm(48);

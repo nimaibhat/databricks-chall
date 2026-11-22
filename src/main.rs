@@ -12,6 +12,7 @@ mod parse;
 mod pqw;
 mod setup;
 mod sys;
+mod v3b;
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -407,6 +408,17 @@ fn main() {
     let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, nt, check)));
     sys::xm(10);
     lap("setup");
+    if v3b::ON.load(std::sync::atomic::Ordering::SeqCst) {
+        v3b::run(g, &outdir, timing || check);
+        if timing {
+            let mut s = String::new();
+            for (n, ms) in unsafe { sys::LAPS.iter() } {
+                s.push_str(&format!("{n}={ms:.1} "));
+            }
+            eprintln!("[v3b] setup ms: {s}; exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        unsafe { sys::_exit(0) }
+    }
     if std::env::var("XL_SORTBENCH").is_ok() {
         links::sort_bench(g);
         unsafe { sys::_exit(0) };

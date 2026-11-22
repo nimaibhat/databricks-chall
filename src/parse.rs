@@ -960,6 +960,9 @@ impl<'a> Ctx<'a> {
     #[inline(always)]
     fn token(&mut self, id: u64) -> u64 {
         if id & ID_ODD == 0 {
+            if id_is_long(id) {
+                fallback("long id (v2 sink)");
+            }
             return id;
         }
         self.raw_token(self.base + odd_offset(id) as u64, odd_len(id))
@@ -1524,6 +1527,9 @@ fn link_slow(c: &mut Ctx, buf: &[u8], s: usize, e: usize) {
     let ob = b.as_ptr() as usize - buf.as_ptr() as usize;
     let ia = crate::k_ref::parse_id(buf, (oa, oa + a.len()), b'u');
     let ib = crate::k_ref::parse_id(buf, (ob, ob + b.len()), b'u');
+    if id_is_long(ia) || id_is_long(ib) {
+        fallback("long id (v2 links)");
+    }
     if ia & ID_ODD == 0 && ib & ID_ODD == 0 {
         if let (Some((ua, aa)), Some((ub, ab))) = (g.normal(ia), g.normal(ib)) {
             if ua == ub {
@@ -2124,7 +2130,7 @@ mod tests {
                     _ => r.below(PBOUND as u64) as u32,
                 };
                 let price = if kind == 2 { [0, 1, 10_000_000, r.below(10_000_000) as u32 + 1][r.below(4) as usize] } else { 0 };
-                rows.push(EvRow { eid, uid, ts, ingest, kind, product, price });
+                rows.push(EvRow { eid, uid, ts, ingest, kind, product, price, ..Default::default() });
             }
             for (i, row) in rows.iter().enumerate() {
                 eb.eid[i] = row.eid;
@@ -2300,7 +2306,7 @@ mod tests {
                     4 => r.next() as i64,
                     _ => p.cbase + r.below(p.clen) as i64,
                 };
-                rows.push(ClRow { cid, uid, campaign, ts });
+                rows.push(ClRow { cid, uid, campaign, ts, ..Default::default() });
             }
             for (i, row) in rows.iter().enumerate() {
                 cb.cid[i] = row.cid;
