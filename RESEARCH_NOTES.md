@@ -12,40 +12,68 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 
 **What experiment 37 implies for 60M.** The 20M gain came from dedup writing to half as many lane heads, and 60M got none of it because its count stayed at the cap (2,048) while lowering the cap there (`XL_V3M2=10`) made `p1` partitions too big and gave nothing back. So at 60M the two stages want different partition counts. I do not have a cheap way to give them that; a two-step split would cost another pass. Noted so nobody re-sweeps the same knobs expecting a 60M gain.
 
-## Top five untried (after experiment 36)
+## Top five untried (after experiment 38)
 
-Experiment 36 put experiment 32's two changes back (my previous number 1) and kept them: −4 ms at 20M, −14 ms at 60M. The rest of the table moves up, with one new check.
+Experiment 38 measured my sort-and-walk idea out of contention (bin fill is only 43 of the 572 thread-ms in the unlinked lane) and named the best remaining lead itself: one run takes 802 huge-page faults, 1.6 GB of fresh anonymous memory, and zeroing it is 10.7% of all cycles, about 470 thread-ms. That is 0.29 thread-ms per MB, so every 100 MB not freshly touched is worth about 3.7 ms of wall at 20M (derived from the log's two numbers).
 
-| # | Idea | Where | Expected at 20M | Row risk |
-|---|---|---|---|---|
-| 1 | Sort-and-walk for people with few events, bins only above a threshold | `lane`, the `Lk::No` branch, and the first loop of `finish_person` | −10 ms (estimate) out of the 587 thread-ms short lane | Low |
-| 2 | Count radix buckets while copying a partition out, instead of in a second pass | `p1_thread` copy loop and the first loop of `group` | −2 to −4 ms (estimate) out of the 228 thread-ms group step | None |
-| 3 | Iterate only the occupancy words a person touched | `SBins::add` and the `for wi in 0..t.sb.occ.len()` loop in `finish_person` | −2 ms (estimate) | None |
-| 4 | At 60M, does the link union-find finish before parsing does? | compare `lk.uf` thread-ms with the parse stage wall in a 60M timing line | No gain if it does; if it does not, the parse stage is waiting on one thread and the union-find needs splitting | None (a reading) |
-| 5 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | Safety, not speed | — |
+My count of what the pipeline needs to write at 20M comes to about 1.1 GB (below), so about 0.5 GB is overhead I can only attribute by reading. The table is ordered by how sure I am the memory is really there.
 
-**On item 4.** `build_links` runs on whichever thread parses the last link chunk, alone, while the others parse. At 20M it takes 212 ms against a 247 ms parse stage, so it fits with 35 ms to spare. Both scale with input, but the union-find's tables outgrow the cache faster than parsing slows down (at 60M its hash table is about 100 MB), so the margin may be gone at the size that counts. If `lk.uf` at 60M is above the parse wall, tell me and I will write up a partitioned version.
+| # | Idea | Where | Fresh memory saved (estimate) | Expected at 20M | Row risk |
+|---|---|---|---|---|---|
+| 1 | One diagnostic run that prints bytes handed out per `anon()` call site and per allocator size class | `sys::anon`, `sys::Alloc::get`; the `tl` feature's `mp::add` already records call sites | — | Decides 2 to 4 | None |
+| 2 | Pack each thread's lane staging arrays into one block | `VB::new` (five per thread: `ck.s`, `ck.w`, `u2.s`, `u2.w`, `blk`), `WBins::new`, and the lane tables in `parse_thread` | about 100 MB | −4 ms | None |
+| 3 | Size the per-thread scratch vectors and the row buffers once, up front | `B3` vectors in `p1_thread` / `p2_thread`; `Rows` in `run` | 200 to 300 MB | −7 to −11 ms | None |
+| 4 | Recycle released lane chunks into every later lane, not only `u2.s` | `dedup_thread` release block (feeds only `t.u2.s.free`); `p1_thread` after a partition is copied out; `VB::chunk` | about 150 MB | −5 ms | Low |
+| 5 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | — | Safety, not speed | — |
+
+### What I count as necessary (20M, estimates)
+
+| Use | Size |
+|---|---|
+| Event lanes written by parse (16 bytes for about 76% of events, 32 for the rest) | 410 MB |
+| Half-filled last chunk per thread, partition and lane | 50 MB |
+| Click lanes | 110 MB |
+| User lane | 215 MB, but mostly recycled from event-lane chunks |
+| Blocks shipped from `p1` to `p2` for linked people | 90 MB |
+| Output rows and names | 100 MB |
+| Link tables in `build_links` and the relink arrays | 170 MB |
+| Parquet buffers | 50 MB |
+
+### 2. Staging arrays
+
+`anon()` rounds every request up to 2 MiB and asks for a huge page (`src/sys.rs`, `anon`). A `VB` staging array is `np × 256` bytes, 256 to 512 KB at the current partition counts, so each one zeroes a 2 MiB page for a fraction of that. There are five `VB`s and one `WBins` per thread plus the event-lane tables, on 8 threads: about 100 MB zeroed for about 25 MB used. Carving them from one per-thread block (or from one shared block, 64-byte aligned per thread) fixes it. The arrays are only ever indexed by partition, so nothing else changes.
+
+### 3. Scratch vectors and rows
+
+The custom allocator hands out power-of-two classes and a freed block is reused only by the same class (`Alloc::get`). A vector that grows by doubling to a final size `S` therefore touches about `2S` of fresh memory, and none of the smaller blocks is used again unless another vector happens to need that class.
+
+- `B3` has about twenty such vectors per thread (`es`, `es2`, `ps`, `ps2`, `cs`, `cs2`, the wide lanes, `flat`, `bw`, …) and each grows to the largest partition that thread meets, which for a whale's partition is megabytes. The largest partition size is known before `p1` starts (maximum over partitions of the summed `words(q)`), so each can be reserved once.
+- `Rows` (six vectors plus the name bytes, about 100 MB in total at 20M) can be reserved from the kept-event count divided by threads, with headroom.
+
+This is the item I am least able to size, which is why item 1 comes first.
+
+### 4. Wider recycling
+
+Today released event-lane chunks go only to `t.u2.s.free` (short user records). The wide user lane `u2.w`, the `p1`-to-`p2` block lane `blk`, and the click lanes all take fresh blocks. Two additions:
+
+- In `dedup_thread`, split the released chunks between `u2.s.free` and `u2.w.free` (or let `VB::chunk` fall back to a shared per-thread free list).
+- In `p1_thread`, once a partition's user and click lanes are copied out (after the last `copy_out` for that partition), their chunks are dead; release them into `blk.free`.
+
+Risk is the usual one for recycling: a chunk must not be reused while a reader still holds it. In `p1` the readers work on copies (`es`, `flat`), so the chunks are dead as soon as the copy is made. It is "low" and not "none" because `VB` has no release function yet and one must be written.
+
+### Closed by experiment 38
+
+- **Sort-and-walk for small people:** bin fill is 43 thread-ms; nothing to win. My estimate of −10 ms was wrong.
+- **Occupancy mask** and **count-while-copying:** not tested, but each was a 2 to 4 ms estimate in code where my last estimate was several times too high. Dropped from the table; they are described in git history at `c3c91bb` if wanted.
+- **Link union-find at 60M:** still an open reading (compare `lk.uf` with the parse wall in a 60M timing line).
+
+### The click part of `finish_person`
+
+Experiment 38 puts it at 385 thread-ms, about 48 ms of wall, the largest single piece of the back half. Experiment 32's split of the same code was: sort 93, session walk 237, non-brute assists 84. I have looked at this three times and still have no restructuring that is both cheaper and safe for `assisted_sessions`; the bitmask method was fairly rejected. I am leaving it without a proposal.
 
 ### Done: experiment 32's changes (experiment 36)
 
 The log says they "do not apply to the rewritten back half and are dropped for now". The code they touched is still there in the same shape: the stamp test in the brute-force assist loop (taken 77% of the time, so worth making branch-free) and the `rows × 32` category table that is cleared and scanned even for a person with one purchase. Both were gate-clean and moved the stage the same way at both sizes.
-
-### 1. Sort-and-walk for small people
-
-Now simpler than when I first proposed it, because in `lane` a person's events arrive as one contiguous slice of 32-bit relative times (`e.lo32() >> 1`).
-
-- **Why:** the bins method costs every person the same fixed work: clear-on-read of each occupied bucket, the scan over all 11 occupancy words, and an unpredictable "new session?" test per bucket. Experiment 32 measured bins fill plus scan at about 438 thread-ms for 667,450 people, about 2,500 TSC cycles each, for people averaging 30 events. When upstream introduced bins (experiment 27) sessions was the only stage that got slower, 189 to 205 ms.
-- **What:** in the `Lk::No` branch, if `j - i <= T`, copy the times to a small buffer, sort it (`u32`, the standard library's small sort is branch-free at this size), and walk it: new session when `t - prev > GAP_MS`, new row when the session's day changes, count events per row. Push `Sess` and rows exactly as the bins loop does. Purchases then need the session of a given time: with at most `T` events a linear or binary search over the session starts replaces `sb.si[bi]`. Above `T`, and in `p2_thread`, keep bins.
-- **Knob:** `T` at 16, 32, 64, 128 at both sizes.
-- **Risk:** low. Equal timestamps may sort in any order and nothing depends on it. The purchase-to-session lookup is the one new piece; a purchase belongs to the last session whose start is at or before its time.
-
-### 3. Occupancy mask
-
-Set bit `bi >> 6` of a 16-bit mask in `SBins::add`; in `finish_person` loop over the set bits of that mask instead of all words. Removes about eleven poorly predicted tests per person.
-
-### 2. Count while copying out
-
-`p1_thread` copies each partition's event words into `es`, then `group` reads `es` once to count and once to scatter. The total is known before the copy (`tot`, line 2227), so the bucket shift is known too, and the count can be taken in the copy loop. That removes one pass over 8 bytes per event. The same applies to the smaller lanes but only `es` is worth it.
 
 ### Exactness review of the new back half (by reading, `d9788a0`)
 
@@ -224,4 +252,5 @@ I read the new generator source (`generator.zip` in the repo root).
 | One-purchase shortcut for category totals | 32 | Kept with a branch-free assist loop: sessions 202.3 to 198.6 at 20M, 616.5 to 600.2 at 60M | −3 to −5 ms |
 | Bitmask assists | 32 | Not built: visits would fall only from 15.2M to about 13M steps | up to −20 ms; too high |
 | Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
+| Sort-and-walk for small people | 38 (diagnostic only) | Not built: bin fill is 43 of 572 thread-ms | −10 ms; wrong |
 | `KTab` layout | — | Dropped: upstream `c7ebaf9` removed the per-event lookup it targeted | −3 to −8 ms |
