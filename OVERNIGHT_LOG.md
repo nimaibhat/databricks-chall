@@ -193,6 +193,9 @@ Experiment 32: per-person work in the sessions stage (research table of 22:30).
 - **Rejected: prefetch of the next linked chunk** in `WBins::chunks` (used by dedup, join and sessions), `XL_PB3` = lines to prefetch, 7 rounds, wall min / med: off 619.2 / 631.9; 8 lines 617.1 / 631.3; 16: 622.5 / 631.8; 32: 631.1 / 639.4; 64: 630.9 / 641.4. No gain at 8, worse above. The chunk reads are not what limits these stages.
 - Idea 2 (bitmask assists) not built: the non-brute path already does the per-campaign interval walk, and the `XL_PB0` sweep (experiment 31) shows the split between the two paths is at its optimum.
 
+Experiment 33 (not kept): where the input release should run. `rl2` = main plus a switch: `XL_PB2=0` release inside the parse threads (main), `=2` release in a separate parallel pass right after parsing, `=1` no release. 20M, 9 rounds, wall min / med: in-thread 623.4 / 627.4 (parse 258.5); separate pass 616.8 / 623.5 (parse 256.3, pass included); none 633.5 / 639.9 (parse 247.4, in-process total 601 but 32 ms of exit). So the release itself still costs about 9 ms of wall in either form even on 8 threads (page-table and shootdown work does not parallelise well), against 32 ms at exit. The separate pass is 4 ms better at the median, inside noise; not changed.
+Parse-phase cycle split on main (`pa Mcycles`, 3.8 GHz): event sink 2260 (595 thread-ms of about 2050), click sink 645, second-pass scan 363, emit 624, write 497; the rest is the scanner and first-touch faults (minflt 31,796, all huge-page faults).
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
