@@ -2811,7 +2811,7 @@ pub fn run(g: &G, outdir: &str, timing: bool) {
             v.push(P3 { es: ELane::empty(), ew: ELane::empty(), ex: ELane::empty(), seen: Vec::new(), ssl: Vec::new(), wsl: Vec::new(), xsl: Vec::new(), cptr: Vec::new(), cands: Vec::new(), ctab: Vec::new(), dead: Vec::new(), out: Vec::new(), out3: Vec::new(), cyc: [0; 8] });
         }
     }
-    let b2 = bits_for(rows_est * 17, knob("XL_V3T2", 384) << 10, knob("XL_V3M2", 11).clamp(10, 16) as u32).max(10);
+    let b2 = bits_for(rows_est * 17, knob("XL_V3T2", 768) << 10, knob("XL_V3M2", 11).clamp(10, 16) as u32).max(10);
     unsafe {
         if KN[2] == 0 {
             KN[2] = 12;
