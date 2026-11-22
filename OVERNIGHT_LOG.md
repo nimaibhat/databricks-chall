@@ -172,6 +172,8 @@ New sets on tmpfs: `/mnt/t/n1` (seed 1, 1M: the dev set), `/mnt/t/n20` (seed 20,
 
 `j9` stages at 20M: parse 394, dedup 132, join 110, sessions 191, write 10 (total 839 in-process). Gate: 36/36 fixtures, old dev and new dev answer match (new dev also through Docker with the 24 GB / 8 CPU limits), outputs equal to `old73f8661` on both 20M sets and the 60M set, equal at NCPU 2 and 1. The image is now `rust:1-slim` with a static glibc target.
 
+Experiment 27: upstream ff78d19 ("compact event lane, bitmap dedup, session bins", `v3b.rs` only). `k1` as is, `k1s` with the two constants (kept on main). 7 rounds at 20M seed 20, wall min / med: `j9` 868.4 / 876.0, `k1` 679.8 / 682.3, `k1s` 681.2 / 684.0. Stages: parse 395 to 273, dedup 133 to 87, join 107 to 72, sessions 189 to 205, write level; peak memory 5.1 to 3.9 GB. 60M: 2.93 to 2.08 s, peak 15.0 to 11.0 GB. Gate: 36/36, old dev, new dev answer, 20M equal to the saved reference at NCPU 8, 2, 1, 60M equal. The two constants make no measurable difference on this path. (Note: a first gate run compared a stale root-owned output folder and was discarded.)
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
