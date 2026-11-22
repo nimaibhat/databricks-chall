@@ -2538,7 +2538,18 @@ fn finish_person(g: &G, odds: &[Vec<u8>], t: &mut T3, ppv: &mut Vec<u64>, cl: &m
         }
     }
     flush_row(t, d_day, d_ses, d_evs);
-    if !ppv.is_empty() {
+    if ppv.len() == 1 {
+        let v = ppv[0];
+        let bi = ((v >> 32) as u32 / GAP_MS as u32) as usize;
+        let price = (v as u32 >> 5) as u64;
+        let s = &mut t.sess[t.sb.si[bi] as usize];
+        s.rev += price;
+        s.purch = true;
+        let r = s.row as usize;
+        t.rows.rev[r] += price as i64;
+        t.rows.top[r] = (v & 31) as u8;
+        ppv.clear();
+    } else if !ppv.is_empty() {
         let nrows = t.rows.day.len() - row0;
         let sb = &mut t.sb;
         sb.cs.clear();
@@ -2629,10 +2640,9 @@ fn finish_person(g: &G, odds: &[Vec<u8>], t: &mut T3, ppv: &mut Vec<u64>, cl: &m
                 for &k in &k64[lo..hi] {
                     let c = k as u32;
                     let st = unsafe { t.stamp.get_unchecked_mut(c as usize) };
-                    if *st != ser {
-                        *st = ser;
-                        t.acc.assist(slot(c, s.day), 1);
-                    }
+                    let inc = (*st != ser) as u32;
+                    *st = ser;
+                    t.acc.assist(slot(c, s.day), inc);
                 }
             }
         }
