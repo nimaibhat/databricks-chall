@@ -8,25 +8,27 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 
 **Which size to tune for:** the practice board runs 20M, the final runs about 60M. Where a setting helps one size and hurts the other, the 60M result is the one that decides the final score.
 
-**State (log, experiment 35):** 20M 570.9 ms median, stages parse 247 (release included), dedup 83, relink 16, p1 129, p2 77, write 10. 60M 1.72 s, peak 4.3 GB. Experiment 35 (upstream `d9462ea`) changed the parse side only; the back half the table below aims at is as I read it, though line numbers in `v3b.rs` may have shifted by a few.
+**State (log, experiment 36):** 20M 564.0 ms median, 60M 1.70 s. Thread-ms at 20M on the build before it: dedup table 449, p1 short lane 587, p1 group 228, p2 walk 539, link union-find 212 (one thread, inside the parse stage).
 
-## Top five untried (after experiment 34)
+## Top five untried (after experiment 36)
 
-Upstream rewrote the back half again (`c7ebaf9`): events are grouped into runs per user ID by a radix pass (`group`, line 872), people with no links are finished inside `p1_thread`, and linked people are shipped as blocks to their home partition for `p2_thread`. The per-event hash lookup I was aiming at is gone, so my `KTab` idea is dropped. `finish_person` (line 2494) is the old `person` almost unchanged, so the ideas aimed at it carry over.
+Experiment 36 put experiment 32's two changes back (my previous number 1) and kept them: −4 ms at 20M, −14 ms at 60M. The rest of the table moves up, with one new check.
 
 | # | Idea | Where | Expected at 20M | Row risk |
 |---|---|---|---|---|
-| 1 | Put experiment 32's two kept changes back | `finish_person`: the assist loop at lines 2629–2636 and the purchase block at 2541–2572 | −3 ms; −12 ms at 60M (log, measured on the previous back half) | None beyond what the gate already covered |
-| 2 | Sort-and-walk for people with few events, bins only above a threshold | `lane` (line 2160, the `Lk::No` branch) and `finish_person` first loop | −10 ms (estimate) | Low |
-| 3 | Iterate only the occupancy words a person touched | `SBins::add` and the `for wi in 0..t.sb.occ.len()` loop at line 2504 | −2 ms (estimate) | None |
-| 4 | Count radix buckets while copying a partition out, instead of in a second pass | `p1_thread` copy loop (lines 2231–2258) and `group` (lines 887–889) | −2 to −4 ms (estimate) | None |
+| 1 | Sort-and-walk for people with few events, bins only above a threshold | `lane`, the `Lk::No` branch, and the first loop of `finish_person` | −10 ms (estimate) out of the 587 thread-ms short lane | Low |
+| 2 | Count radix buckets while copying a partition out, instead of in a second pass | `p1_thread` copy loop and the first loop of `group` | −2 to −4 ms (estimate) out of the 228 thread-ms group step | None |
+| 3 | Iterate only the occupancy words a person touched | `SBins::add` and the `for wi in 0..t.sb.occ.len()` loop in `finish_person` | −2 ms (estimate) | None |
+| 4 | At 60M, does the link union-find finish before parsing does? | compare `lk.uf` thread-ms with the parse stage wall in a 60M timing line | No gain if it does; if it does not, the parse stage is waiting on one thread and the union-find needs splitting | None (a reading) |
 | 5 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | Safety, not speed | — |
 
-### 1. Experiment 32's changes
+**On item 4.** `build_links` runs on whichever thread parses the last link chunk, alone, while the others parse. At 20M it takes 212 ms against a 247 ms parse stage, so it fits with 35 ms to spare. Both scale with input, but the union-find's tables outgrow the cache faster than parsing slows down (at 60M its hash table is about 100 MB), so the margin may be gone at the size that counts. If `lk.uf` at 60M is above the parse wall, tell me and I will write up a partitioned version.
+
+### Done: experiment 32's changes (experiment 36)
 
 The log says they "do not apply to the rewritten back half and are dropped for now". The code they touched is still there in the same shape: the stamp test in the brute-force assist loop (taken 77% of the time, so worth making branch-free) and the `rows × 32` category table that is cleared and scanned even for a person with one purchase. Both were gate-clean and moved the stage the same way at both sizes.
 
-### 2. Sort-and-walk for small people
+### 1. Sort-and-walk for small people
 
 Now simpler than when I first proposed it, because in `lane` a person's events arrive as one contiguous slice of 32-bit relative times (`e.lo32() >> 1`).
 
@@ -39,7 +41,7 @@ Now simpler than when I first proposed it, because in `lane` a person's events a
 
 Set bit `bi >> 6` of a 16-bit mask in `SBins::add`; in `finish_person` loop over the set bits of that mask instead of all words. Removes about eleven poorly predicted tests per person.
 
-### 4. Count while copying out
+### 2. Count while copying out
 
 `p1_thread` copies each partition's event words into `es`, then `group` reads `es` once to count and once to scatter. The total is known before the copy (`tot`, line 2227), so the bucket shift is known too, and the count can be taken in the copy loop. That removes one pass over 8 bytes per event. The same applies to the smaller lanes but only `es` is worth it.
 
@@ -219,4 +221,5 @@ I read the new generator source (`generator.zip` in the repo root).
 | Counters in `person` | 32 | Done; gave the split used above | — |
 | One-purchase shortcut for category totals | 32 | Kept with a branch-free assist loop: sessions 202.3 to 198.6 at 20M, 616.5 to 600.2 at 60M | −3 to −5 ms |
 | Bitmask assists | 32 | Not built: visits would fall only from 15.2M to about 13M steps | up to −20 ms; too high |
+| Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
 | `KTab` layout | — | Dropped: upstream `c7ebaf9` removed the per-event lookup it targeted | −3 to −8 ms |
