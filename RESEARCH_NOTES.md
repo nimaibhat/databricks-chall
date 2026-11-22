@@ -30,7 +30,11 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 - **Alternative without touching upstream's code:** go back to upstream's 384 KiB target, which costs the 9 ms the 768 setting gains at 20M and still leaves inputs under about 23M events exposed. The one-line fix is better.
 - **Worth telling upstream's author**, since the defect is in their code and affects their entry for inputs under about 23M events.
 
-**Links retry (my item of 00:22): overtaken.** Upstream raised `LkT::PROBES` from 64 to 2048 in this version (line 2668 at `5f2fda8`), which is the fix I proposed. Whether a retry was the cause of the rare 50 ms wait was never checked against the `slots=` line, so it stays a hypothesis; what can be checked is whether the wait still occurs: count `links` laps above 5 ms over 40 or more runs at 60M on the new build.
+**Links retry (my item of 00:22): not confirmed (experiment 46).** On the new build, 40 runs at 60M built the link table exactly once each and showed no long wait (the `links` lap was 4 to 5 ms throughout). The link thread's own time varied widely between runs, which fits a ninth thread being descheduled, not a rebuild. The new build has the higher probe limit, so this does not say what happened on the old one, but there is nothing left to change. Closed.
+
+**Experiment 46 also re-ran nine seeds and the 60M fallback on the new build, all equal.** That does not cover the defect in section 1 above: it needs one specific ID value and cannot turn up by chance.
+
+**Profile (log, experiment 46, 20M):** the scanner (`ev_loop`) is 20% of cycles and parse is 170 of 402 ms; page zeroing 8.6%. Thread-ms: dedup table 375, dedup gather 102, p1 short lane 254, p1 gather 201, p1 group 109, p2 walk 271, users file 111, campaigns file 64. I have no ranked speed idea against this version yet.
 
 **Experiment 42 (readings, nothing changed):** 8 threads is the right count on 8 CPUs (7, 10, 12 and 16 are all slower). With transparent huge pages set to `never` the 20M run takes about 630 ms instead of 478, so about 150 ms depends on the scorer honouring `madvise`; `always` is the same as `madvise`. Nothing in the notes can change that setting; if the scorer turned out to be `never`, the fresh-memory items (experiment 41's packing, fewer chunks touched) would be worth several times what they measured, and that is the one case in which to put them back.
 
@@ -285,7 +289,7 @@ I read the new generator source (`generator.zip` in the repo root).
 | Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
 | Sort-and-walk for small people | 38 (diagnostic only) | Not built: bin fill is 43 of 572 thread-ms | −10 ms; wrong |
 | Recycle chunks into later lanes; presize row columns | 39 (upstream) | Done upstream; peak at 60M 4.3 to 3.4 GB | −5 ms and part of −7 to −11 ms; not separable from the rest of the upstream change |
-| Raise the link table probe limit | 45 (upstream) | Done upstream (64 to 2048); effect on the rare wait not yet counted | removes about 50 ms in 1 run in 40 at 60M (hypothesis) |
+| Raise the link table probe limit | 45 (upstream), 46 | Done upstream (64 to 2048). Experiment 46: no retry and no long wait in 40 runs at 60M; my retry hypothesis is not confirmed | removes about 50 ms in 1 run in 40 at 60M (hypothesis) |
 | Pack staging arrays, more rounds | 44 | Closed: 1 to 2 ms at both sizes | −3 to −4 ms; high |
 | Link lists built in `p1_thread` | 43, corrected in 44 | Not built: wait is rare (1 run in 41 at 60M with defaults, about 50 ms) | about −2 ms on average at 60M; nothing to recover |
 | Pack staging arrays into shared blocks | 41 | Not kept: 106 MB less zeroed, 2 to 4 ms, inside noise | −3 to −4 ms, about 100 MB |
