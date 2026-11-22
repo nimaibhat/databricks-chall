@@ -226,6 +226,8 @@ Experiment 42 (readings on `k5p`, nothing changed):
 - **Sensitivity to the huge-page setting** (set on the VM, then restored to `madvise`): `never` 629 to 633 ms with 235k faults (parse 270 to 280); `madvise` 476 to 481 with 31.8k faults; `always` 477 to 485. So the run depends on huge pages for about 150 ms. The scorer is `madvise` according to a competitor's probe quoted in the old research notes (iteration 51), which is the mode all our timing uses.
 - The VM's baseline drifted up about 10 ms during the last hour (`k5p` 466 / 468 at 23:10, 476 to 481 / 479 to 484 now); comparisons stay valid because binaries alternate within a run.
 
+Experiment 43 (reading on `k5p`, nothing changed; closes research idea 1 of 23:45): 30 runs at 60M with default settings, the `links` lap never exceeded 2 ms (0 of 30). The two waits seen in experiment 40 (23 and 49 ms) were both under non-default knobs (`XL_V3T2=3072`, `XL_V3M1=11`), which we do not ship. So the links thread is not on the critical path at 60M with the shipped defaults, and moving the per-partition link list into `p1_thread` (which would need a concurrent `find`) has nothing to recover. Not attempted.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
