@@ -963,6 +963,13 @@ fn parse_thread(cx: &Cx, tid: usize) {
                 }
             }
         }
+        if unsafe { KN[2] } == 0 {
+            let a = (f.off + s + 4095) & !4095;
+            let b = (f.off + e) & !4095;
+            if b > a {
+                unsafe { crate::sys::madvise(g.region.add(a) as *mut u8, b - a, 4) };
+            }
+        }
     }
     let t = cx.t(tid);
     t.ck.finish();
