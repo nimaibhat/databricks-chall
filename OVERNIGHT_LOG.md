@@ -221,6 +221,11 @@ Experiment 40 (checks on `k5p`, 60f2fae; nothing changed):
 
 Experiment 41 (not kept, research idea 1 of 23:25): the `WBins` and `VB` stage arrays (np x 256 B each, about 256 KiB, each rounded up to its own 2 MiB block by `anon`) carved out of shared 2 MiB blocks instead (`pk1`). Huge-page faults per 20M run 673 to 620 (106 MB less zeroed), peak RSS 1389 to 1305 MB. 13 rounds, wall min / med: `k5p` 469.6 / 479.5, `pk1` 465.0 / 477.1. That is 2 to 4 ms, inside noise, and it is one more patch to carry across upstream's fast-moving `v3b.rs`; not kept. If upstream slows down it is a safe small gain to put back. The census line of `k5p` shows where the rest of the fresh memory goes at 20M: event lanes 66,780 + 42,368 + 8,194 chunks of 4 KiB (459 MB), click lanes 33,199 chunks (130 MB), pass-one blocks 37,090 chunks (145 MB) while 47,337 released chunks (185 MB) are still on the free list at that point.
 
+Experiment 42 (readings on `k5p`, nothing changed):
+- **Thread count**, 5 rounds at 20M, wall min / med: `NCPU` 8 (the scorer's value): 475.8 / 479.0; 7: 482.4 / 486.9; 10: 488.0 / 493.6; 12: 503.8 / 509.5; 16: 528.4 / 532.9. One thread per CPU is right; more threads cost dedup and make the links thread wait.
+- **Sensitivity to the huge-page setting** (set on the VM, then restored to `madvise`): `never` 629 to 633 ms with 235k faults (parse 270 to 280); `madvise` 476 to 481 with 31.8k faults; `always` 477 to 485. So the run depends on huge pages for about 150 ms. The scorer is `madvise` according to a competitor's probe quoted in the old research notes (iteration 51), which is the mode all our timing uses.
+- The VM's baseline drifted up about 10 ms during the last hour (`k5p` 466 / 468 at 23:10, 476 to 481 / 479 to 484 now); comparisons stay valid because binaries alternate within a run.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
