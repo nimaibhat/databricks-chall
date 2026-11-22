@@ -249,6 +249,9 @@ Experiment 48 (checks on `k6p`, 5f2fda8; nothing changed):
 - **Scorer-like container run.** `ss:k6p` with `--read-only --user 1000:1000 --cpuset-cpus 0-7 --memory 24g --memory-swap 24g --tmpfs /tmp:size=64m`, data mounted read-only, the five scorer environment variables set: exit code 0 and output equal to the reference at 60M (1728 ms including container start) and at 20M (763 ms); nothing left in `/scratch`.
 - **Second 60M data set.** Seed 77, 60M events / 15M clicks, generated on disk (tmpfs is full): `k6p` 1.38 s warm (3.3 s on the first, cold run), 2.46 GB peak, no fallback; output equal to the independent pre-overhaul implementation (18.3 s, 4.9 GB).
 
+Experiment 49 (rejected): 4 KiB pages for the lane chunk blocks only (`MADV_NOHUGEPAGE` on the three `anon(BLOCK)` sites in `WBins` / `VB` / the third bin type), so that each 4 KiB chunk is zeroed just before it is written instead of 2 MiB at a time. Binary `sp1`. 9 rounds at 20M, wall min / med: `k6p` 402.9 / 411.7, `sp1` 419.3 / 424.7. Parse is unchanged (173.8 against 174.8), dedup is 7 ms slower (TLB misses when reading the lanes back), and about 8 ms more goes outside the timed stages (fault and teardown cost of 147k small pages). 13 ms worse; huge pages stay.
+Also: upstream `jason-scheffel/express-lane` has answered "Repository not found" since 02:43 (private or removed). Last pipeline commit seen, 1cda738, is on main. Line numbers in the research table should now be taken from main, which will not move unless we change it.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
