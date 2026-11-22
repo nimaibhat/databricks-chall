@@ -245,6 +245,10 @@ Experiment 46 (checks on `k6p`, 5f2fda8; nothing changed):
 
 Experiment 47 (knob sweep on `k6p`, nothing changed): 5 rounds at 20M, wall min / med, base 410.8 / 412.3 (VM about 8 ms slower than an hour ago). `XL_V3T1` 25: 407.0 / 412.0; 60: 403.3 / 411.0; `XL_V3M1` 11: 408.9 / 411.7; 13: 408.9 / 411.4; `XL_DD` 1: 405.8 / 413.1; 2: 410.0 / 412.3; `XL_EK` 1: 406.9 / 411.9; 2: 409.4 / 411.2; `XL_PF=1`: 419.3 / 420.8 (worse); `XL_NT=0`: 405.3 / 412.4. All medians within 1.3 ms of base except `XL_PF=1`; nothing to change. Parse CPU on `k6p`: 1152 ms user + 248 ms system across 8 threads for 176 ms wall, so parse is fully parallel and about 18% of it is the kernel zeroing lane memory (574 MB by the end of parse). Input is 1.78 GB of events, so the scanner moves about 10 GB/s.
 
+Experiment 48 (checks on `k6p`, 5f2fda8; nothing changed):
+- **Scorer-like container run.** `ss:k6p` with `--read-only --user 1000:1000 --cpuset-cpus 0-7 --memory 24g --memory-swap 24g --tmpfs /tmp:size=64m`, data mounted read-only, the five scorer environment variables set: exit code 0 and output equal to the reference at 60M (1728 ms including container start) and at 20M (763 ms); nothing left in `/scratch`.
+- **Second 60M data set.** Seed 77, 60M events / 15M clicks, generated on disk (tmpfs is full): `k6p` 1.38 s warm (3.3 s on the first, cold run), 2.46 GB peak, no fallback; output equal to the independent pre-overhaul implementation (18.3 s, 4.9 GB).
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
