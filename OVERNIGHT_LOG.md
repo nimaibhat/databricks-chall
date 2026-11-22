@@ -198,6 +198,8 @@ Parse-phase cycle split on main (`pa Mcycles`, 3.8 GHz): event sink 2260 (595 th
 
 Experiment 34 (kept, `k3m`): upstream c7ebaf9 ("back half by user runs, long-long lines in the loop"; stages are now parse, dedup, relink, p1, p2, write) with our input release and the two constants. Upstream now uses `XL_PB2` itself, so the release switch moved to `XL_PB7` (a first build silently had the release off). The two small `person` changes of experiment 32 do not apply to the rewritten back half and are dropped for now. 20M, 11 rounds, wall min / med: `bl3` 622.0 / 625.4; `k3` (upstream as is) 607.2 / 615.2; `k3m` 594.0 / 600.6. Stages for `k3m`: parse 278 (release included), dedup 82, relink 15, p1 127, p2 77, write 10. 60M, 5 rounds: 1888.5 / 1890.2 to 1805.8 / 1807.6, peak 4.3 GB. Gate: 36/36, old dev, new dev (also through Docker), 20M at NCPU 8, 2, 1 and 60M equal to the references.
 
+Experiment 35 (kept, `k4m`): upstream d9462ea ("sink line prefetch, click and link loops"; `k_free.rs`, `v3b.rs`) with our input release and the two constants (re-applied by scratchpad `ours.py`). 20M, 11 rounds, wall min / med: `k3m` 593.6 / 604.6; `k4` (upstream as is) 576.8 / 587.7; `k4m` 564.7 / 570.9. Stages for `k4m`: parse 247, dedup 83, relink 16, p1 129, p2 77, write 10. 60M, 5 rounds: 1801.4 / 1804.5 to 1713.9 / 1715.2, peak 4.3 GB. Full gate clean. The input release is still worth 12 to 17 ms over upstream at 20M.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
