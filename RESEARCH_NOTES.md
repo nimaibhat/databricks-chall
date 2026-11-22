@@ -138,7 +138,19 @@ All of these are printed by a normal `XL_TIMING=1` run; they were not pasted int
 ## Two safety checks worth one run each
 
 1. **The fallback at 60M.** `v3b` calls `fallback()` on several conditions (bad `ingest_ts`, a long ID whose high half is zero, a window over 2³¹ ms, a fault signal). Confirm once that a forced fallback on the new 20M set produces the reference output, and record its time and peak memory at 60M. It must stay under 3 minutes and 24 GB, since a timed-out run scores nothing.
-2. **Campaign index width.** `ckrec_put` (line 513) packs the campaign index into 14 bits and `sess_thread` reads it back with `& 0x3FFF` (line 1556). `CBOUND` is 2¹⁴ (`src/main.rs:74`), so the widths agree. What I did not verify is what setup does when `campaigns.csv` holds an ID at or above 16,384: `ck_batch` drops clicks whose index is `>= CBOUND`, which would be wrong for a real campaign. The rules say only "IDs like `c_123`"; the generator writes 2,000. Please check that setup falls back in that case rather than dropping.
+2. **Campaign index width: checked by reading, no action needed.** `ckrec_put` (line 513) packs the campaign index into 14 bits and `CBOUND` is 2¹⁴. Setup calls `fallback("campaigns.csv is not canonical")` for any campaign number at or above `CBOUND`, a repeated number, or more than 250 channels (`src/setup.rs:589–610`), so an out-of-range campaign is slow, not wrong.
+
+## Exactness review of the new sink and lanes (by reading, `fcd9075`)
+
+I traced every record form from `ev_batch` / `ev_wide` through `w_unit`, `cand_key` and `emit_rec` to `urec_put`, and the person lookup in `sess_thread`. I found no case where two spellings of one ID get different keys, where a field's bits overlap another's, or where a duplicate could escape the candidate table:
+
+- Compact form: remainder of the event ID in bits 32–63, ingest seconds in 11–31 (guarded by `is < 2²¹`), user ID split 11 + 31 bits (guarded by `uid < 2⁴²`), time in 33–63 of the second word (guarded by the 2³¹ ms window check), invalid flag in bit 1.
+- All three wide forms and the compact form produce the same dedup key for a short event ID (`e_rem`), and long and interned IDs cannot collide with it (`hi != 0`, or bit 63 set).
+- Ingest times are compared on one base (`g.ing_base`) in every form.
+- The 30-minute bucket method in `person` is exact: two events in one bucket are under 30 minutes apart, non-adjacent occupied buckets are always more than 30 minutes apart, and adjacent ones are split on `min(next) − max(prev) > GAP`.
+- A click is matched only to a person who has events, and events are grouped before clicks, so the "skip" marker cached for an ID cannot hide a later event.
+
+This is a reading, not a proof. The gate (fixtures, both dev answers, 20M and 60M against the independent old implementation) is the stronger evidence.
 
 ## What the generator guarantees, and what it only appears to
 
