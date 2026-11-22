@@ -141,6 +141,11 @@ The binary is now `j4s` on the VM; file and line references in the research note
 
 Experiment 23: upstream's probe set at 628f99c (19:00, "loop and index variants") has six source variants beyond 078e760: `v/e3`, `c8`, `c5`, `r4`, `i4`, `all`. Built as they are (so without the two constants), 9 rounds, seed 20, wall min / med: `j4s` (main, 7519633) 192.5 / 196.2; `j4` (plain 078e760) 194.3 / 196.4; e3 194.9 / 197.2; c8 193.9 / 197.0; c5 197.2 / 198.1; r4 197.3 / 197.9; i4 196.2 / 196.9; all 194.4 / 196.8. None is faster than plain 078e760. Nothing taken.
 
+Experiment 24: upstream moved four commits past 078e760 (4b57bc7 click-loop pair decode, abd72ed and 3493fdd fixes, 42e53ab "wider event loop, pair decode for clicks, new click index"). 11 rounds, wall min / med.
+
+- **3493fdd is 078e760 plus two scanner fixes** (4 lines in `k_free.rs`: `TL2_R6` 65 to 66, and a check in `ev_loop` that sends a line without a third comma to the careful path; abd72ed also backs out 4b57bc7's click changes). Taken with the two constants as `j6s`, commit 4f63ac5 on main. These are correctness fixes for malformed lines, not speed: seed 20 194.8 / 196.1 against `j4s` 195.9 / 196.8; seed 7 195.3 / 200.0 against 196.5 / 199.6. Gate clean: 36/36, dev and seed 20 match, equal to 941879e at NCPU 8, 2, 1 on seeds 7, 3 and 6.
+- **42e53ab is slower on this VM**: `j5` (as is) seed 20 208.5 / 211.4, seed 7 211.4 / 215.5; `j5s` (with constants) 208.9 / 211.0 and 212.1 / 215.4; against `j4s` 192.6 / 196.5 and 198.8 / 200.3. Parse 160.1 against 144.9 (+15), other stages level. Its outputs are exact (36/36, dev, seed 20, NCPU 8/2/1 on seeds 7 and 3). Not taken on main; pushed as branch `upstream-42e53ab` (6fddb4b) in case the scorer's CPU behaves differently from this 8252C, which is the only reason upstream would ship it.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
