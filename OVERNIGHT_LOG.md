@@ -200,6 +200,8 @@ Experiment 34 (kept, `k3m`): upstream c7ebaf9 ("back half by user runs, long-lon
 
 Experiment 35 (kept, `k4m`): upstream d9462ea ("sink line prefetch, click and link loops"; `k_free.rs`, `v3b.rs`) with our input release and the two constants (re-applied by scratchpad `ours.py`). 20M, 11 rounds, wall min / med: `k3m` 593.6 / 604.6; `k4` (upstream as is) 576.8 / 587.7; `k4m` 564.7 / 570.9. Stages for `k4m`: parse 247, dedup 83, relink 16, p1 129, p2 77, write 10. 60M, 5 rounds: 1801.4 / 1804.5 to 1713.9 / 1715.2, peak 4.3 GB. Full gate clean. The input release is still worth 12 to 17 ms over upstream at 20M.
 
+Experiment 36 (kept, `k4n`, research idea 1 of 22:50): experiment 32's two changes put back into the rewritten `finish_person` (branchless assist loop; direct path for one purchase; scratchpad `ours2.py`). 20M, 13 rounds, wall min / med: `k4m` 561.2 / 568.3, `k4n` 558.4 / 564.0 (p2 76.1 to 72.6). 60M, 5 rounds: 1710.0 / 1718.9 to 1691.8 / 1704.4 (p2 224 to 215). Full gate clean. Thread-ms on `k4m` at 20M for reference: dd.table 449, p1.short 587, p1.group 228, p2.walk 539, lk.uf 212; parse cycles: ev_sink 1915, ev_spush 731, ev_simd 412, ck_sink 708, p2w 781, p2s_emit 561, p2s_scan 354 Mcycles.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
