@@ -160,6 +160,18 @@ j6s                        wall min 292.5 med 297.0 max 297.9 | setup=0.0 parse=
 j7s                        wall min 289.8 med 291.3 max 292.2 | setup=0.0 parse=221.3 ev3a=53.5 write=7.2 total=288.3
 ```
 
+Experiment 26: **the rules changed (about 21:30).** New generator (generator.zip of 22:01, built on the VM as `~/gen2`): every ID passes through a per-seed keyed bijection and one in eight carries a 32-character hex suffix, so IDs are opaque variable-width strings and the old key-recovery fast path never applies. The final now runs on about 60M events with a 3-minute cap. The processing rules, the 36 fixtures and the scripts are unchanged; the dev answer is new. All older numbers in this log are for the old ID format and no longer describe the scorer.
+
+New sets on tmpfs: `/mnt/t/n1` (seed 1, 1M: the dev set), `/mnt/t/n20` (seed 20, 20M), `/mnt/t/n60` (seed 6, 60M). Wall, best of 3:
+
+| Binary | 20M seed 20 | 20M seed 7 | 60M seed 6 | Note |
+|---|---|---|---|---|
+| `j7s` (d3c25fc, previous main) | 3455 ms | 3533 ms | | falls back: "no user key" |
+| `old73f8661` (pre-overhaul implementation) | 5423 ms | 5645 ms | 18.3 s, 4.9 GB | slow on the long IDs |
+| `j9` = upstream 93e9168 + two constants (kept, 738cc7d) | 870 ms | 890 ms | 2.93 s, 15.0 GB peak | new `v3b` path |
+
+`j9` stages at 20M: parse 394, dedup 132, join 110, sessions 191, write 10 (total 839 in-process). Gate: 36/36 fixtures, old dev and new dev answer match (new dev also through Docker with the 24 GB / 8 CPU limits), outputs equal to `old73f8661` on both 20M sets and the 60M set, equal at NCPU 2 and 1. The image is now `rust:1-slim` with a static glibc target.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
