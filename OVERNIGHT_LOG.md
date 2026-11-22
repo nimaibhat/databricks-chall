@@ -180,6 +180,13 @@ Experiment 29 (kept, `m1`): the new path never released the mapped input, so the
 
 Experiment 30 (kept, `k2m`): upstream 7c69e3e ("long ids in the event loop, chunk reuse"; `k_free.rs`, `v3b.rs`) with our input release re-applied (upstream does not have it) and the two constants. 20M, 9 rounds, wall min / med: `m1` 663.6 / 668.3; `k2` (upstream as is) 640.8 / 643.4; `k2m` 623.1 / 628.6. Stages for `k2m`: parse 257, dedup 74, join 73, sessions 204, write 10. 60M, 3 rounds: 2041 / 2046 to 1904 / 1904, peak 4.0 GB. Gate: 36/36, old dev, new dev (also through Docker), 20M at NCPU 8, 2, 1 and 60M equal to the references. The input release is worth 15 to 18 ms on top of upstream at 20M.
 
+Experiment 31 (research table of 22:25, nothing kept), on `k2m` (7de923f), 20M, wall min / med:
+- Idea 3, `XL_PB0` (brute-force assist limit, default 4096), 5 rounds: base 620.8 / 630.7; 0: 634.8 / 645.1; 256: 620.8 / 630.9; 1024: 623.1 / 628.6; 16384: 630.7 / 633.8; 262144: 637.6 / 646.0. Flat from 256 to 4096, worse outside. Closed.
+- Idea 5, `SW` (write-combining stage words, default 24), 7 rounds: base 625.6 / 632.1; 8: 633.4 / 637.7; 56: 636.2 / 644.3 (dedup 75 to 91); 12 does not build. Closed.
+- Idea 2 (largest partitions first): the sessions stage is already balanced. Its thread-ms (gather 10 + group 578 + clicks 192 + person 852 = 1632) divided by 8 threads is 204 ms, which is the stage's wall time, so there is no idle tail to remove at 20M. Not built.
+- Idea 1 (recycle event-lane chunks): upstream 7c69e3e ("chunk reuse") did this; see experiment 30.
+The sessions stage is now a third of the run and its cost is thread work, not imbalance: ideas that cut work per event in `sess_thread` group (hash lookup of each event's person, 578 thread-ms) or `person` (852) are what would pay.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
