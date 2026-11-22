@@ -29,13 +29,22 @@ Upstream moved four commits and overtook most of my previous table:
 
 **Experiment 41 built the staging-array packing** and did not keep it: 106 MB less zeroed, 2 to 4 ms at 20M, which is what I estimated but is inside run-to-run noise and is one more patch to carry across upstream changes. It is a safe small gain to put back once upstream stops moving.
 
-**No open ideas (after experiment 43).** Experiment 43 ran 30 times at 60M with the shipped defaults and the links wait never exceeded 2 ms; the two long waits in experiment 40 were under non-default knobs. So my last item (building link lists inside `p1_thread`) has nothing to recover and is closed without being built.
+## Top ideas untried (after experiment 44)
 
-I have read every stage of the current version and have nothing left that I would rank above run-to-run noise. Listing weaker guesses would cost the coding agent test time for nothing, so the table is empty on purpose. What would reopen it:
+Experiment 44 closed the staging-array packing for good (1 to 2 ms at both sizes over 31 and 11 rounds) and corrected experiment 43: the links wait does happen with shipped defaults, about once in 40 runs at 60M, about 50 ms when it does. It asked whether I see a cheap cause. I see one candidate, and it can be confirmed from a line the binary already prints.
 
-- **A new upstream version:** I re-read the changed stages for exactness and for anything it opens up.
-- **The scorer turning out not to honour huge pages** (experiment 42: about +150 ms at 20M): put experiment 41's packing back and look again at fresh memory.
-- **60M scaling:** 1.47 s at 60M against 0.468 s at 20M is a ratio of 3.1 for 3 times the input, so nothing is superlinear enough to target. If a later build moves that ratio above about 3.3, the stage that grew is worth a look.
+| # | Idea | Where | Expected | Row risk |
+|---|---|---|---|---|
+| 1 | The slow runs may be the link table being built twice. Check, then raise the probe limit | `LkT::PROBES` (line 1746), the retry loop in `build_links` (line 1825) | Nothing in a typical run. If confirmed, removes the roughly 50 ms wait in about 1 run in 40 at 60M. (hypothesis from reading; not measured) | None |
+
+### 1. A retry in `build_links` would look exactly like this
+
+- **What the code does.** `links_fast` puts short IDs in a table with `s` slots per partition, where `s = 2 × pairs / np` (line 1820). `LkT::slot` gives up after `min(64, s)` probes and returns 0; `links_fast` then returns `false`, and `build_links` doubles `s` and **starts the whole union-find again** (line 1825). Everything done so far is thrown away, so a retry roughly doubles the links thread's time.
+- **Why it would be rare and random.** Each link pair brings up to two IDs, so a partition's region is between half full and full depending on how many IDs repeat across pairs. Whether some ID needs more than 64 probes depends on the order IDs are inserted, and that order depends on which thread parsed which link chunk. Same input, different order, occasionally one long probe run. That fits "1 run in 40, same data, same settings" better than scheduling does: a ninth thread on 8 CPUs loses a little time on every run, not 50 ms on one.
+- **How to confirm, no new code.** The `[v3b] links:` timing line prints `slots=` and `uf=` (line 2017). In a slow run, `slots` will be twice its usual value and `uf` about twice as long (the timers add up across retries). If `slots` is the usual value in a slow run, this hypothesis is wrong and the cause is scheduling. `pairs=` and `ids=` on the same line give the fill: `ids / (np × slots)`.
+- **The fix if confirmed.** Raise `PROBES` from 64 to something that only trips when a region is really full, for example 1024. The limit is only a give-up threshold; a long probe run costs a few hundred nanoseconds once, against tens of milliseconds for a retry. Alternatively start with a larger `s` (the `XL_LKS` knob already overrides it, so `XL_LKS` at 1.5 and 2 times the printed value can be tried without a rebuild), but that makes the table bigger for every run, so the probe limit is the better fix.
+- **Risk to rows:** none. The probe limit decides only when to give up and retry; which slot an ID ends up in does not affect the result, and `XL_LKCHK=1` compares the link lists and bitmap against the plain method.
+- **How to test.** Count slow runs over 40 or more at 60M before and after, and confirm `slots=` never doubles after. The typical run should not move.
 
 **Where the fresh memory goes now (log, experiment 41 census, 20M):** event lanes 459 MB, click lanes 130 MB, pass-one blocks 145 MB, with 185 MB of released chunks idle on the free list at that point. The event and click lanes match my count of what must be written (410 + 50 and 110 MB), so there is no slack there. The idle 185 MB cannot serve the click lanes, which are written during parse before anything is released. I see no further memory item worth more than the 2 to 4 ms that experiment 41 just declined.
 
@@ -254,7 +263,8 @@ I read the new generator source (`generator.zip` in the repo root).
 | Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
 | Sort-and-walk for small people | 38 (diagnostic only) | Not built: bin fill is 43 of 572 thread-ms | −10 ms; wrong |
 | Recycle chunks into later lanes; presize row columns | 39 (upstream) | Done upstream; peak at 60M 4.3 to 3.4 GB | −5 ms and part of −7 to −11 ms; not separable from the rest of the upstream change |
-| Link lists built in `p1_thread` | 43 (reading only) | Not built: links wait is under 2 ms in 30 of 30 runs at 60M with defaults | about −2 ms on average at 60M; nothing to recover |
+| Pack staging arrays, more rounds | 44 | Closed: 1 to 2 ms at both sizes | −3 to −4 ms; high |
+| Link lists built in `p1_thread` | 43, corrected in 44 | Not built: wait is rare (1 run in 41 at 60M with defaults, about 50 ms) | about −2 ms on average at 60M; nothing to recover |
 | Pack staging arrays into shared blocks | 41 | Not kept: 106 MB less zeroed, 2 to 4 ms, inside noise | −3 to −4 ms, about 100 MB |
 | Fallback path at 60M | 40 | Safe: 10.2 s, 11.8 GB, output equal | safety check |
 | Links wait at 60M | 40 | 0.2 ms typically, 23 and 49 ms in 2 of 40 runs | a reading |
