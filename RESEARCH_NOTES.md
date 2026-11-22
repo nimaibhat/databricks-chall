@@ -10,6 +10,8 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 
 **State (log, experiment 39):** 20M 468.1 ms median, stages parse 213, dedup 67, links 0.2, p1 107, p2 58, write 10. 60M about 1.47 s, peak 3.4 GB. Line numbers below are for `src/v3b.rs` at `60f2fae` (upstream `c4a033b` plus the 768 KiB partition target).
 
+**Experiment 42 (readings, nothing changed):** 8 threads is the right count on 8 CPUs (7, 10, 12 and 16 are all slower). With transparent huge pages set to `never` the 20M run takes about 630 ms instead of 478, so about 150 ms depends on the scorer honouring `madvise`; `always` is the same as `madvise`. Nothing in the notes can change that setting; if the scorer turned out to be `never`, the fresh-memory items (experiment 41's packing, fewer chunks touched) would be worth several times what they measured, and that is the one case in which to put them back.
+
 ## Top five untried (after experiment 39)
 
 Upstream moved four commits and overtook most of my previous table:
