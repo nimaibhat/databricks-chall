@@ -252,6 +252,10 @@ Experiment 48 (checks on `k6p`, 5f2fda8; nothing changed):
 Experiment 49 (rejected): 4 KiB pages for the lane chunk blocks only (`MADV_NOHUGEPAGE` on the three `anon(BLOCK)` sites in `WBins` / `VB` / the third bin type), so that each 4 KiB chunk is zeroed just before it is written instead of 2 MiB at a time. Binary `sp1`. 9 rounds at 20M, wall min / med: `k6p` 402.9 / 411.7, `sp1` 419.3 / 424.7. Parse is unchanged (173.8 against 174.8), dedup is 7 ms slower (TLB misses when reading the lanes back), and about 8 ms more goes outside the timed stages (fault and teardown cost of 147k small pages). 13 ms worse; huge pages stay.
 Also: upstream `jason-scheffel/express-lane` has answered "Repository not found" since 02:43 (private or removed). Last pipeline commit seen, 1cda738, is on main. Line numbers in the research table should now be taken from main, which will not move unless we change it.
 
+Experiment 50 (rejected; readings):
+- **Profile-guided build on the new code.** Instrumented build in the pinned Rust image (1.100.0, LLVM 23.1.5), trained on the 20M set twice and the dev set, merged, rebuilt with `-Cprofile-use` (binary `puse`). 11 rounds at 20M, wall min / med: `k6p` 406.2 / 411.7, `puse` 405.2 / 409.6. 5 rounds at 60M: `k6p` 1266.4 / 1270.5, `puse` 1265.7 / 1266.4. 1 to 4 ms, inside noise, as on the old code (first table, row 1); not worth a binary profile in the build.
+- **Time outside the pipeline's own timer.** Wall is 4 ms more than the internal "exit at" time, and an empty process (`/bin/true`) costs 2.4 ms on this harness, so start-up and teardown together are about 1.5 ms. Nothing to gain there.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
