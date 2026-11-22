@@ -232,6 +232,12 @@ Experiment 44 (not kept; correction to experiment 43):
 - **Packed stage arrays again, more rounds.** `pk1` against `k5p`, 31 rounds at 20M, wall min / med: `k5p` 466.4 / 470.0, `pk1` 465.2 / 468.2. 11 rounds at 60M: `k5p` 1451.6 / 1487.9, `pk1` 1450.0 / 1485.6 (peak 3.39 against 3.35 GB). The gain is 1 to 2 ms at both sizes. Closed; not worth a second patch on upstream's file.
 - **Correction on the links wait.** One of the 11 `k5p` runs at 60M in this comparison, with default settings, showed `links=60.4` (that run's wall was the maximum, 1543 ms). So the wait does happen with the shipped defaults, roughly once in 40 runs (1 of 41 across experiments 43 and 44), costing about 50 ms when it does, about 1 ms on average. Experiment 43's statement that it only happens under non-default knobs is wrong. It is still too rare to justify a concurrent `find` in `p1_thread`; a cheaper fix would be worth having if the research session sees one (for example why the links thread is late in those runs: it is a ninth thread on 8 CPUs).
 
+Experiment 45 (kept): upstream 1cda738 (five commits since c4a033b: dedup kernels without gathers, clicks handled after dedup, plain loads for table lookups, walk and click-path steps, wide users in the user table, pass-one plumbing) plus our partition target 768. Binaries `k6` (plain) and `k6p` (with 768). Gate on `k6p`: 36/36 fixtures, old dev, new dev direct and through Docker, 20M at NCPU 8, 2, 1 and 60M all equal to the references; 60M peak 2.5 GB (was 3.4).
+- 20M, 9 rounds, wall min / med: `k5p` 469.5 / 471.2, `k6` 410.1 / 411.2, `k6p` 401.4 / 402.0. Stages `k6p`: parse 170, dedup 70, clicks 27, links 0.2, p1 76, p2 42, write 7.
+- 60M, 7 rounds: `k5p` 1477 / 1496, `k6` 1247 / 1252, `k6p` 1246 / 1251.
+- Our 768 is still worth 9 ms at 20M and neutral at 60M. Re-sweep on `k6p` at 20M (5 rounds, min / med, base 401.6 / 406.9): `T2` 512: 401.3 / 403.7; 1024: 401.5 / 403.3; 1536: 402.2 / 403.9; `M2` 12: 401.5 / 403.8; 10: 403.5 / 405.3. Flat around 768; left as is.
+- Line numbers in the research table refer to c4a033b and have moved.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
