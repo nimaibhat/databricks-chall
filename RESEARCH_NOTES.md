@@ -19,18 +19,28 @@ Upstream moved four commits and overtook most of my previous table:
 - **Assist and credit loops:** replaced by vector passes (`credit16`, `credit_sorted`), so experiment 36's changes are gone with the code they touched.
 - **Link union-find:** now a flat table on its own thread (`links_start`), joined after dedup. At 20M the join waits 0.2 ms, so it is off the critical path there.
 
-What is left is short, and I would rather list three real items than pad to five.
+**Experiment 40 answered three of my four items** (nothing changed in the code):
 
-| # | Idea | Where | Expected at 20M | Row risk |
+- **Fallback at 60M: safe.** 10.2 s, 11.8 GB peak, output equal to the reference. Closed.
+- **Fresh memory:** 670 huge-page faults per 20M run (1.34 GB, was 1.6 GB); zeroing is 9.5% of cycles (was 10.7%). My count of what must be written is about 1.1 GB, so about 0.25 GB of overhead is left.
+- **Links wait at 60M:** 0.2 to 0.3 ms in 38 of 40 runs, 23 and 49 ms in the other two.
+
+What is left is short. I am not padding it to five.
+
+| # | Idea | Where | Expected | Row risk |
 |---|---|---|---|---|
-| 1 | Re-read the fault count and the `kernel_init_pages` share on the current build | the `minflt` figure in the `pa Mcycles` timing line; one `perf` profile | Decides whether item 2 and any further memory work is worth building. Experiment 38 had 802 huge-page faults and 10.7% of cycles; peak at 60M has since fallen from 4.3 to 3.4 GB | None |
-| 2 | Pack each thread's lane staging arrays into one block | `VB::new` (line 556), `WBins::new` (line 74) | −4 ms (estimate: about 100 MB zeroed for 25 MB used, at the 0.29 thread-ms per MB derived from experiment 38) | None |
-| 3 | At 60M, how long does `links_join` wait? | the `links` lap in a 60M timing line | No gain if near zero. If it is tens of ms, the links thread is the critical path at the size that counts and wants starting earlier or splitting | None (a reading) |
-| 4 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | Safety, not speed | — |
+| 1 | Pack each thread's lane staging arrays into one block | `VB::new` (line 556), `WBins::new` (line 74) | −3 to −4 ms at 20M (estimate: about 100 MB zeroed for 25 MB used; 9.5% of cycles over 1.34 GB is about 0.3 thread-ms per MB) | None |
+| 2 | Build each partition's link list inside `p1_thread` instead of on the links thread | the last loop of `links_fast` (from line 1977) moved to the top of the `p1_thread` partition loop | Nothing in a typical run. Removes the 23 to 49 ms wait seen in 2 of 40 runs at 60M; about −2 ms on average there (estimate) | Low |
 
-**On item 2.** Unchanged from my previous table and still applies: `anon()` rounds each request up to 2 MiB, and each staging array is `np × 256` bytes, well under that. One per-thread block carved into the five `VB` arrays and the `WBins` array fixes it. The arrays are only indexed by partition.
+**On item 1.** `anon()` rounds each request up to 2 MiB, and each staging array is `np × 256` bytes, well under that. One per-thread block carved into the five `VB` arrays and the `WBins` array fixes it. The arrays are only indexed by partition. If upstream's new chunk census already shows these arrays as small, drop this.
 
-**On item 3.** The links thread is a ninth thread on eight pinned CPUs, so while it runs it takes time from a parse or dedup thread. That is fine if it finishes early. Its node table is `(np + 1) × s` words plus the wide IDs; at 60M that is several hundred MB of random access, so its time grows faster than the stages it hides behind.
+**On item 2.** The links thread does three things: union-find, then a per-partition pass that writes the moved-ID list (`lkf`) and sets the representative bits. The third is about a fifth of its time (62 of 275 thread-ms at 20M, log) and is independent per partition: partition `q` reads only its own slots `[(q+1)·s, (q+2)·s)` and its own wide IDs, and writes only its own slice of the bitmap, which is also the only slice `p1` reads for `q`. So each `p1` thread can do it for the partition it is about to process, and the links thread finishes about 20% sooner.
+
+- **The catch:** `LkT::find` compresses paths as it goes, which is a write to shared nodes. Eight threads doing that at once is a data race. Use a read-only find there (follow parents without writing). To keep chains short, the links thread should finish with one sequential pass that points every node at its root; that pass is cheaper than the current third step because it writes nothing else.
+- **Why low on the list:** it pays only in the rare run where the links thread is late, and it adds a full-compression pass that costs a little every run. Worth building only if the final's 3-run scoring makes one slow run matter.
+- **Check with** `XL_LKCHK`, which already compares the link lists and bitmap against the plain method; it would need to run after `p1`.
+
+**Where the rest of the time is (log, experiment 40, 20M thread-ms):** dedup table 386, p1 short lane 448, p1 group 193, p1 gather 144, p2 walk 398. Parse is 213 of 468 ms wall and its hottest instructions are the loads of input bytes. I have read the dedup stage and the back half and have no further proposal for them that I would put a number on. The parse sink (`Sink`, `ELane`) in the current version is the one large piece I have not read end to end; that is what I am reading next.
 
 ### Exactness review of the new credit code (by reading, `60f2fae`)
 
@@ -235,4 +245,6 @@ I read the new generator source (`generator.zip` in the repo root).
 | Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
 | Sort-and-walk for small people | 38 (diagnostic only) | Not built: bin fill is 43 of 572 thread-ms | −10 ms; wrong |
 | Recycle chunks into later lanes; presize row columns | 39 (upstream) | Done upstream; peak at 60M 4.3 to 3.4 GB | −5 ms and part of −7 to −11 ms; not separable from the rest of the upstream change |
+| Fallback path at 60M | 40 | Safe: 10.2 s, 11.8 GB, output equal | safety check |
+| Links wait at 60M | 40 | 0.2 ms typically, 23 and 49 ms in 2 of 40 runs | a reading |
 | `KTab` layout | — | Dropped: upstream `c7ebaf9` removed the per-event lookup it targeted | −3 to −8 ms |
