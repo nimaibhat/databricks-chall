@@ -187,6 +187,12 @@ Experiment 31 (research table of 22:25, nothing kept), on `k2m` (7de923f), 20M, 
 - Idea 1 (recycle event-lane chunks): upstream 7c69e3e ("chunk reuse") did this; see experiment 30.
 The sessions stage is now a third of the run and its cost is thread work, not imbalance: ideas that cut work per event in `sess_thread` group (hash lookup of each event's person, 578 thread-ms) or `person` (852) are what would pay.
 
+Experiment 32: per-person work in the sessions stage (research table of 22:30).
+- **Idea 1, diagnostic** (`diag`: cycle counters in `person` switched back on; TSC is 3.8 GHz here). `person Mcycles: sort=461 walk=1206 clicks=1637`, i.e. bins fill 121 thread-ms, sessions/rows/purchases 317, clicks 431. Inside clicks (`st[8..10]`): people without clicks 64 Mcycles (17 ms), click key build and sort 353 (93 ms), session walk 900 (237 ms), the rest (non-brute assists) about 320 (84 ms). `st`: 667,450 people, 3,371,561 sessions, 5,074,753 clicks, 432,758 people with clicks holding 2,184,246 sessions, 15,241,964 click visits in brute windows giving 11,803,268 assists, 5,002 people on the non-brute path, 58,674 timestamp ties.
+- **Kept (`bl3`, two small changes):** the assist loop writes the stamp and adds 0 or 1 without a branch (the test was taken 77% of the time), and a person with exactly one purchase sets revenue and top category directly instead of clearing and scanning a 32-wide table per row. 20M, 15 rounds, wall min / med: `k2m` 627.2 / 629.0, branchless only 622.9 / 627.3, both 616.3 / 625.6 (sessions 202.3 to 198.6). 60M, 5 rounds: 1892.7 / 1904.0 to 1882.9 / 1892.3 (sessions 616.5 to 600.2). Small, but the stage time moves the same way at both sizes. Full gate clean.
+- **Rejected: prefetch of the next linked chunk** in `WBins::chunks` (used by dedup, join and sessions), `XL_PB3` = lines to prefetch, 7 rounds, wall min / med: off 619.2 / 631.9; 8 lines 617.1 / 631.3; 16: 622.5 / 631.8; 32: 631.1 / 639.4; 64: 630.9 / 641.4. No gain at 8, worse above. The chunk reads are not what limits these stages.
+- Idea 2 (bitmask assists) not built: the non-brute path already does the per-campaign interval walk, and the `XL_PB0` sweep (experiment 31) shows the split between the two paths is at its optimum.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
