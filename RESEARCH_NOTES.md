@@ -29,19 +29,15 @@ Upstream moved four commits and overtook most of my previous table:
 
 **Experiment 41 built the staging-array packing** and did not keep it: 106 MB less zeroed, 2 to 4 ms at 20M, which is what I estimated but is inside run-to-run noise and is one more patch to carry across upstream changes. It is a safe small gain to put back once upstream stops moving.
 
-**One idea is left, and it is a tail-risk item, not a speed item.** I am not padding the table.
+**No open ideas (after experiment 43).** Experiment 43 ran 30 times at 60M with the shipped defaults and the links wait never exceeded 2 ms; the two long waits in experiment 40 were under non-default knobs. So my last item (building link lists inside `p1_thread`) has nothing to recover and is closed without being built.
 
-| # | Idea | Where | Expected | Row risk |
-|---|---|---|---|---|
-| 1 | Build each partition's link list inside `p1_thread` instead of on the links thread | the last loop of `links_fast` (from line 1977) moved to the top of the `p1_thread` partition loop | Nothing in a typical run. Removes the 23 to 49 ms wait seen in 2 of 40 runs at 60M; about −2 ms on average there (estimate) | Low |
+I have read every stage of the current version and have nothing left that I would rank above run-to-run noise. Listing weaker guesses would cost the coding agent test time for nothing, so the table is empty on purpose. What would reopen it:
+
+- **A new upstream version:** I re-read the changed stages for exactness and for anything it opens up.
+- **The scorer turning out not to honour huge pages** (experiment 42: about +150 ms at 20M): put experiment 41's packing back and look again at fresh memory.
+- **60M scaling:** 1.47 s at 60M against 0.468 s at 20M is a ratio of 3.1 for 3 times the input, so nothing is superlinear enough to target. If a later build moves that ratio above about 3.3, the stage that grew is worth a look.
 
 **Where the fresh memory goes now (log, experiment 41 census, 20M):** event lanes 459 MB, click lanes 130 MB, pass-one blocks 145 MB, with 185 MB of released chunks idle on the free list at that point. The event and click lanes match my count of what must be written (410 + 50 and 110 MB), so there is no slack there. The idle 185 MB cannot serve the click lanes, which are written during parse before anything is released. I see no further memory item worth more than the 2 to 4 ms that experiment 41 just declined.
-
-**On item 1.** The links thread does three things: union-find, then a per-partition pass that writes the moved-ID list (`lkf`) and sets the representative bits. The third is about a fifth of its time (62 of 275 thread-ms at 20M, log) and is independent per partition: partition `q` reads only its own slots `[(q+1)·s, (q+2)·s)` and its own wide IDs, and writes only its own slice of the bitmap, which is also the only slice `p1` reads for `q`. So each `p1` thread can do it for the partition it is about to process, and the links thread finishes about 20% sooner.
-
-- **The catch:** `LkT::find` compresses paths as it goes, which is a write to shared nodes. Eight threads doing that at once is a data race. Use a read-only find there (follow parents without writing). To keep chains short, the links thread should finish with one sequential pass that points every node at its root; that pass is cheaper than the current third step because it writes nothing else.
-- **Why low on the list:** it pays only in the rare run where the links thread is late, and it adds a full-compression pass that costs a little every run. Worth building only if the final's 3-run scoring makes one slow run matter.
-- **Check with** `XL_LKCHK`, which already compares the link lists and bitmap against the plain method; it would need to run after `p1`.
 
 **Where the rest of the time is (log, experiment 40, 20M thread-ms):** dedup table 386, p1 short lane 448, p1 group 193, p1 gather 144, p2 walk 398. Parse is 213 of 468 ms wall and its hottest instructions are the loads of input bytes. I have now read every stage of the current version (parse sink, event lanes, dedup, links, p1, p2, credit) and have no further proposal I would put a number on. The parse sink is already a vector classify step followed by write-combined 64-byte lines with non-temporal stores; what remains in parse is the scanner in `k_free.rs` reading input bytes, which upstream is changing every cycle.
 
@@ -258,6 +254,7 @@ I read the new generator source (`generator.zip` in the repo root).
 | Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
 | Sort-and-walk for small people | 38 (diagnostic only) | Not built: bin fill is 43 of 572 thread-ms | −10 ms; wrong |
 | Recycle chunks into later lanes; presize row columns | 39 (upstream) | Done upstream; peak at 60M 4.3 to 3.4 GB | −5 ms and part of −7 to −11 ms; not separable from the rest of the upstream change |
+| Link lists built in `p1_thread` | 43 (reading only) | Not built: links wait is under 2 ms in 30 of 30 runs at 60M with defaults | about −2 ms on average at 60M; nothing to recover |
 | Pack staging arrays into shared blocks | 41 | Not kept: 106 MB less zeroed, 2 to 4 ms, inside noise | −3 to −4 ms, about 100 MB |
 | Fallback path at 60M | 40 | Safe: 10.2 s, 11.8 GB, output equal | safety check |
 | Links wait at 60M | 40 | 0.2 ms typically, 23 and 49 ms in 2 of 40 runs | a reading |
