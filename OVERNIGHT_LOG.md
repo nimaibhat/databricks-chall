@@ -139,6 +139,8 @@ j4s                        wall min 289.4 med 295.3 max 297.8 | setup=0.0 parse=
 
 The binary is now `j4s` on the VM; file and line references in the research notes are stale again (5 source files changed, +861 -192).
 
+Experiment 23: upstream's probe set at 628f99c (19:00, "loop and index variants") has six source variants beyond 078e760: `v/e3`, `c8`, `c5`, `r4`, `i4`, `all`. Built as they are (so without the two constants), 9 rounds, seed 20, wall min / med: `j4s` (main, 7519633) 192.5 / 196.2; `j4` (plain 078e760) 194.3 / 196.4; e3 194.9 / 197.2; c8 193.9 / 197.0; c5 197.2 / 198.1; r4 197.3 / 197.9; i4 196.2 / 196.9; all 194.4 / 196.8. None is faster than plain 078e760. Nothing taken.
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
