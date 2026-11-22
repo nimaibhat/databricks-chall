@@ -25,16 +25,17 @@ Upstream moved four commits and overtook most of my previous table:
 - **Fresh memory:** 670 huge-page faults per 20M run (1.34 GB, was 1.6 GB); zeroing is 9.5% of cycles (was 10.7%). My count of what must be written is about 1.1 GB, so about 0.25 GB of overhead is left.
 - **Links wait at 60M:** 0.2 to 0.3 ms in 38 of 40 runs, 23 and 49 ms in the other two.
 
-What is left is short. I am not padding it to five.
+**Experiment 41 built the staging-array packing** and did not keep it: 106 MB less zeroed, 2 to 4 ms at 20M, which is what I estimated but is inside run-to-run noise and is one more patch to carry across upstream changes. It is a safe small gain to put back once upstream stops moving.
+
+**One idea is left, and it is a tail-risk item, not a speed item.** I am not padding the table.
 
 | # | Idea | Where | Expected | Row risk |
 |---|---|---|---|---|
-| 1 | Pack each thread's lane staging arrays into one block | `VB::new` (line 556), `WBins::new` (line 74) | −3 to −4 ms at 20M (estimate: about 100 MB zeroed for 25 MB used; 9.5% of cycles over 1.34 GB is about 0.3 thread-ms per MB) | None |
-| 2 | Build each partition's link list inside `p1_thread` instead of on the links thread | the last loop of `links_fast` (from line 1977) moved to the top of the `p1_thread` partition loop | Nothing in a typical run. Removes the 23 to 49 ms wait seen in 2 of 40 runs at 60M; about −2 ms on average there (estimate) | Low |
+| 1 | Build each partition's link list inside `p1_thread` instead of on the links thread | the last loop of `links_fast` (from line 1977) moved to the top of the `p1_thread` partition loop | Nothing in a typical run. Removes the 23 to 49 ms wait seen in 2 of 40 runs at 60M; about −2 ms on average there (estimate) | Low |
 
-**On item 1.** `anon()` rounds each request up to 2 MiB, and each staging array is `np × 256` bytes, well under that. One per-thread block carved into the five `VB` arrays and the `WBins` array fixes it. The arrays are only indexed by partition. If upstream's new chunk census already shows these arrays as small, drop this.
+**Where the fresh memory goes now (log, experiment 41 census, 20M):** event lanes 459 MB, click lanes 130 MB, pass-one blocks 145 MB, with 185 MB of released chunks idle on the free list at that point. The event and click lanes match my count of what must be written (410 + 50 and 110 MB), so there is no slack there. The idle 185 MB cannot serve the click lanes, which are written during parse before anything is released. I see no further memory item worth more than the 2 to 4 ms that experiment 41 just declined.
 
-**On item 2.** The links thread does three things: union-find, then a per-partition pass that writes the moved-ID list (`lkf`) and sets the representative bits. The third is about a fifth of its time (62 of 275 thread-ms at 20M, log) and is independent per partition: partition `q` reads only its own slots `[(q+1)·s, (q+2)·s)` and its own wide IDs, and writes only its own slice of the bitmap, which is also the only slice `p1` reads for `q`. So each `p1` thread can do it for the partition it is about to process, and the links thread finishes about 20% sooner.
+**On item 1.** The links thread does three things: union-find, then a per-partition pass that writes the moved-ID list (`lkf`) and sets the representative bits. The third is about a fifth of its time (62 of 275 thread-ms at 20M, log) and is independent per partition: partition `q` reads only its own slots `[(q+1)·s, (q+2)·s)` and its own wide IDs, and writes only its own slice of the bitmap, which is also the only slice `p1` reads for `q`. So each `p1` thread can do it for the partition it is about to process, and the links thread finishes about 20% sooner.
 
 - **The catch:** `LkT::find` compresses paths as it goes, which is a write to shared nodes. Eight threads doing that at once is a data race. Use a read-only find there (follow parents without writing). To keep chains short, the links thread should finish with one sequential pass that points every node at its root; that pass is cheaper than the current third step because it writes nothing else.
 - **Why low on the list:** it pays only in the rare run where the links thread is late, and it adds a full-compression pass that costs a little every run. Worth building only if the final's 3-run scoring makes one slow run matter.
@@ -255,6 +256,7 @@ I read the new generator source (`generator.zip` in the repo root).
 | Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
 | Sort-and-walk for small people | 38 (diagnostic only) | Not built: bin fill is 43 of 572 thread-ms | −10 ms; wrong |
 | Recycle chunks into later lanes; presize row columns | 39 (upstream) | Done upstream; peak at 60M 4.3 to 3.4 GB | −5 ms and part of −7 to −11 ms; not separable from the rest of the upstream change |
+| Pack staging arrays into shared blocks | 41 | Not kept: 106 MB less zeroed, 2 to 4 ms, inside noise | −3 to −4 ms, about 100 MB |
 | Fallback path at 60M | 40 | Safe: 10.2 s, 11.8 GB, output equal | safety check |
 | Links wait at 60M | 40 | 0.2 ms typically, 23 and 49 ms in 2 of 40 runs | a reading |
 | `KTab` layout | — | Dropped: upstream `c7ebaf9` removed the per-event lookup it targeted | −3 to −8 ms |
