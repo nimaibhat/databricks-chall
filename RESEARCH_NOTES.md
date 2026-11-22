@@ -22,6 +22,8 @@ The useful reading of those numbers is per person, not per event: the bins pass 
 | 4 | Is the sessions stage balanced at 60M? | compare its thread-ms ÷ 8 with its wall time in an existing 60M timing line | If there is a gap, largest-partitions-first is worth that gap; a whale partition is three times larger at 60M | None |
 | 5 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | Safety, not speed | — |
 
+**Experiment 33 (read in, no action for me).** The input release costs about 9 ms of wall even on 8 threads, in either placement, against 32 ms at exit. That cost is per mapped 4 KiB page (reverse-map and counter updates), not the system call, so I see no cheaper way to release short of not mapping the input, and reading it instead lost clearly on the old path. The parse split it gives (event sink 595 of about 2,050 thread-ms, click sink 170, the rest scanner and first-touch faults) says the scanner is still about two thirds of parse; that is upstream's assembly and I have no blind proposal for it.
+
 ### 1. Hybrid sessionizing
 
 **Evidence that bins cost the average person time.** When upstream replaced sort-and-walk with session bins (experiment 27), every stage got faster except sessions, which went from 189 to 205 ms (log). Other things changed in the same step, so this is suggestive, not proof.
