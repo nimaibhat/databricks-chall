@@ -8,7 +8,7 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 
 **Which size to tune for:** the practice board runs 20M, the final runs about 60M. Where a setting helps one size and hurts the other, the 60M result is the one that decides the final score.
 
-**State (log, experiment 34):** 20M 600.6 ms median, stages parse 278 (release included), dedup 82, relink 15, p1 127, p2 77, write 10. 60M 1.81 s, peak 4.3 GB.
+**State (log, experiment 35):** 20M 570.9 ms median, stages parse 247 (release included), dedup 83, relink 16, p1 129, p2 77, write 10. 60M 1.72 s, peak 4.3 GB. Experiment 35 (upstream `d9462ea`) changed the parse side only; the back half the table below aims at is as I read it, though line numbers in `v3b.rs` may have shifted by a few.
 
 ## Top five untried (after experiment 34)
 
