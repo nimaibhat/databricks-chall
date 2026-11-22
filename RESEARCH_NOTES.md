@@ -8,7 +8,9 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 
 **Which size to tune for:** the practice board runs 20M, the final runs about 60M. Where a setting helps one size and hurts the other, the 60M result is the one that decides the final score.
 
-**State (log, experiment 36):** 20M 564.0 ms median, 60M 1.70 s. Thread-ms at 20M on the build before it: dedup table 449, p1 short lane 587, p1 group 228, p2 walk 539, link union-find 212 (one thread, inside the parse stage).
+**State (log, experiment 37):** 20M 549.7 ms median, 60M about 1.69 s. Experiment 37 doubled the second-stage partition target (`XL_V3T2` 384 to 768 KiB), which halves the partition count at 20M and cut dedup from 82 to 70 ms; at 60M the count is capped and did not change. Thread-ms at 20M before that change: dedup table 449, p1 short lane 587, p1 group 228, p2 walk 539, link union-find 212 (one thread, inside the parse stage).
+
+**What experiment 37 implies for 60M.** The 20M gain came from dedup writing to half as many lane heads, and 60M got none of it because its count stayed at the cap (2,048) while lowering the cap there (`XL_V3M2=10`) made `p1` partitions too big and gave nothing back. So at 60M the two stages want different partition counts. I do not have a cheap way to give them that; a two-step split would cost another pass. Noted so nobody re-sweeps the same knobs expecting a 60M gain.
 
 ## Top five untried (after experiment 36)
 
