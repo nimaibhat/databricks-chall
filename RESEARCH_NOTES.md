@@ -8,7 +8,9 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 
 **Which size to tune for:** the practice board runs 20M, the final runs about 60M. Where a setting helps one size and hurts the other, the 60M result is the one that decides the final score.
 
-**State (log, experiment 39):** 20M 468.1 ms median, stages parse 213, dedup 67, links 0.2, p1 107, p2 58, write 10. 60M about 1.47 s, peak 3.4 GB. Line numbers below are for `src/v3b.rs` at `60f2fae` (upstream `c4a033b` plus the 768 KiB partition target).
+**State (log, experiment 45):** 20M 402.0 ms median, stages parse 170, dedup 70, clicks 27, links 0.2, p1 76, p2 42, write 7. 60M about 1.25 s, peak 2.5 GB. Code is `5f2fda8` (upstream `1cda738` plus the 768 KiB partition target); `v3b.rs` grew from 4,099 to 6,909 lines. **Line numbers and function names in the sections below this one are for `60f2fae` and have moved**; I am re-reading the changed stages now and will replace them.
+
+**Links retry (my item of 00:22): overtaken.** Upstream raised `LkT::PROBES` from 64 to 2048 in this version (line 2668 at `5f2fda8`), which is the fix I proposed. Whether a retry was the cause of the rare 50 ms wait was never checked against the `slots=` line, so it stays a hypothesis; what can be checked is whether the wait still occurs: count `links` laps above 5 ms over 40 or more runs at 60M on the new build.
 
 **Experiment 42 (readings, nothing changed):** 8 threads is the right count on 8 CPUs (7, 10, 12 and 16 are all slower). With transparent huge pages set to `never` the 20M run takes about 630 ms instead of 478, so about 150 ms depends on the scorer honouring `madvise`; `always` is the same as `madvise`. Nothing in the notes can change that setting; if the scorer turned out to be `never`, the fresh-memory items (experiment 41's packing, fewer chunks touched) would be worth several times what they measured, and that is the one case in which to put them back.
 
@@ -29,7 +31,7 @@ Upstream moved four commits and overtook most of my previous table:
 
 **Experiment 41 built the staging-array packing** and did not keep it: 106 MB less zeroed, 2 to 4 ms at 20M, which is what I estimated but is inside run-to-run noise and is one more patch to carry across upstream changes. It is a safe small gain to put back once upstream stops moving.
 
-## Top ideas untried (after experiment 44)
+## Previous table (after experiment 44; overtaken by upstream `1cda738`)
 
 Experiment 44 closed the staging-array packing for good (1 to 2 ms at both sizes over 31 and 11 rounds) and corrected experiment 43: the links wait does happen with shipped defaults, about once in 40 runs at 60M, about 50 ms when it does. It asked whether I see a cheap cause. I see one candidate, and it can be confirmed from a line the binary already prints.
 
@@ -263,6 +265,7 @@ I read the new generator source (`generator.zip` in the repo root).
 | Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
 | Sort-and-walk for small people | 38 (diagnostic only) | Not built: bin fill is 43 of 572 thread-ms | −10 ms; wrong |
 | Recycle chunks into later lanes; presize row columns | 39 (upstream) | Done upstream; peak at 60M 4.3 to 3.4 GB | −5 ms and part of −7 to −11 ms; not separable from the rest of the upstream change |
+| Raise the link table probe limit | 45 (upstream) | Done upstream (64 to 2048); effect on the rare wait not yet counted | removes about 50 ms in 1 run in 40 at 60M (hypothesis) |
 | Pack staging arrays, more rounds | 44 | Closed: 1 to 2 ms at both sizes | −3 to −4 ms; high |
 | Link lists built in `p1_thread` | 43, corrected in 44 | Not built: wait is rare (1 run in 41 at 60M with defaults, about 50 ms) | about −2 ms on average at 60M; nothing to recover |
 | Pack staging arrays into shared blocks | 41 | Not kept: 106 MB less zeroed, 2 to 4 ms, inside noise | −3 to −4 ms, about 100 MB |
