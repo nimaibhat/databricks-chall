@@ -8,68 +8,49 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 
 **Which size to tune for:** the practice board runs 20M, the final runs about 60M. Where a setting helps one size and hurts the other, the 60M result is the one that decides the final score.
 
-**State (log, experiment 37):** 20M 549.7 ms median, 60M about 1.69 s. Experiment 37 doubled the second-stage partition target (`XL_V3T2` 384 to 768 KiB), which halves the partition count at 20M and cut dedup from 82 to 70 ms; at 60M the count is capped and did not change. Thread-ms at 20M before that change: dedup table 449, p1 short lane 587, p1 group 228, p2 walk 539, link union-find 212 (one thread, inside the parse stage).
+**State (log, experiment 39):** 20M 468.1 ms median, stages parse 213, dedup 67, links 0.2, p1 107, p2 58, write 10. 60M about 1.47 s, peak 3.4 GB. Line numbers below are for `src/v3b.rs` at `60f2fae` (upstream `c4a033b` plus the 768 KiB partition target).
 
-**What experiment 37 implies for 60M.** The 20M gain came from dedup writing to half as many lane heads, and 60M got none of it because its count stayed at the cap (2,048) while lowering the cap there (`XL_V3M2=10`) made `p1` partitions too big and gave nothing back. So at 60M the two stages want different partition counts. I do not have a cheap way to give them that; a two-step split would cost another pass. Noted so nobody re-sweeps the same knobs expecting a 60M gain.
+## Top five untried (after experiment 39)
 
-## Top five untried (after experiment 38)
+Upstream moved four commits and overtook most of my previous table:
 
-Experiment 38 measured my sort-and-walk idea out of contention (bin fill is only 43 of the 572 thread-ms in the unlinked lane) and named the best remaining lead itself: one run takes 802 huge-page faults, 1.6 GB of fresh anonymous memory, and zeroing it is 10.7% of all cycles, about 470 thread-ms. That is 0.29 thread-ms per MB, so every 100 MB not freshly touched is worth about 3.7 ms of wall at 20M (derived from the log's two numbers).
+- **Chunk recycling into later lanes** (my item 4): done upstream. Free chunks left over after dedup are handed to the `p1` block lane (`run`, the `XL_PMH` block near line 3973, on by default).
+- **Presized row columns** (half of my item 3): done upstream ("presized columns").
+- **Assist and credit loops:** replaced by vector passes (`credit16`, `credit_sorted`), so experiment 36's changes are gone with the code they touched.
+- **Link union-find:** now a flat table on its own thread (`links_start`), joined after dedup. At 20M the join waits 0.2 ms, so it is off the critical path there.
 
-My count of what the pipeline needs to write at 20M comes to about 1.1 GB (below), so about 0.5 GB is overhead I can only attribute by reading. The table is ordered by how sure I am the memory is really there.
+What is left is short, and I would rather list three real items than pad to five.
 
-| # | Idea | Where | Fresh memory saved (estimate) | Expected at 20M | Row risk |
-|---|---|---|---|---|---|
-| 1 | One diagnostic run that prints bytes handed out per `anon()` call site and per allocator size class | `sys::anon`, `sys::Alloc::get`; the `tl` feature's `mp::add` already records call sites | — | Decides 2 to 4 | None |
-| 2 | Pack each thread's lane staging arrays into one block | `VB::new` (five per thread: `ck.s`, `ck.w`, `u2.s`, `u2.w`, `blk`), `WBins::new`, and the lane tables in `parse_thread` | about 100 MB | −4 ms | None |
-| 3 | Size the per-thread scratch vectors and the row buffers once, up front | `B3` vectors in `p1_thread` / `p2_thread`; `Rows` in `run` | 200 to 300 MB | −7 to −11 ms | None |
-| 4 | Recycle released lane chunks into every later lane, not only `u2.s` | `dedup_thread` release block (feeds only `t.u2.s.free`); `p1_thread` after a partition is copied out; `VB::chunk` | about 150 MB | −5 ms | Low |
-| 5 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | — | Safety, not speed | — |
+| # | Idea | Where | Expected at 20M | Row risk |
+|---|---|---|---|---|
+| 1 | Re-read the fault count and the `kernel_init_pages` share on the current build | the `minflt` figure in the `pa Mcycles` timing line; one `perf` profile | Decides whether item 2 and any further memory work is worth building. Experiment 38 had 802 huge-page faults and 10.7% of cycles; peak at 60M has since fallen from 4.3 to 3.4 GB | None |
+| 2 | Pack each thread's lane staging arrays into one block | `VB::new` (line 556), `WBins::new` (line 74) | −4 ms (estimate: about 100 MB zeroed for 25 MB used, at the 0.29 thread-ms per MB derived from experiment 38) | None |
+| 3 | At 60M, how long does `links_join` wait? | the `links` lap in a 60M timing line | No gain if near zero. If it is tens of ms, the links thread is the critical path at the size that counts and wants starting earlier or splitting | None (a reading) |
+| 4 | Confirm the fallback path at 60M (output, time, memory) | one run with a forced fallback | Safety, not speed | — |
 
-### What I count as necessary (20M, estimates)
+**On item 2.** Unchanged from my previous table and still applies: `anon()` rounds each request up to 2 MiB, and each staging array is `np × 256` bytes, well under that. One per-thread block carved into the five `VB` arrays and the `WBins` array fixes it. The arrays are only indexed by partition.
 
-| Use | Size |
-|---|---|
-| Event lanes written by parse (16 bytes for about 76% of events, 32 for the rest) | 410 MB |
-| Half-filled last chunk per thread, partition and lane | 50 MB |
-| Click lanes | 110 MB |
-| User lane | 215 MB, but mostly recycled from event-lane chunks |
-| Blocks shipped from `p1` to `p2` for linked people | 90 MB |
-| Output rows and names | 100 MB |
-| Link tables in `build_links` and the relink arrays | 170 MB |
-| Parquet buffers | 50 MB |
+**On item 3.** The links thread is a ninth thread on eight pinned CPUs, so while it runs it takes time from a parse or dedup thread. That is fine if it finishes early. Its node table is `(np + 1) × s` words plus the wide IDs; at 60M that is several hundred MB of random access, so its time grows faster than the stages it hides behind.
 
-### 2. Staging arrays
+### Exactness review of the new credit code (by reading, `60f2fae`)
 
-`anon()` rounds every request up to 2 MiB and asks for a huge page (`src/sys.rs`, `anon`). A `VB` staging array is `np × 256` bytes, 256 to 512 KB at the current partition counts, so each one zeroes a 2 MiB page for a fraction of that. There are five `VB`s and one `WBins` per thread plus the event-lane tables, on 8 threads: about 100 MB zeroed for about 25 MB used. Carving them from one per-thread block (or from one shared block, 64-byte aligned per thread) fixes it. The arrays are only ever indexed by partition, so nothing else changes.
+I traced `credit16`, `credit_sorted`, `tie_camp` and the purchase and row code in `finish_person`. I found no defect. Points checked:
 
-### 3. Scratch vectors and rows
+- **Window bounds.** A click counts for a session when its time is in `[start − 7 days, start]`, both ends inclusive, in all three paths (16 or fewer clicks, 17 to 64, more than 64). `cbase` is `ws − 7 days` and every session starts at or after `ws`, so `start − cbase` is never negative and the relative times fit 31 bits.
+- **Last click wins, ties by click ID.** The vector paths take the maximum of `time << 32 | campaign` inside the window, then test whether any other click has the same time and a different campaign; only then is `tie_camp` called, which compares full click IDs (short or from the side array). Padding lanes are all-ones and can neither enter the window nor trip the tie test, and the tie test is guarded by "window not empty".
+- **Assists, 16-click path.** One entry per session per distinct campaign with a click in the window: the conflict mask picks the last click of each campaign as its representative and tests whether any click of that campaign is in the window.
+- **Assists, sorted path.** Each click covers the sessions starting in `[time, time + 7 days]`; per campaign the covered range only moves forward (clicks are in time order), so the stamp-and-`lidx` scheme counts each session once per campaign. The per-day vector add relies on a person's sessions for one day being contiguous, which holds because sessions are in time order.
+- **Buffer sizes.** `Walk.asst` has room for a full 16-lane store per session beyond the flush threshold, so the unchecked compress-store cannot run past its capacity.
+- **Sort keys above 64 clicks** pack time, campaign (14 bits, guaranteed by the campaign bound check in `setup.rs`) and index (19 bits) without overlap; above 2^19 clicks a tuple sort is used.
 
-The custom allocator hands out power-of-two classes and a freed block is reused only by the same class (`Alloc::get`). A vector that grows by doubling to a final size `S` therefore touches about `2S` of fresh memory, and none of the smaller blocks is used again unless another vector happens to need that class.
+This is a reading, not a proof. The gate is the stronger evidence.
 
-- `B3` has about twenty such vectors per thread (`es`, `es2`, `ps`, `ps2`, `cs`, `cs2`, the wide lanes, `flat`, `bw`, …) and each grows to the largest partition that thread meets, which for a whale's partition is megabytes. The largest partition size is known before `p1` starts (maximum over partitions of the summed `words(q)`), so each can be reserved once.
-- `Rows` (six vectors plus the name bytes, about 100 MB in total at 20M) can be reserved from the kept-event count divided by threads, with headroom.
+### Closed
 
-This is the item I am least able to size, which is why item 1 comes first.
-
-### 4. Wider recycling
-
-Today released event-lane chunks go only to `t.u2.s.free` (short user records). The wide user lane `u2.w`, the `p1`-to-`p2` block lane `blk`, and the click lanes all take fresh blocks. Two additions:
-
-- In `dedup_thread`, split the released chunks between `u2.s.free` and `u2.w.free` (or let `VB::chunk` fall back to a shared per-thread free list).
-- In `p1_thread`, once a partition's user and click lanes are copied out (after the last `copy_out` for that partition), their chunks are dead; release them into `blk.free`.
-
-Risk is the usual one for recycling: a chunk must not be reused while a reader still holds it. In `p1` the readers work on copies (`es`, `flat`), so the chunks are dead as soon as the copy is made. It is "low" and not "none" because `VB` has no release function yet and one must be written.
-
-### Closed by experiment 38
-
-- **Sort-and-walk for small people:** bin fill is 43 thread-ms; nothing to win. My estimate of −10 ms was wrong.
-- **Occupancy mask** and **count-while-copying:** not tested, but each was a 2 to 4 ms estimate in code where my last estimate was several times too high. Dropped from the table; they are described in git history at `c3c91bb` if wanted.
-- **Link union-find at 60M:** still an open reading (compare `lk.uf` with the parse wall in a 60M timing line).
-
-### The click part of `finish_person`
-
-Experiment 38 puts it at 385 thread-ms, about 48 ms of wall, the largest single piece of the back half. Experiment 32's split of the same code was: sort 93, session walk 237, non-brute assists 84. I have looked at this three times and still have no restructuring that is both cheaper and safe for `assisted_sessions`; the bitmask method was fairly rejected. I am leaving it without a proposal.
+- **Sort-and-walk for small people** (experiment 38): bin fill is 43 thread-ms; nothing to win. My estimate of −10 ms was wrong.
+- **Occupancy mask:** done upstream in a better form (a 64-byte vector test per occupancy block in `finish_person`).
+- **Scratch vector presizing in `B3`:** not tested. `es` is reserved once per partition; the rest grow by doubling but are reused across partitions, so the loss is one-off per thread. Left out until item 1 says memory still matters.
+- **The click part of `finish_person`:** rewritten upstream as vector passes; I have nothing to add.
 
 ### Done: experiment 32's changes (experiment 36)
 
@@ -253,4 +234,5 @@ I read the new generator source (`generator.zip` in the repo root).
 | Bitmask assists | 32 | Not built: visits would fall only from 15.2M to about 13M steps | up to −20 ms; too high |
 | Experiment 32's two changes, re-applied to the new back half | 36 | Kept: −4 ms at 20M, −14 ms at 60M | −3 ms, −12 ms |
 | Sort-and-walk for small people | 38 (diagnostic only) | Not built: bin fill is 43 of 572 thread-ms | −10 ms; wrong |
+| Recycle chunks into later lanes; presize row columns | 39 (upstream) | Done upstream; peak at 60M 4.3 to 3.4 GB | −5 ms and part of −7 to −11 ms; not separable from the rest of the upstream change |
 | `KTab` layout | — | Dropped: upstream `c7ebaf9` removed the per-event lookup it targeted | −3 to −8 ms |
