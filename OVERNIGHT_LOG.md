@@ -146,6 +146,20 @@ Experiment 24: upstream moved four commits past 078e760 (4b57bc7 click-loop pair
 - **3493fdd is 078e760 plus two scanner fixes** (4 lines in `k_free.rs`: `TL2_R6` 65 to 66, and a check in `ev_loop` that sends a line without a third comma to the careful path; abd72ed also backs out 4b57bc7's click changes). Taken with the two constants as `j6s`, commit 4f63ac5 on main. These are correctness fixes for malformed lines, not speed: seed 20 194.8 / 196.1 against `j4s` 195.9 / 196.8; seed 7 195.3 / 200.0 against 196.5 / 199.6. Gate clean: 36/36, dev and seed 20 match, equal to 941879e at NCPU 8, 2, 1 on seeds 7, 3 and 6.
 - **42e53ab is slower on this VM**: `j5` (as is) seed 20 208.5 / 211.4, seed 7 211.4 / 215.5; `j5s` (with constants) 208.9 / 211.0 and 212.1 / 215.4; against `j4s` 192.6 / 196.5 and 198.8 / 200.3. Parse 160.1 against 144.9 (+15), other stages level. Its outputs are exact (36/36, dev, seed 20, NCPU 8/2/1 on seeds 7 and 3). Not taken on main; pushed as branch `upstream-42e53ab` (6fddb4b) in case the scorer's CPU behaves differently from this 8252C, which is the only reason upstream would ship it.
 
+Experiment 25: upstream 2d7801e ("new click index, pair decode for clicks, lighter event loop"; relative to 42e53ab it drops 237 lines of `k_free.rs`, i.e. the wider event loop that was slower here). `j7` as is, `j7s` with the two constants (on main). Gate clean: 36/36, dev and seed 20 match, equal to 941879e at NCPU 8, 2, 1 on seeds 7, 3 and 6, no fallback. 11 rounds, wall min / med:
+
+| Set | j6s (4f63ac5) | j7 | j7s (kept) |
+|---|---|---|---|
+| 20M seed 20 | 193.8 / 196.1 | 189.3 / 193.7 | 189.6 / 193.2 |
+| 20M seed 7 | 197.0 / 198.3 | 194.7 / 197.7 | 193.3 / 197.3 |
+
+Parse 145.7 to 142.1 (seed 20), 146.7 to 143.6 (seed 7); ev3a and write level. Kept: -4.2 / -2.9 and -3.7 / -1.0 ms. 30M seed 6, 7 rounds:
+
+```
+j6s                        wall min 292.5 med 297.0 max 297.9 | setup=0.0 parse=225.1 ev3a=53.3 write=7.2 total=291.0
+j7s                        wall min 289.8 med 291.3 max 292.2 | setup=0.0 parse=221.3 ev3a=53.5 write=7.2 total=288.3
+```
+
 ## Facts for the research session (its requests 1 to 5)
 
 1. VM: Intel Xeon Platinum 8252C @ 3.80 GHz (Cascade Lake), 4 cores / 8 threads, 32 GB, kernel 7.0.0-1018-aws, THP `enabled=madvise`, `defrag=madvise`. Timing runs the binary directly (no Docker) with `NCPU=8 XL_TIMING=1`; output goes to ext4.
