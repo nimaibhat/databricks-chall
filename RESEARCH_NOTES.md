@@ -40,7 +40,17 @@ What is left is short. I am not padding it to five.
 - **Why low on the list:** it pays only in the rare run where the links thread is late, and it adds a full-compression pass that costs a little every run. Worth building only if the final's 3-run scoring makes one slow run matter.
 - **Check with** `XL_LKCHK`, which already compares the link lists and bitmap against the plain method; it would need to run after `p1`.
 
-**Where the rest of the time is (log, experiment 40, 20M thread-ms):** dedup table 386, p1 short lane 448, p1 group 193, p1 gather 144, p2 walk 398. Parse is 213 of 468 ms wall and its hottest instructions are the loads of input bytes. I have read the dedup stage and the back half and have no further proposal for them that I would put a number on. The parse sink (`Sink`, `ELane`) in the current version is the one large piece I have not read end to end; that is what I am reading next.
+**Where the rest of the time is (log, experiment 40, 20M thread-ms):** dedup table 386, p1 short lane 448, p1 group 193, p1 gather 144, p2 walk 398. Parse is 213 of 468 ms wall and its hottest instructions are the loads of input bytes. I have now read every stage of the current version (parse sink, event lanes, dedup, links, p1, p2, credit) and have no further proposal I would put a number on. The parse sink is already a vector classify step followed by write-combined 64-byte lines with non-temporal stores; what remains in parse is the scanner in `k_free.rs` reading input bytes, which upstream is changing every cycle.
+
+### Exactness review of the parse sink and event lanes (by reading, `60f2fae`)
+
+No defect found. Points checked:
+
+- **Bit packing of the 16-byte event record** (`ev_batch`, line 1343 on): remainder of the event ID, ingest second (21 bits) and the top 11 bits of the user ID in one word; relative time (31 bits), the low 31 bits of the user ID and the invalid flag in the other. It is exact only if the remainder fits 32 bits and the relative time fits 31. Both are enforced in `run`: `b1` is at least 10 (line 3813) and a window over 2^31 ms falls back (lines 3807 to 3815). `dedup_thread` unpacks with the same shifts.
+- **Which events take the compact lane:** short event ID, ingest time a whole second inside the 21-bit range, and either invalid or a short user ID and not a purchase. Everything else goes to the 32-byte or 64-byte lane with full keys. Long IDs with a zero high half fall back instead of colliding with short ones.
+- **Duplicate bitmap index** is computed the same way for the same event ID in all three lanes (`(a >> 35) & BMM`, the same expression on the 32-byte record, and `x_index` on the 64-byte one), so "seen once" is reliable; "seen twice" only nominates candidates, which are then compared on full keys.
+- **Deferred line flush:** a full line may be flushed either by the next push to that partition or by `drain`; both check the fill count first, so a line cannot be written twice or lost. The queue has room for a whole batch past the drain threshold (`EQCAP = EDRAIN + NB + 8`).
+- **Skewed IDs** (not from this generator) would unbalance the partitions because event partitioning uses raw ID bits, but that costs time only, not rows.
 
 ### Exactness review of the new credit code (by reading, `60f2fae`)
 
