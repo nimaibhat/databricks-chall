@@ -166,6 +166,11 @@ I read the new generator source (`generator.zip` in the repo root).
 
 **Exploitable, but I recommend against it:** both halves of a long ID are an invertible mix of the same 40-bit value, so a long ID could be reduced to 40 bits with a per-ID check and a fallback, which would let long IDs use the compact lane. It would be output-safe. But the rules now say IDs "must" be treated as opaque strings "rather than … invertible generator numbers", and the organisers changed the format specifically to stop this. Whether to use it is the user's decision, not a technical one; I have not ranked it.
 
+## Public entries and literature
+
+- **Other entries:** a web search for this task's table names and rules found no public entry or write-up (2026-11-21). The only outside implementation I know of is the upstream repository this code is taken from.
+- **Partitioned or global table for grouping:** "Global Hash Tables Strike Back!" (arXiv 2505.04153, 2025) reports that a concurrent global hash table built for aggregation can match partitioned aggregation. I do not recommend acting on it here: the dedup, join and session stages all need the same person's records together, which partitioning gives for free, and experiment 28 shows the partition counts are already on a flat optimum. The same literature (Bandle et al., "To Partition, or Not to Partition", SIGMOD 2021) says partitioning gains fall off quickly away from the tuned fan-out, which matches experiment 28.
+
 ## Log of what was tried from these notes
 
 | Idea | Experiment | Result | My estimate |
