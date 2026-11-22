@@ -2056,7 +2056,7 @@ struct TailRow2 {
 const TL2_P: usize = 72;
 const TL2_S: usize = 3 * TL2_P;
 const TL2_SOFF: usize = 36;
-const TL2_R6: usize = 65;
+const TL2_R6: usize = 66;
 const fn tail_rows2() -> [TailRow2; TL2_R6 * TL2_S] {
     let mut t = [TailRow2 { m: 0, sel: 0, _p0: 0, pat: [1; 4], pp: 0, _p1: 0 }; TL2_R6 * TL2_S];
     let mut pl = 0;
@@ -2748,6 +2748,9 @@ unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: 
             ev_hd!("r14", "ymm8", "ymm9"),
             "blsr ecx, ecx",
             "jnz 68f",
+            "vpmovmskb eax, ymm9",
+            "test eax, eax",
+            "jz 68f",
             "vpcmpeqb ymm0, ymm14, ymmword ptr [r14 + 64]",
             "vpmovmskb eax, ymm0",
             "tzcnt eax, eax",
