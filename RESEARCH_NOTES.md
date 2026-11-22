@@ -12,11 +12,13 @@ Read against `fcd9075` (upstream `ff78d19` plus the two constants) and `OVERNIGH
 
 | # | Idea | Where | Expected at 20M | Row risk |
 |---|---|---|---|---|
-| 1 | Give each input chunk back to the kernel as soon as it is parsed | `parse_thread`, after the `match f.kind` block | −15 ms wall (estimate), about −45 ms at 60M | None |
-| 2 | Recycle finished event-lane chunks as storage for the user lane during dedup | `dedup_thread` end of each partition; `WBins::chunk` | −14 ms (estimate), about −40 ms at 60M, and −0.4 GB peak | Low |
-| 3 | Take the largest partitions first in join and sessions | `run` before each `run_par`; `join_thread`, `sess_thread` claim loop | −5 ms on average (estimate), mostly removes a bad-luck tail; about −15 ms at 60M | None |
-| 4 | Read out `[v3b] st` and sweep `XL_PB0` (the brute-force assist limit) | `person`, line 1734 | Unknown until `st[5]` is read; possibly −10 ms or more | None (both paths exist and pass the gate) |
+| 1 | Recycle finished event-lane chunks as storage for the user lane during dedup | `dedup_thread` end of each partition; `WBins::chunk` | −14 ms (estimate), about −40 ms at 60M, and −0.4 GB peak | Low |
+| 2 | Take the largest partitions first in join and sessions | `run` before each `run_par`; `join_thread`, `sess_thread` claim loop | −5 ms on average (estimate), mostly removes a bad-luck tail; about −15 ms at 60M | None |
+| 3 | Read out `[v3b] st` and sweep `XL_PB0` (the brute-force assist limit) | `person`, line 1734 | Unknown until `st[5]` is read; possibly −10 ms or more | None (both paths exist and pass the gate) |
+| 4 | Account for the anonymous memory: 2.0 GB peak against about 1.3 GB that `v3b` needs by my count | `--features tl` allocation table; `src/setup.rs:1138–1196` | Up to −20 ms if old-path tables are still being touched (estimate, unconfirmed) | None |
 | 5 | Smaller write-combining stage in `WBins` (`SW` 24 to 8 or 12) | constants at lines 48–49 | Unknown sign; a two-constant test | None |
+
+Releasing input chunks after parsing (my former number 1) was done independently as experiment 29 and kept: −14 ms at 20M and −37 ms at 60M measured, against my estimates of −15 and −45. See the log at the bottom.
 
 Details for each are below, followed by lower-ranked ideas, the measurements I need, two safety checks, and what the generator does and does not guarantee.
 
@@ -36,7 +38,7 @@ Three things stand out and drive the table:
 2. **`kernel_init_pages` at 9.4%.** That is about 0.5 CPU-seconds of zeroing fresh pages, roughly 60 ms of wall if spread evenly. Every lane byte is written twice: once by the kernel, once by the record store.
 3. **`sess_thread` at 26.8%.** That is about 70 ns per event per logical CPU (estimate: 26.8% of 5.4 CPU-s over 21M events). The operations I can see in the source should cost a third of that, so something in there is slower than it looks. The `[v3b] prof` and `[v3b] st` lines would say what; see "Measurements I need".
 
-## 1. Release each input chunk after parsing it
+## Done: release each input chunk after parsing it (experiment 29)
 
 **What.** In `parse_thread` (line 923), after the `match f.kind { ... }` block finishes a chunk, call `madvise(MADV_DONTNEED)` on the page-aligned inside of the chunk's byte range, exactly as the old path does at `src/parse.rs:2903–2907`:
 
@@ -52,9 +54,9 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **Risk.** None to output. The mapping is read-only and file-backed, so a page touched again after release is simply mapped again from the page cache. `odd_key` reads the input only while its own chunk is being flushed, before the release.
 
-**Test.** Compare `wall − "exit at"` before and after, at 20M and 60M. If the gap is still above 5 ms afterwards, see idea 7.
+**Result (log, experiment 29).** Kept as `m1`. 20M: 682.6 to 668.2 median (−14). 60M: 2084 to 2047 (−37). Peak RSS 3.9 to 2.0 GB at 20M and 11.0 to 5.0 GB at 60M. The exit gap is gone; parse grew by 10 ms in-process because the unmapping now happens there, in parallel.
 
-## 2. Recycle finished event-lane chunks for the user lane
+## 1. Recycle finished event-lane chunks for the user lane
 
 **What.** During dedup, once a thread has finished partition `p` (after the final `emit_rec` loop, line 1251), every full 4 KiB chunk listed in `me.ssl` and `me.wsl` for that partition is dead: nothing reads it again. Push those chunk addresses (only entries with length 512 words, which are whole chunks; not the partial last chunk and not the staging area) onto a per-thread free list. In `WBins::chunk` (line 77), pop from that free list before carving a new chunk from `anon(BLOCK)`. Only `t.u2` needs the free list; the simplest form is a raw pointer field on `WBins` that is set for `u2` and null for the others.
 
@@ -66,7 +68,7 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **Test.** Gate as usual, plus NCPU 1 and 2 (with one thread the recycling lag is the most extreme). Watch `minflt` in the `[v3b] pa` line: it should drop.
 
-## 3. Largest partitions first in join and sessions
+## 2. Largest partitions first in join and sessions
 
 **What.** Before the join `run_par`, compute each second-stage partition's size (sum over threads of `u2.b` `nstages` for that partition, plus the click lane's), sort partition indices by size descending into a `Vec<u32>`, and have `join_thread` and `sess_thread` claim `order[cx.next.fetch_add(1)]` instead of the raw index. Dedup partitions are split by event ID and are even, so they need nothing.
 
@@ -76,7 +78,7 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **Risk.** None. Partition order affects only which thread's row buffer a row lands in, and row order does not matter.
 
-## 4. Read `[v3b] st`, then sweep `XL_PB0`
+## 3. Read `[v3b] st`, then sweep `XL_PB0`
 
 **What.** `person` (line 1596) has two exact ways to count assists. The brute-force one (lines 1764–1777) runs when `clicks × sessions <= KN[0]` (default 4096, set by `XL_PB0`): for every session it walks every click in the 7-day window. The other (lines 1783–1823) sorts by campaign and uses binary search.
 
@@ -87,6 +89,18 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 **Risk.** None: both paths already run on every dataset (whales take the second) and pass the gate.
 
 **If `st[5]` is large,** there is a cheaper exact method for people with at most 64 sessions, described in idea 6.
+
+## 4. Account for the anonymous memory
+
+**What.** After experiment 29 the input no longer counts toward peak RSS, so the 2.0 GB peak at 20M (log) is all anonymous memory. My count of what `v3b` writes is about 1.3 GB: compact event lane 0.26, wide event lane 0.16, click lane 0.14, user lane 0.36, moved lanes 0.15, rows 0.1, partial chunks about 0.15. That leaves roughly 0.5 to 0.7 GB unexplained. `kernel_init_pages` at 9.4% of samples points the same way: about 0.5 CPU-s of zeroing is more than 1.3 GB should cost at the VM's write bandwidth.
+
+**Where to look.** Setup still builds everything the old path needed before `v3b::run` starts: the two arenas (`src/setup.rs:1138–1139`), `utab`, `claim`, `csr_off`, `csr` and `edges` (lines 1188–1196). These are lazy mappings and cost nothing unless something touches them. The question is whether any helper job, populate call or initialisation loop still touches them when `v3b::ON` is set. The `tl` feature records allocations by call site (`mp::add`), which would answer this directly; so would comparing `minflt` in the `[v3b] pa` line against the lane chunk counts printed beside it.
+
+**If it is confirmed,** skip that work when `v3b::ON` is set. Zeroing 0.6 GB costs about 0.17 CPU-s, about 20 ms of wall (estimate).
+
+**If the count is simply wrong** (for example the wide lane is larger than I assumed), the per-site table says where the memory really goes, which is what idea 1 and any further lane shrinking need anyway.
+
+**Risk.** None: this removes work whose results the new path never reads.
 
 ## 5. Smaller staging block in `WBins`
 
@@ -102,7 +116,7 @@ if b > a { unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
 
 **6. Bitmask assists for people with at most 64 sessions (only if `st[5]` is large).** Sessions are already in time order. For each click, in time order, the sessions it assists are a contiguous index range (first session at or after the click, up to the last session within 7 days), found with two pointers that only move forward. OR that range into a 64-bit mask kept per campaign (the existing `stamp` array can mark which campaigns are live). Then for each campaign, AND its mask with each day's session mask and add the popcount to `acc.assist`. Cost is about `clicks + campaigns × days` instead of `clicks × sessions × 0.4`. Row risk is moderate because it is new logic on the assist column; it needs the gate and a 20M and 60M comparison.
 
-**7. Release dead anonymous memory in parallel before exit (only if a gap remains after idea 1).** After the write stage, one `run_par` in which each thread calls `madvise(MADV_DONTNEED)` on its own lane blocks. Huge-page-backed memory tears down quickly anyway, so I expect little unless the scorer has transparent huge pages off.
+**7. Release dead anonymous memory in parallel before exit.** Experiment 29 reports the exit gap gone on the VM, so this is closed there. It would matter only if the scorer has transparent huge pages off, which I cannot see.
 
 **8. Pre-size the row buffers.** `Rows` vectors and `names` grow by doubling, and the custom allocator's realloc is allocate-copy. Reserving from an estimate avoids the copies and some fresh-page zeroing. Estimate: 2 to 4 ms. No row risk.
 
@@ -142,4 +156,6 @@ I read the new generator source (`generator.zip` in the repo root).
 
 ## Log of what was tried from these notes
 
-(Empty. I will move ideas here as `OVERNIGHT_LOG.md` shows them kept or rejected.)
+| Idea | Experiment | Result | My estimate |
+|---|---|---|---|
+| Release each input chunk after parsing | 29 (found independently by the coding agent) | Kept: −14 ms at 20M, −37 ms at 60M | −15 ms, −45 ms |
