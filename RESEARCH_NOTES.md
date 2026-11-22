@@ -2,13 +2,15 @@
 
 Written for the coding agent. These notes cover the rules as changed on 2026-11-21 (opaque variable-width IDs, final on about 60M events). Everything written for the old ID format was removed from this file; it is in git history up to `0f4ee43` and none of it is evidence for the new path.
 
-Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two constants) and `OVERNIGHT_LOG.md` up to experiment 34. Line numbers in the current sections are for `src/v3b.rs` at `d9788a0`. Sections under "Earlier analysis" carry older line numbers and are closed.
+**To the coding agent: section 1 below is a probable wrong-output case, not a speed idea. Please run its one-fixture test before anything else.** There is no open speed table at the moment; everything after section 1 was written against earlier versions and is kept as a record.
+
+Read against `5f2fda8` (upstream `1cda738` plus the 768 KiB partition target) and `OVERNIGHT_LOG.md` up to experiment 47. Line numbers in section 1 are for `src/v3b.rs` at `5f2fda8`; older sections carry older line numbers.
 
 **Numbers:** "log" means measured by the coding agent and quoted from `OVERNIGHT_LOG.md`. "estimate" means my arithmetic, not a measurement. I cannot run the binary.
 
 **Which size to tune for:** the practice board runs 20M, the final runs about 60M. Where a setting helps one size and hurts the other, the 60M result is the one that decides the final score.
 
-**State (log, experiment 45):** 20M 402.0 ms median, stages parse 170, dedup 70, clicks 27, links 0.2, p1 76, p2 42, write 7. 60M about 1.25 s, peak 2.5 GB. Code is `5f2fda8` (upstream `1cda738` plus the 768 KiB partition target); `v3b.rs` grew from 4,099 to 6,909 lines. **Line numbers and function names in the sections below this one are for `60f2fae` and have moved**; I am re-reading the changed stages now and will replace them.
+**State (log, experiments 45 to 47):** 20M 402.0 ms median, stages parse 170, dedup 70, clicks 27, links 0.2, p1 76, p2 42, write 7. 60M about 1.25 s, peak 2.5 GB. Code is `5f2fda8` (upstream `1cda738` plus the 768 KiB partition target); `v3b.rs` grew from 4,099 to 6,909 lines. **Line numbers and function names in the sections below this one are for `60f2fae` and have moved**; I am re-reading the changed stages now and will replace them.
 
 ## 1. Probable output defect at 1,024 user partitions: a linked alias can lose its link (by reading, `5f2fda8`; not run)
 
@@ -34,6 +36,8 @@ Read against `d9788a0` (upstream `c7ebaf9` plus the input release and the two co
 **Links retry (my item of 00:22): not confirmed (experiment 46).** On the new build, 40 runs at 60M built the link table exactly once each and showed no long wait (the `links` lap was 4 to 5 ms throughout). The link thread's own time varied widely between runs, which fits a ninth thread being descheduled, not a rebuild. The new build has the higher probe limit, so this does not say what happened on the old one, but there is nothing left to change. Closed.
 
 **Experiment 46 also re-ran nine seeds and the 60M fallback on the new build, all equal.** That does not cover the defect in section 1 above: it needs one specific ID value and cannot turn up by chance.
+
+**Experiment 47** swept the knobs on the new build: all flat within 1.3 ms, nothing changed. Parse is fully parallel (1,152 ms user plus 248 ms system for 176 ms wall); about 18% of parse CPU is the kernel zeroing lane memory.
 
 **Profile (log, experiment 46, 20M):** the scanner (`ev_loop`) is 20% of cycles and parse is 170 of 402 ms; page zeroing 8.6%. Thread-ms: dedup table 375, dedup gather 102, p1 short lane 254, p1 gather 201, p1 group 109, p2 walk 271, users file 111, campaigns file 64. I have no ranked speed idea against this version yet.
 
